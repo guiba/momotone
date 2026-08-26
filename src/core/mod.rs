@@ -36,3 +36,8 @@ pub trait Tracker: Send + Sync {
     fn update(&mut self, timestamp_ms: u64) -> Result<HandDetectionResult>;
     fn stop(&mut self);
 }
+
+/// Interface for mapping hand landmarks to gesture events.
+pub trait Strategy: Send + Sync {
+    fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent>;
+}

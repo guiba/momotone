@@ -4,6 +4,8 @@ mod midi;
 mod sources;
 mod vision;
 mod visualizer;
+mod strategies;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver};
@@ -18,6 +20,8 @@ use crate::midi::MidiOutputEngine;
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTrackerImpl;
 use crate::visualizer::Visualizer;
+use crate::strategies::{FrequencyStrategy, FingerPositionStrategy};
+use crate::core::Strategy;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -70,10 +74,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // 2. Initialize Vision
+    // 2. Initialize Vision and Strategy
     let mut camera = WebcamSource::new(0).context("Failed to open webcam")?;
     let tracker = HandTrackerImpl::new("hand_landmarker.task");
     let visualizer = Visualizer::new();
+    let strategy = FingerPositionStrategy;
 
     // 3. Orchestration Loop
     let mut last_event_time = Instant::now();
@@ -86,11 +91,10 @@ fn main() -> Result<()> {
         let mut frame = camera.get_frame()?;
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
 
-        // Get detection result (Currently returns mock landmarks)
+        // Get detection result
         let detection = tracker.process_frame(&frame)?;
 
         // --- B. Strategy/Gesture Processing (The "Logic") ---
-        // In a real app, this maps 'detection' to 'event'. For now, we simulate events in Mock mode.
         if args.mode == Mode::Mock {
             if last_event_time.elapsed() > Duration::from_secs(2) {
                 let dummy_event = if (iterations / 10) % 2 == 0 {
@@ -102,11 +106,9 @@ fn main() -> Result<()> {
                 last_event_time = Instant::now();
             }
         } else if let Some(landmarks) = &detection.hand_landmarks {
-             // Real logic would be: let event = strategy.process(&landmarks);
-             // For now, just use dummy events for testing real-world loops without the full model
-             if iterations % 100 == 0 {
-                 event_bus.dispatch(GestureEvent::new_note(65, 0.8, "Hand Detected Note"));
-             }
+            if let Some(gesture_event) = strategy.process(&detection) {
+                event_bus.dispatch(gesture_event);
+            }
         }
 
         // --- C. Event Dispatch (The "Output") ---
@@ -124,11 +126,14 @@ fn main() -> Result<()> {
             ("Tracking", if detection.hand_landmarks.is_some() { "Active" } else { "Searching..." }),
         ];
 
-        let event_text = match &event_bus.dispatch(GestureEvent::no_gesture()) { // Dummy hack to get text? No, let's just use a placeholder
-             // (Wait, I can't access internal bus state easily like this)
-             _ => if args.mode == Mode::Mock { "Simulated Movement" } else { "Looking for hand..." },
+        let event_text = if args.mode == Mode::Mock { 
+            "Simulated Movement" 
+        } else if detection.hand_landmarks.is_some() {
+            "Tracking Active"
+        } else {
+            "Looking for hand..."
         };
-        // Note: In real code we track the last received event to show it on screen
+        
         visualizer.draw_hud(&mut frame, event_text, (0, 255, 0), &status)?;
 
         opencv::highgui::imshow("Gesture-to-Audio Rust (OpenCV)", &frame)?;
