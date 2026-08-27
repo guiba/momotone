@@ -76,7 +76,7 @@ fn main() -> Result<()> {
 
     // 2. Initialize Vision and Strategy
     let mut camera = WebcamSource::new(0).context("Failed to open webcam")?;
-    let tracker = HandTrackerImpl::new("hand_landmarker.task");
+    let mut tracker = HandTrackerImpl::new("hand_landmarker.task").context("Failed to initialize hand tracker")?;
     let visualizer = Visualizer::new();
     let strategy = FingerPositionStrategy;
 
