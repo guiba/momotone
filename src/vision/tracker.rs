@@ -302,6 +302,9 @@ impl HandTrackerImpl {
                         eprintln!(
                             "[Tracker] landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
                         );
+                        for (i, lm) in landmarks.iter().enumerate() {
+                            eprintln!("[Tracker] lm[{i}] = ({:.1}, {:.1}, {:.3})", lm.x, lm.y, lm.z);
+                        }
                     }
                 }
                 Err(e) => {

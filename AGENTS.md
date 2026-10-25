@@ -41,7 +41,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
 2.  **Vision Phase** (`src/vision/tracker.rs`, `HandTrackerImpl`):
     *   Stage 1 — `run_detector()`: largest centred square of the frame resampled to **192×192** via `sample_affine_to_tensor()` (hand-written bilinear sampling, BGR→RGB, `/255`). Outputs 2016 boxes (18 values per anchor) + 2016 raw scores; scores are **sigmoid**-ed, argmax wins, gated by `SCORE_THRESHOLD = 0.3`.
     *   Anchor offsets are converted to frame pixels and the palm box is **expanded ×2** to cover the whole hand (`r#box` = `(x, y, w, h)` in frame pixels).
-    *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`).
+    *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`). `--debug` prints the winning anchor, the landmark bbox and all 21 landmark coordinates.
     *   The tracker computes geometry only — it draws nothing. All overlays live in `src/visualizer/mod.rs`.
     *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, score: f32 }` (defined in `src/core/mod.rs`).
 
@@ -56,7 +56,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
 5.  **Output Phase** (implement `Sink`: `start`/`stop`/`handle_event`):
     *   `src/audio/synthesizer.rs`: `Synthesizer` — cpal output stream; shared `Arc<Mutex<SynthesizerState>>` between the callback and the event handler. `cpal::Stream` is wrapped in `StreamWrapper` with `unsafe impl Send/Sync`.
     *   `src/midi/mod.rs`: `MidiOutputEngine` — connects to a port whose name contains `--port` (default `OP-1`). Note payload is sent as `0x90, note + 60, velocity*127`.
-    *   `src/visualizer/mod.rs`: HUD text/status overlay; `draw_skeleton()` is currently unused.
+    *   `src/visualizer/mod.rs`: all frame overlays — `draw_skeleton()` (bones + joint dots) and `draw_hud()` (gesture text / status). Only landmark indices from MediaPipe's `HandLandmarksConnections` are drawn; the legacy `solutions.hands` cross-links ((9,4), (4,7), (4,10), (9,2), (13,5), (14,5)) are intentionally omitted because they assume an upright palm and render as stray lines on rotated hands.
 
 ## Key Module Reference
 | Module | Responsibility |
@@ -70,7 +70,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
 | `src/strategies/mod.rs` | Landmark → `GestureEvent` mappings. |
 | `src/audio/synthesizer.rs` | cpal sine-wave audio sink. |
 | `src/midi/mod.rs` | midir MIDI sink. |
-| `src/visualizer/mod.rs` | Hand skeleton (`HAND_CONNECTIONS`, 27 edges) and HUD overlay. |
+| `src/visualizer/mod.rs` | Hand skeleton (`HAND_CONNECTIONS`, the 21-edge MediaPipe `HandLandmarksConnections` topology) and HUD overlay. |
 | `src/sources/mock.rs` | Unused mock source (legacy). |
 
 ## Running It
