@@ -39,7 +39,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
     *   `src/sources/mock.rs`: `MockSource` / `MockSourceImpl` are **dead code**. Mock mode is generated inline in `main.rs` (`Mode::Mock` branch, one event every 2 s).
 
 2.  **Vision Phase** (`src/vision/tracker.rs`, `HandTrackerImpl`):
-    *   Stage 1 — `run_detector()`: largest centred square of the frame resampled to **192×192** via `sample_affine_to_tensor()` (hand-written bilinear sampling, BGR→RGB, `/255`). Outputs 2016 boxes (18 values per anchor) + 2016 raw scores; scores are **sigmoid**-ed, argmax wins, gated by `SCORE_THRESHOLD = 0.3`.
+    *   Stage 1 — `run_detector()`: largest centred square of the frame resampled to **192×192** via `sample_affine_to_tensor()` (OpenCV `resize` on the crop — `warpAffine` if it runs off the frame edge — then one bulk BGR→RGB `/255` pass). It returns a `Resampled { tensor, map }` so the box/landmark conversion uses the mapping that was actually applied. Outputs 2016 boxes (18 values per anchor) + 2016 raw scores; scores are **sigmoid**-ed, argmax wins, gated by `SCORE_THRESHOLD = 0.3`.
     *   Anchor offsets are converted to frame pixels and the palm box is **expanded ×2** to cover the whole hand (`r#box` = `(x, y, w, h)` in frame pixels).
     *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`). `--debug` prints the winning anchor, the landmark bbox and all 21 landmark coordinates.
     *   The tracker computes geometry only — it draws nothing. All overlays live in `src/visualizer/mod.rs`.
@@ -90,10 +90,11 @@ cargo run -- --image <any-photo-with-a-hand.png> --dump-frame output_frame.png -
 Useful `Args`: `--mode signal|midi|mock`, `--amplitude`, `--port`, `--image`, `--dump-frame`, `--max-frames`, `--debug`.
 
 ## Known Gaps / Things To Fix
+See `ROADMAP.md` for the prioritised list of next features and performance work (effort-tagged).
 - **MIDI range bug**: `FingerPositionStrategy` emits notes 36–84 and `MidiOutputEngine` adds +60 → values up to 144, outside the 0–127 MIDI range. Either drop the +60 offset or narrow the strategy range.
 - No notes are ever sent **off**; note-on events repeat with no release.
 - `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `no_gesture()` is unused; the hand box is computed but never drawn.
-- No tests, no lint/CI; `cargo check` warnings are the only signal.
+- Unit tests cover the strategies and the resampling helper (`cargo test`); the bench is `#[ignore]`d. Still no lint/CI.
 - The loop is single-threaded: detection runs on the same thread as rendering/audio dispatch.
 
 ## Development Guidelines for AI Assistants

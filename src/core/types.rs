@@ -1,5 +1,4 @@
-use serde::{Serialize, Deserialize};
-
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
@@ -12,15 +11,9 @@ pub enum EventType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GesturePayload {
     // For Continuous gestures (e.g., frequency modulation)
-    Signal {
-        frequency: f32,
-        amplitude: f32,
-    },
+    Signal { frequency: f32, amplitude: f32 },
     // For Discrete gestures (e.g., note on/off)
-    Note {
-        note: u8,
-        velocity: f32,
-    },
+    Note { note: u8, velocity: f32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +30,10 @@ impl GestureEvent {
     pub fn new_signal(frequency: f32, amplitude: f32, text: &str) -> Self {
         Self {
             event_type: EventType::Continuous,
-            payload: GesturePayload::Signal { frequency, amplitude },
+            payload: GesturePayload::Signal {
+                frequency,
+                amplitude,
+            },
             text: text.to_string(),
             color: (0, 255, 0), // Green for signal
         }
@@ -57,7 +53,10 @@ impl GestureEvent {
     pub fn no_gesture() -> Self {
         Self {
             event_type: EventType::Discrete,
-            payload: GesturePayload::Note { note: 0, velocity: 0.0 }, // Dummy payload
+            payload: GesturePayload::Note {
+                note: 0,
+                velocity: 0.0,
+            }, // Dummy payload
             text: "No Hand Detected".to_string(),
             color: (255, 0, 0), // Red for empty/error
         }

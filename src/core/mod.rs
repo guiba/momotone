@@ -1,5 +1,5 @@
-pub mod types;
 pub mod event_bus;
+pub mod types;
 
 use crate::core::types::GestureEvent;
 use anyhow::Result;
@@ -32,7 +32,7 @@ pub trait Sink: Send + Sync {
 
 /// Interface for the source of movement (Webcam/Mock).
 pub trait Source: Send + Sync {
-    fn update(&mut self) -> Result<Option<Vec<Landmark>>>; 
+    fn update(&mut self) -> Result<Option<Vec<Landmark>>>;
 }
 
 /// Interface for hand tracking.

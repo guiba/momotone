@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use opencv::prelude::*;
 use opencv::videoio;
 
-
 pub struct WebcamSource {
     cap: videoio::VideoCapture,
 }

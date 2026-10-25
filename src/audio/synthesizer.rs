@@ -1,7 +1,7 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crate::core::Sink;
 use crate::core::types::{GestureEvent, GesturePayload};
+use crate::core::Sink;
 use anyhow::{anyhow, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 
 /// A single sine wave oscillator.
@@ -37,7 +37,7 @@ struct SynthesizerState {
 }
 
 /// Wrapper to allow cpal::Stream (which is !Sync) to be used inside a Sync struct.
-/// This is safe because we only access it through &mut self in Sink methods, 
+/// This is safe because we only access it through &mut self in Sink methods,
 /// ensuring exclusive access if the caller respects Rust's borrowing rules.
 struct StreamWrapper(cpal::Stream);
 
@@ -64,7 +64,10 @@ impl Synthesizer {
     pub fn update_from_event(&self, event: &GestureEvent) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| anyhow!("Mutex lock error"))?;
         match &event.payload {
-            GesturePayload::Signal { frequency, amplitude } => {
+            GesturePayload::Signal {
+                frequency,
+                amplitude,
+            } => {
                 if state.voices.is_empty() {
                     state.voices.push(Voice::new(*frequency, *amplitude));
                 } else {
@@ -95,7 +98,8 @@ impl Synthesizer {
 impl Sink for Synthesizer {
     fn start(&mut self) -> Result<()> {
         let host = cpal::default_host();
-        let device = host.default_output_device()
+        let device = host
+            .default_output_device()
             .ok_or_else(|| anyhow!("No audio output device found"))?;
         let config: cpal::StreamConfig = device.default_output_config()?.into();
 

@@ -1,5 +1,5 @@
-use crate::core::{HandDetectionResult, Strategy};
 use crate::core::types::GestureEvent;
+use crate::core::{HandDetectionResult, Strategy};
 
 pub struct SimplePinchStrategy {
     pub threshold: f32,
@@ -17,7 +17,7 @@ impl Strategy for SimplePinchStrategy {
         if landmarks.len() < 8 {
             return None;
         }
-        
+
         let thumb = &landmarks[4];
         let index = &landmarks[8];
 
@@ -90,8 +90,8 @@ impl Strategy for FingerPositionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{HandDetectionResult, Landmark};
     use crate::core::types::GesturePayload;
+    use crate::core::{HandDetectionResult, Landmark};
 
     /// A detection with a 200x200 hand box and a fixed landmark layout; only the
     /// thumb tip x coordinate changes, i.e. the thumb/index spread.
@@ -111,7 +111,9 @@ mod tests {
     }
 
     fn velocity(thumb_x: f32) -> f32 {
-        let event = FingerPositionStrategy.process(&detection_with_spread(thumb_x)).unwrap();
+        let event = FingerPositionStrategy
+            .process(&detection_with_spread(thumb_x))
+            .unwrap();
         match event.payload {
             GesturePayload::Note { velocity, .. } => velocity,
             _ => panic!("expected a note payload"),
@@ -125,15 +127,25 @@ mod tests {
         let pinched = velocity(1102.0); //   2 px apart
         let mid = velocity(1160.0); //    60 px apart
         let wide = velocity(1220.0); //  120 px apart
-        assert!(pinched < mid && mid < wide, "volume must rise with distance: {pinched} < {mid} < {wide}");
+        assert!(
+            pinched < mid && mid < wide,
+            "volume must rise with distance: {pinched} < {mid} < {wide}"
+        );
         assert!((pinched - 2.0 / 200.0 / 0.6).abs() < 1e-6);
         assert!((mid - 0.5).abs() < 1e-6);
-        assert!((wide - 1.0).abs() < 1e-6, "beyond MAX_SPREAD saturates at 1.0");
+        assert!(
+            (wide - 1.0).abs() < 1e-6,
+            "beyond MAX_SPREAD saturates at 1.0"
+        );
     }
 
     #[test]
     fn no_gesture_without_landmarks() {
-        let empty = HandDetectionResult { hand_landmarks: None, r#box: Some((0.0, 0.0, 10.0, 10.0)), score: 0.1 };
+        let empty = HandDetectionResult {
+            hand_landmarks: None,
+            r#box: Some((0.0, 0.0, 10.0, 10.0)),
+            score: 0.1,
+        };
         assert!(FingerPositionStrategy.process(&empty).is_none());
     }
 }

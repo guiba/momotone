@@ -15,17 +15,32 @@ use crate::core::HandDetectionResult;
 /// rotated, so they are deliberately not used here.
 const HAND_CONNECTIONS: [(usize, usize); 21] = [
     // palm: wrist -> thumb CMC -> knuckle line -> back to wrist
-    (0, 1), (0, 5), (5, 9), (9, 13), (13, 17), (0, 17),
+    (0, 1),
+    (0, 5),
+    (5, 9),
+    (9, 13),
+    (13, 17),
+    (0, 17),
     // thumb
-    (1, 2), (2, 3), (3, 4),
+    (1, 2),
+    (2, 3),
+    (3, 4),
     // index
-    (5, 6), (6, 7), (7, 8),
+    (5, 6),
+    (6, 7),
+    (7, 8),
     // middle
-    (9, 10), (10, 11), (11, 12),
+    (9, 10),
+    (10, 11),
+    (11, 12),
     // ring
-    (13, 14), (14, 15), (15, 16),
+    (13, 14),
+    (14, 15),
+    (15, 16),
     // pinky
-    (17, 18), (18, 19), (19, 20),
+    (17, 18),
+    (18, 19),
+    (19, 20),
 ];
 
 pub struct Visualizer {

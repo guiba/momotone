@@ -1,5 +1,5 @@
-use crate::core::Sink;
 use crate::core::types::{GestureEvent, GesturePayload};
+use crate::core::Sink;
 use anyhow::{anyhow, Result};
 use midir::{MidiOutput, MidiOutputConnection};
 use std::sync::Mutex;
@@ -22,11 +22,16 @@ impl Sink for MidiOutputEngine {
     fn start(&mut self) -> Result<()> {
         let midi_out = MidiOutput::new("Gesture MIDI")?;
         let available_ports = midi_out.ports();
-        
+
         // Find the port with a matching name
         let port = available_ports
             .iter()
-            .find(|p| midi_out.port_name(p).unwrap_or_default().contains(&self.port_name))
+            .find(|p| {
+                midi_out
+                    .port_name(p)
+                    .unwrap_or_default()
+                    .contains(&self.port_name)
+            })
             .ok_or_else(|| anyhow!("MIDI port '{}' not found", self.port_name))?;
 
         let conn = midi_out.connect(port, "Gesture MIDI Rust")?;
@@ -45,7 +50,7 @@ impl Sink for MidiOutputEngine {
             Some(c) => c.lock().unwrap(),
             None => return Ok(()), // If not started, ignore events
         };
- 
+
         match &event.payload {
             GesturePayload::Note { note, velocity } => {
                 if *note == 0 {

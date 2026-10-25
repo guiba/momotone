@@ -7,7 +7,9 @@ pub struct MockSource {
 
 impl MockSource {
     pub fn new() -> Self {
-        Self { start_time: Instant::now() }
+        Self {
+            start_time: Instant::now(),
+        }
     }
 }
 
@@ -27,7 +29,9 @@ pub struct MockSourceImpl {
 
 impl MockSourceImpl {
     pub fn new() -> Self {
-        Self { last_event_time: Instant::now() }
+        Self {
+            last_event_time: Instant::now(),
+        }
     }
 
     pub fn get_next(&mut self) -> Option<GestureEvent> {
@@ -35,14 +39,21 @@ impl MockSourceImpl {
             return None;
         }
         self.last_event_time = Instant::now();
-        
+
         // Randomly alternate between a note and continuous signal for simulation
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
         if now % 2 == 0 {
             Some(GestureEvent::new_note((now % 13) as u8, 0.8, "Mock Note"))
         } else {
-            Some(GestureEvent::new_signal(220.0 + (now % 440) as f32, 0.5, "Mock Signal"))
+            Some(GestureEvent::new_signal(
+                220.0 + (now % 440) as f32,
+                0.5,
+                "Mock Signal",
+            ))
         }
     }
 }
