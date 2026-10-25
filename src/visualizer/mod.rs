@@ -1,7 +1,25 @@
-use opencv::prelude::*;
-use opencv::imgproc;
 use opencv::core::{Point, Scalar};
+use opencv::imgproc;
+use opencv::prelude::*;
 
+use crate::core::HandDetectionResult;
+
+/// MediaPipe hand landmark connection pairs: wrist to the four knuckles, then
+/// each finger chain (MCP -> PIP -> DIP -> TIP). 27 edges over 21 landmarks.
+const HAND_CONNECTIONS: [(usize, usize); 27] = [
+    // thumb
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    // index
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    // middle
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    // ring
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    // pinky
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    // palm cross-links
+    (5, 2), (9, 4), (4, 7), (4, 10), (9, 2), (13, 5), (14, 5),
+];
 
 pub struct Visualizer {
     // In a real app, we might store state here for animations
@@ -12,13 +30,59 @@ impl Visualizer {
         Self {}
     }
 
+    /// Draw the hand skeleton: a bone between every connected landmark pair and
+    /// a joint dot at each landmark. Landmarks are in frame pixels; nothing is
+    /// drawn when the tracker did not find a hand.
+    pub fn draw_skeleton(
+        &self,
+        frame: &mut Mat,
+        detection: &HandDetectionResult,
+    ) -> opencv::Result<()> {
+        let landmarks = match &detection.hand_landmarks {
+            Some(l) if l.len() >= 21 => l,
+            _ => return Ok(()),
+        };
+
+        let bone = Scalar::new(255.0, 255.0, 255.0, 0.0); // white (BGR)
+        let joint = Scalar::new(0.0, 0.0, 255.0, 0.0); // red (BGR)
+
+        for (a, b) in HAND_CONNECTIONS {
+            if a >= landmarks.len() || b >= landmarks.len() {
+                continue;
+            }
+            imgproc::line(
+                frame,
+                Point::new(landmarks[a].x as i32, landmarks[a].y as i32),
+                Point::new(landmarks[b].x as i32, landmarks[b].y as i32),
+                bone,
+                2,
+                imgproc::LINE_AA,
+                0,
+            )?;
+        }
+
+        for landmark in landmarks {
+            imgproc::circle(
+                frame,
+                Point::new(landmark.x as i32, landmark.y as i32),
+                3,
+                joint,
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Draws the HUD (Heads-Up Display) on top of the camera frame.
     pub fn draw_hud(
-        &self, 
-        frame: &mut Mat, 
-        event_text: &str, 
+        &self,
+        frame: &mut Mat,
+        event_text: &str,
         color: (u8, u8, u8),
-        system_status: &[(&str, &str)], // e.g., [("MIDI", "Connected"), ("Audio", "Running")]
+        system_status: &[(&str, &str)], // e.g. [("MIDI", "Connected"), ("Audio", "Running")]
     ) -> opencv::Result<()> {
         let scalar_color = Scalar::new(color.0 as f64, color.1 as f64, color.2 as f64, 0.0);
 
@@ -53,22 +117,6 @@ impl Visualizer {
             y_offset += 30;
         }
 
-        Ok(())
-    }
-
-    /// Draw the hand skeleton (landmarks are in frame pixels).
-    pub fn draw_skeleton(&self, frame: &mut Mat, landmarks: &[crate::core::Landmark]) -> opencv::Result<()> {
-        for landmark in landmarks {
-            imgproc::circle(
-                frame,
-                Point::new(landmark.x as i32, landmark.y as i32),
-                4,
-                Scalar::new(255.0, 0.0, 0.0, 0.0),
-                -1,
-                imgproc::LINE_8,
-                0,
-            )?;
-        }
         Ok(())
     }
 }

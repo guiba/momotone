@@ -1,13 +1,12 @@
 //! Two-stage hand tracking: BlazeHand detector (192x192) + landmarker (224x224).
 //!
 //! The detector returns an axis-aligned hand box which is turned into a
-//! rectangle in frame pixel coordinates; the landmarker stage is wired up but
-//! only runs once a confident box is found.
+//! rectangle in frame pixel coordinates; the landmarker stage only runs once a
+//! confident box is found. The tracker only computes geometry - all drawing is
+//! handled by `crate::visualizer`.
 
 use anyhow::{anyhow, Context, Result};
 use ndarray::Array4;
-use opencv::core::{Point, Rect, Scalar};
-use opencv::imgproc;
 use opencv::prelude::*;
 
 use ort::session::Session;
@@ -316,47 +315,6 @@ impl HandTrackerImpl {
         Ok(result)
     }
 
-    /// Draw the axis-aligned bounding box of the detected hand.
-    pub fn draw_box_on_frame(&self, frame: &mut Mat, detection: &HandDetectionResult) -> Result<()> {
-        let Some((x, y, w, h)) = detection.r#box else {
-            return Ok(());
-        };
-
-        let fw = frame.cols();
-        let fh = frame.rows();
-        let x0 = x.max(0.0).min(fw as f32) as i32;
-        let y0 = y.max(0.0).min(fh as f32) as i32;
-        let x1 = (x + w).max(0.0).min(fw as f32) as i32;
-        let y1 = (y + h).max(0.0).min(fh as f32) as i32;
-        if x1 <= x0 || y1 <= y0 {
-            return Ok(());
-        }
-
-        imgproc::rectangle(
-            frame,
-            Rect::new(x0, y0, x1 - x0, y1 - y0),
-            Scalar::new(0.0, 255.0, 0.0, 0.0),
-            2,
-            imgproc::LINE_8,
-            0,
-        )?;
-
-        if let Some(landmarks) = &detection.hand_landmarks {
-            for lm in landmarks {
-                imgproc::circle(
-                    frame,
-                    Point::new(lm.x as i32, lm.y as i32),
-                    3,
-                    Scalar::new(255.0, 0.0, 0.0, 0.0),
-                    -1,
-                    imgproc::LINE_8,
-                    0,
-                )?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 fn load_anchors(path: &str) -> Result<Vec<(f32, f32)>> {

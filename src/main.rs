@@ -95,16 +95,18 @@
           }
       }
 
-       // 2. Initialize Vision and Strategy
-       let mut tracker = HandTrackerImpl::new(&args.detector_path, &args.landmarker_path, &args.anchors_path, args.debug)
-           .context("Failed to initialize hand tracker")?;
+       // 2. Initialize Vision, Strategy and the Visualizer
+        let mut tracker = HandTrackerImpl::new(&args.detector_path, &args.landmarker_path, &args.anchors_path, args.debug)
+            .context("Failed to initialize hand tracker")?;
+        let visualizer = Visualizer::new();
+        let strategy = FingerPositionStrategy;
 
-       // Headless single-image mode: useful for verifying the detection box offline.
-       if let Some(path) = &args.image {
-            let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
-                .with_context(|| format!("Failed to read image {path}"))?;
+        // Headless single-image mode: useful for verifying detection offline.
+        if let Some(path) = &args.image {
+             let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
+                 .with_context(|| format!("Failed to read image {path}"))?;
             let detection = tracker.process_frame(&frame)?;
-           tracker.draw_box_on_frame(&mut frame, &detection)?;
+            visualizer.draw_skeleton(&mut frame, &detection)?;
            let out = args.dump_frame.clone().unwrap_or_else(|| "output_frame.png".to_string());
            opencv::imgcodecs::imwrite(&out, &frame, &opencv::core::Vector::new())?;
            println!("Detection: box={:?} score={:.3} landmarks={}",
@@ -113,10 +115,7 @@
            return Ok(());
        }
 
-       let mut camera = WebcamSource::new(0).context("Failed to open webcam")?;
-       let visualizer = Visualizer::new();
-       let strategy = FingerPositionStrategy;
-
+        let mut camera = WebcamSource::new(0).context("Failed to open webcam")?;
        // 3. Orchestration Loop
        let mut last_event_time = Instant::now();
        let mut iterations = 0;
@@ -156,10 +155,7 @@
           }
 
            // --- D. Visualization (The "Display") ---
-            
-            // Draw bounding box around detected hand
-            tracker.draw_box_on_frame(&mut frame, &detection)?;
-            
+            visualizer.draw_skeleton(&mut frame, &detection)?;
             let status = [
                 ("MIDI", if args.mode == Mode::Midi { "Connected" } else { "N/A" }),
                 ("Audio", if args.mode == Mode::Signal { "Running" } else { "Off" }),

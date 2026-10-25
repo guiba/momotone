@@ -31,7 +31,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
                                               |
                                         EventBus.dispatch()  ->  Sink.handle_event()
                                               |                        (Synthesizer / MidiOutputEngine)
-                                        Visualizer.draw_hud() + imshow
+                                        Visualizer.draw_skeleton() + draw_hud() + imshow
 ```
 
 1.  **Input Phase**:
@@ -42,7 +42,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
     *   Stage 1 — `run_detector()`: largest centred square of the frame resampled to **192×192** via `sample_affine_to_tensor()` (hand-written bilinear sampling, BGR→RGB, `/255`). Outputs 2016 boxes (18 values per anchor) + 2016 raw scores; scores are **sigmoid**-ed, argmax wins, gated by `SCORE_THRESHOLD = 0.3`.
     *   Anchor offsets are converted to frame pixels and the palm box is **expanded ×2** to cover the whole hand (`r#box` = `(x, y, w, h)` in frame pixels).
     *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`).
-    *   `draw_box_on_frame()` renders the box (green) and landmark dots (red).
+    *   The tracker computes geometry only — it draws nothing. All overlays live in `src/visualizer/mod.rs`.
     *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, score: f32 }` (defined in `src/core/mod.rs`).
 
 3.  **Strategy Phase** (`src/strategies/mod.rs`): implements `Strategy` from `src/core/mod.rs`.
@@ -66,11 +66,11 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
 | `src/core/types.rs` | `GestureEvent`, `GesturePayload`, `EventType`. |
 | `src/core/event_bus.rs` | crossbeam-channel event hub. |
 | `src/vision/camera.rs` | OpenCV webcam capture (`WebcamSource`). |
-| `src/vision/tracker.rs` | ONNX hand detection + landmark extraction + box drawing. |
+| `src/vision/tracker.rs` | ONNX hand detection + landmark extraction (no drawing). |
 | `src/strategies/mod.rs` | Landmark → `GestureEvent` mappings. |
 | `src/audio/synthesizer.rs` | cpal sine-wave audio sink. |
 | `src/midi/mod.rs` | midir MIDI sink. |
-| `src/visualizer/mod.rs` | HUD / skeleton overlay. |
+| `src/visualizer/mod.rs` | Hand skeleton (`HAND_CONNECTIONS`, 27 edges) and HUD overlay. |
 | `src/sources/mock.rs` | Unused mock source (legacy). |
 
 ## Running It
@@ -92,7 +92,7 @@ Useful `Args`: `--mode signal|midi|mock`, `--amplitude`, `--port`, `--image`, `-
 ## Known Gaps / Things To Fix
 - **MIDI range bug**: `FingerPositionStrategy` emits notes 36–84 and `MidiOutputEngine` adds +60 → values up to 144, outside the 0–127 MIDI range. Either drop the +60 offset or narrow the strategy range.
 - No notes are ever sent **off**; note-on events repeat with no release.
-- `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `no_gesture()` and `draw_skeleton()` are unused.
+- `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `no_gesture()` is unused; the hand box is computed but never drawn.
 - No tests, no lint/CI; `cargo check` warnings are the only signal.
 - The loop is single-threaded: detection runs on the same thread as rendering/audio dispatch.
 
