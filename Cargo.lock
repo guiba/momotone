@@ -470,7 +470,6 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "midir",
- "ndarray",
  "opencv",
  "ort",
  "serde",
