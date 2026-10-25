@@ -46,7 +46,7 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
     *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, score: f32 }` (defined in `src/core/mod.rs`).
 
 3.  **Strategy Phase** (`src/strategies/mod.rs`): implements `Strategy` from `src/core/mod.rs`.
-    *   `FingerPositionStrategy` — the one used by `main.rs`. Index-tip Y normalised against the hand box → note **36–84**; thumb↔index distance → velocity 0–1.
+    *   `FingerPositionStrategy` — the one used by `main.rs`. Index-tip Y normalised against the hand box → note **36–84**; thumb↔index distance → velocity/volume 0–1, where fingers spread apart is loud and a pinch is silent (saturates at `MAX_SPREAD = 0.6` of the hand box height). Unit tests in `src/strategies/mod.rs` cover the direction of the mapping.
     *   `SimplePinchStrategy` (thumb/index distance < 0.05) and `FrequencyStrategy` exist but are **not wired in**.
 
 4.  **Orchestration**:
