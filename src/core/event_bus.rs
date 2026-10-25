@@ -1,5 +1,5 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use crate::core::types::GestureEvent;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 /// A simple high-performance event bus using crossbeam channels.
 #[derive(Clone)]

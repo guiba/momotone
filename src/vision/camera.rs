@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use opencv::prelude::*;
 use opencv::videoio;
-use crate::core::Landmark;
 
 pub struct WebcamSource {
     cap: videoio::VideoCapture,
