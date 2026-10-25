@@ -19,7 +19,6 @@ midir = "0.11"
 
 # Vision & Math
 opencv = { version = "0.100", features = ["clang-runtime"] }
-ndarray = "0.17"
 
 # Concurrency/Async (Useful for management)
 tokio = { version = "1.36", features = ["full"] }
