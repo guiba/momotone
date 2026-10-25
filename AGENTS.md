@@ -3,64 +3,110 @@
 This document provides structural and architectural context to guide AI assistants in working with this codebase.
 
 ## Project Overview
-`gesture_rust` is a high-performance, real-time hand gesture recognition engine implemented in Rust. It processes webcam input via OpenCV, extracts hand landmarks, and translates those movements into audio signals (via `cpal`) or MIDI messages (via `midir`) using an asynchronous event-driven architecture.
+`gesture_rust` is a real-time hand gesture recognition engine in Rust: OpenCV captures webcam frames, an **ONNX two-stage hand pipeline** (BlazeHand detector → landmark detector, via `ort`) produces a hand box plus 21 landmarks, a **strategy** turns those landmarks into a `GestureEvent`, and the **event bus** dispatches it to sinks (audio, MIDI) while the visualizer renders an HUD.
+
+> **Current status (Oct 2026):** the vision pipeline works end-to-end and `cargo check` passes (14 dead-code warnings, no errors). The runtime is a **single synchronous loop in `main.rs`** — `tokio` is still in `Cargo.toml` but is not used anywhere in `src/`. The detector stage is solid; the landmarker stage runs and returns 21 landmarks but is only lightly validated. Several modules (`sources/mock.rs`, unused strategies, the `Source`/`Tracker` traits) are scaffolding from earlier iterations.
 
 ## Tech Stack
 - **Language**: Rust (Edition 2021)
-- **Vision**: `opencv` (OpenCV bindings), `ndarray` (Linear algebra/matrix ops)
-- **Audio**: `cpal` (Low-level audio I/O)
-- **MIDI**: `midir` (MIDI communication)
-- **Concurrency**: `tokio` (Async runtime), `crossbeam-channel` (High-performance MPMC channels)
-- **CLI/Config**: `clap` (CLI parsing), `serde`/`serde_json` (Serialization)
-- **Error Handling**: `anyhow`
+- **Vision / inference**: `opencv` 0.100 (`clang-runtime` feature), `ort` 2.0.0-rc.13 (ONNX Runtime), `ndarray` 0.17
+- **Audio**: `cpal` 0.17 (`Synthesizer` with a `Voice` sine oscillator)
+- **MIDI**: `midir` 0.11 (`MidiOutputEngine`)
+- **Messaging**: `crossbeam-channel` (unbounded MPMC) — the event bus
+- **CLI**: `clap` 4.5 (derive); `serde`/`serde_json` on the event types
+- **Async**: `tokio` declared but **unused**; concurrency is `std` + `Mutex`/`Arc`
+- **Error handling**: `anyhow`
+
+## Build Environment
+- `.cargo/config.toml` forces `LIBCLANG_PATH` / `DYLD_LIBRARY_PATH` to `/opt/homebrew/opt/llvm/lib` (Homebrew LLVM) so the `opencv` build script finds clang. Do not remove it on macOS.
+- OpenCV is built by the crate's build script on first compile; `target/` is ~1.7 GB and is gitignored.
+- Quick verification loop: `cargo check` (≈4 s warm) rather than a full build.
 
 ## Core Architecture & Data Flow
-The project follows a **Producer-Consumer** pattern mediated by an **Event Bus**.
+Everything is orchestrated synchronously inside the `loop` in `src/main.rs`:
 
-1.  **Input Phase (Sources)**:
-    *   `src/vision/camera.rs`: Captures frames from the webcam via OpenCV.
-    *   `src/sources/mock.rs`: Provides mock data for testing without hardware.
-    *   Both implement traits defined in `src/core/mod.rs` (see `Source`).
+```
+WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.process()
+        (opencv)                 (ort: detector + landmarker)          (GestureEvent)
+                                              |
+                                        EventBus.dispatch()  ->  Sink.handle_event()
+                                              |                        (Synthesizer / MidiOutputEngine)
+                                        Visualizer.draw_hud() + imshow
+```
 
-2.  **Processing Phase (Vision)**:
-    *   `src/vision/tracker.rs`: Uses hand detection models to identify landmarks within video frames. 
-    *   Results are encapsulated in `HandDetectionResult`.
+1.  **Input Phase**:
+    *   `src/vision/camera.rs`: `WebcamSource::get_frame()` returns an OpenCV `Mat` (BGR). It does **not** implement the `Source` trait — that trait is currently unused scaffolding.
+    *   `src/sources/mock.rs`: `MockSource` / `MockSourceImpl` are **dead code**. Mock mode is generated inline in `main.rs` (`Mode::Mock` branch, one event every 2 s).
 
-3.  **Orchestration Phase (The Glue)**:
-    *   `src/core/event_bus.rs`: The central hub (`EventBus`) that routes `GestureEvent`s based on their `EventType`.
-    *   `src/core/types.rs`: Defines the core data models like `Landmark`, `GesturePayload`, and `EventType`.
+2.  **Vision Phase** (`src/vision/tracker.rs`, `HandTrackerImpl`):
+    *   Stage 1 — `run_detector()`: largest centred square of the frame resampled to **192×192** via `sample_affine_to_tensor()` (hand-written bilinear sampling, BGR→RGB, `/255`). Outputs 2016 boxes (18 values per anchor) + 2016 raw scores; scores are **sigmoid**-ed, argmax wins, gated by `SCORE_THRESHOLD = 0.3`.
+    *   Anchor offsets are converted to frame pixels and the palm box is **expanded ×2** to cover the whole hand (`r#box` = `(x, y, w, h)` in frame pixels).
+    *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`).
+    *   `draw_box_on_frame()` renders the box (green) and landmark dots (red).
+    *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, score: f32 }` (defined in `src/core/mod.rs`).
 
-4.  **Output Phase (Sinks)**:
-    *   Subscribers to the Event Bus implement the `Sink` trait:
-        *   `src/audio/synthesizer.rs`: Converts gestures into continuous audio tones.
-        *   `src/midi/mod.rs`: Maps gestures to MIDI notes/CC messages for external hardware (e.g., OP-1).
-        *   `src/visualizer/mod.rs`: Renders the detection overlays onto the video feed for UI feedback.
+3.  **Strategy Phase** (`src/strategies/mod.rs`): implements `Strategy` from `src/core/mod.rs`.
+    *   `FingerPositionStrategy` — the one used by `main.rs`. Index-tip Y normalised against the hand box → note **36–84**; thumb↔index distance → velocity 0–1.
+    *   `SimplePinchStrategy` (thumb/index distance < 0.05) and `FrequencyStrategy` exist but are **not wired in**.
+
+4.  **Orchestration**:
+    *   `src/core/event_bus.rs`: `EventBus::new()` returns `(EventBus, Receiver<GestureEvent>)`; `dispatch()` sends on a crossbeam channel. `main.rs` drains with `try_recv()` each iteration.
+    *   `src/core/types.rs`: `EventType { Continuous, Discrete }`, `GesturePayload { Signal { frequency, amplitude } | Note { note, velocity } }`, `GestureEvent { event_type, payload, text, color }` plus constructors `new_signal`, `new_note`, `no_gesture` (unused).
+
+5.  **Output Phase** (implement `Sink`: `start`/`stop`/`handle_event`):
+    *   `src/audio/synthesizer.rs`: `Synthesizer` — cpal output stream; shared `Arc<Mutex<SynthesizerState>>` between the callback and the event handler. `cpal::Stream` is wrapped in `StreamWrapper` with `unsafe impl Send/Sync`.
+    *   `src/midi/mod.rs`: `MidiOutputEngine` — connects to a port whose name contains `--port` (default `OP-1`). Note payload is sent as `0x90, note + 60, velocity*127`.
+    *   `src/visualizer/mod.rs`: HUD text/status overlay; `draw_skeleton()` is currently unused.
 
 ## Key Module Reference
 | Module | Responsibility |
 | :--- | :--- |
-| `src/main.rs` | Entry point, CLI argument parsing (`Args`), and lifecycle management. |
-| `src/core/` | The backbone: Traits (`Source`, `Sink`, `Tracker`) and shared data types. |
-| `src/vision/` | Computer vision implementation (Webcam capture and Landmark tracking). |
-| `src/audio/` | Audio synthesis engine and stream management. |
-| `src/midi/` | MIDI communication protocols and output mapping. |
+| `src/main.rs` | Entry point, `Args` (clap), sink setup, and the camera → tracker → strategy → sinks → HUD loop. |
+| `src/core/mod.rs` | Traits (`Sink`, `Strategy`, and the unused `Source`/`Tracker`) + `Landmark`, `HandDetectionResult`. |
+| `src/core/types.rs` | `GestureEvent`, `GesturePayload`, `EventType`. |
+| `src/core/event_bus.rs` | crossbeam-channel event hub. |
+| `src/vision/camera.rs` | OpenCV webcam capture (`WebcamSource`). |
+| `src/vision/tracker.rs` | ONNX hand detection + landmark extraction + box drawing. |
+| `src/strategies/mod.rs` | Landmark → `GestureEvent` mappings. |
+| `src/audio/synthesizer.rs` | cpal sine-wave audio sink. |
+| `src/midi/mod.rs` | midir MIDI sink. |
+| `src/visualizer/mod.rs` | HUD / skeleton overlay. |
+| `src/sources/mock.rs` | Unused mock source (legacy). |
+
+## Running It
+Models live in `gesture_rust/assets/` and are **gitignored** — they must be present locally or the tracker fails at startup. They come from the Unity/Sentis BlazeHand package (`mediapipe_hand_gesture-onnx-float.zip`; see `assets/new_readme.md`). Defaults:
+`--detector-path assets/hand_detector.onnx`, `--landmarker-path assets/hand_landmarks_detector.onnx`, `--anchors-path assets/anchors.csv` (2016 anchors, normalised 0–1).
+
+```bash
+cargo run                                  # signal mode, audio output
+cargo run -- --mode midi --port OP-1       # MIDI output
+cargo run -- --mode mock                   # no hand needed, simulated events
+cargo run -- --debug                       # tracker diagnostics to stderr
+
+# Headless detection check without a webcam (best way to verify the box):
+cargo run -- --image <any-photo-with-a-hand.png> --dump-frame output_frame.png --max-frames 1
+```
+
+Useful `Args`: `--mode signal|midi|mock`, `--amplitude`, `--port`, `--image`, `--dump-frame`, `--max-frames`, `--debug`.
+
+## Known Gaps / Things To Fix
+- **MIDI range bug**: `FingerPositionStrategy` emits notes 36–84 and `MidiOutputEngine` adds +60 → values up to 144, outside the 0–127 MIDI range. Either drop the +60 offset or narrow the strategy range.
+- No notes are ever sent **off**; note-on events repeat with no release.
+- `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `no_gesture()` and `draw_skeleton()` are unused.
+- No tests, no lint/CI; `cargo check` warnings are the only signal.
+- The loop is single-threaded: detection runs on the same thread as rendering/audio dispatch.
 
 ## Development Guidelines for AI Assistants
 
 ### 1. Design Patterns
-- **Trait-Based Abstraction**: When adding a new input (e.g., a different camera API) or a new output (e.g., OSC), implement the `Source` or `Sink` traits from `src/core/mod.rs`.
-- **Asynchronous Runtime**: The project relies on `tokio`. Ensure long-running tasks or hardware I/O are handled without blocking the main event loop.
-- **Error Handling**: Use `anyhow::Result` for all functions that can fail, particularly in the vision and audio pipelines.
+- **Trait-Based Abstraction**: To add a new output (e.g. OSC), implement `Sink` (`src/core/mod.rs`) and push it into the `sinks` vec in `main.rs`. New gesture logic means a new `Strategy` impl in `src/strategies/mod.rs`.
+- **Coordinate discipline**: landmarks and boxes are always in **frame pixel space**, not normalised. Convert explicitly when feeding a model (192×192 detector, 224×224 landmarker) and convert back when drawing.
+- **Error Handling**: Use `anyhow::Result` with `.context()`/`.with_context()` for model loading and frame I/O so failures name the file or stage.
+- **Real-Time Constraints**: Keep `process_frame()` allocation-light; avoid blocking I/O (file writes, MIDI sends) inside the cpal audio callback — that callback must stay sample-rate safe.
 
-### 2. Real-Time Constraints
-- This is a real-time application. Avoid heavy computational tasks or blocking I/O inside the primary detection or audio callback loops.
-- Prefer `crossbeam-channel` for high-throughput message passing between the vision thread and the output engines.
+### 2. Coding Style
+- Follow standard Rust idioms (`rustfmt`/`clippy`), prefer explicit `?` over `.unwrap()`/`.expect()` in vision/audio paths.
+- Treat the existing `unsafe impl Send for StreamWrapper` and `unsafe { ... }` pointer sampling as deliberate; add a comment explaining safety before touching them.
 
-### 3. Coding Style
-- Follow standard Rust idioms (`rustfmt`/`clippy`).
-- Use explicit error propagation (`?`) rather than `.unwrap()` or `.expect()` in production-critical code (audio/vision).
-
-### 4. Never do this actions
-- NEVER run ls -R there are a lot of external dependency files i target folder
-- NEVER mixes find/replace and line-range fields when using edit tool
-|
+### 3. Never do these actions
+- NEVER run `ls -R` — `target/` holds ~1.7 GB of dependency artifacts.
