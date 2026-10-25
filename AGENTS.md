@@ -61,11 +61,6 @@ The project follows a **Producer-Consumer** pattern mediated by an **Event Bus**
 - Use explicit error propagation (`?`) rather than `.unwrap()` or `.expect()` in production-critical code (audio/vision).
 
 ### 4. Never do this actions
-- run ls -R there are a lot of external dependency files i target folder
-- mixes find/replace and line-range fields when using edit tool
-### 5. edit tool instructions
-- The edit tool requires either oldString, newString, replaceAll, or startLine/endLine
-- prevent the following errors
-  - edit: edits[0].startLine must be a positive integer
-  - edit: edits[0] mixes find/replace and line-range fields  
+- NEVER run ls -R there are a lot of external dependency files i target folder
+- NEVER mixes find/replace and line-range fields when using edit tool
 |

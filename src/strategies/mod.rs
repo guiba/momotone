@@ -1,4 +1,4 @@
-use crate::core::{HandDetectionResult, Landmark, Strategy};
+use crate::core::{HandDetectionResult, Strategy};
 use crate::core::types::GestureEvent;
 
 pub struct SimplePinchStrategy {
@@ -64,16 +64,17 @@ impl Strategy for FingerPositionStrategy {
         let thumb = &landmarks[4];
         let index = &landmarks[8];
 
-        // 1. Map Index Y position to MIDI Note (36 to 84 range)
-        // y=0 (top) -> note 84; y=1 (bottom) -> note 36
-        let y_pos = index.y as f32;
+        // Landmarks are in frame pixels; normalise them against the hand box so
+        // the mapping does not depend on the camera resolution.
+        let (_, by, _, bh) = detection.r#box.unwrap_or((0.0, 0.0, 1.0, 1.0));
+        let y_pos = (index.y - by) / bh.max(1.0);
         let note_f = (1.0 - y_pos) * (84.0 - 36.0) + 36.0;
         let note = note_f.clamp(36.0, 84.0) as u8;
 
         // 2. Map Distance between Thumb and Index to Velocity (0.0 to 1.0)
         let dx = thumb.x - index.x;
         let dy = thumb.y - index.y;
-        let distance = (dx * dx + dy * dy).sqrt();
+        let distance = (dx * dx + dy * dy).sqrt() / bh.max(1.0);
 
         // Pinching (distance close to 0) -> Velocity 1.0
         // Large distance -> Velocity 0.0

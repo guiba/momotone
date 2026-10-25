@@ -14,9 +14,13 @@ pub struct Landmark {
     pub z: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HandDetectionResult {
     pub hand_landmarks: Option<Vec<Landmark>>,
+    /// (x, y, w, h) bounding box of the detected hand, in frame pixels.
+    pub r#box: Option<(f32, f32, f32, f32)>,
+    /// Detection confidence of the winning anchor (0..1).
+    pub score: f32,
 }
 
 /// Interface for an output sink (Audio or MIDI).

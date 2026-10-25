@@ -1,5 +1,4 @@
-use crate::core::{Sink, types::{GestureEvent, EventType, GesturePayload}};
-use anyhow::Result;
+use crate::core::types::GestureEvent;
 use std::time::{Duration, Instant};
 
 pub struct MockSource {
