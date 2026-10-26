@@ -1,17 +1,22 @@
-//! The stage: a stylised backdrop with the hand skeleton drawn on top.
+//! The stage: a note keyboard with the hand skeleton drawn on top of it.
 //!
-//! The webcam feed is off by default — the panel is a dark vertical gradient,
-//! a soft centre glow, and a ruler grid locked to the camera frame's pixel
-//! grid. Landmarks and the detector box arrive in *frame pixels*; `Mapping`
-//! scales them into the widget bounds while preserving the frame's aspect
-//! ratio, and the optional feed image is drawn into exactly the same
-//! letterboxed rectangle, so the overlay always lines up with the image.
+//! The grid *is* the instrument: one column per semitone of the range
+//! `FingerPositionStrategy` can reach (36 · C2 .. 84 · C6, left to right),
+//! coloured by pitch class. Every note keeps a brightness that decays
+//! exponentially, so the key you just released fades out while the one you are
+//! holding glows.
+//!
+//! Landmarks and the detector box arrive in *frame pixels*; `Mapping` scales
+//! them into the widget bounds while preserving the frame's aspect ratio, and
+//! the optional feed image is drawn into exactly the same letterboxed
+//! rectangle, so the overlay always lines up with the image.
 
 use iced::widget::canvas::{Frame, Geometry, Image, Path, Program, Stroke, Text};
 use iced::widget::image::Handle;
 use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::Landmark;
+use crate::dashboard::metrics::{note_frequency, note_index, note_name, NOTE_COUNT, NOTE_LOW};
 
 /// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
 /// the palm, 1..5 are thumb..pinky. See `visualizer/mod.rs` for the same list
@@ -53,36 +58,36 @@ const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
 /// The outer palm loop, used as a faint hull fill behind the bones.
 const PALM_HULL: [usize; 5] = [0, 5, 9, 13, 17];
 
-// --- stage backdrop -----------------------------------------------------------
+// --- keyboard ---------------------------------------------------------------
+/// One hue per pitch class, stepping 30° around the colour wheel: C red, D
+/// yellow-green, E green, F cyan, G blue, A violet, B magenta...
+const PITCH_COLORS: [Color; 12] = [
+    Color::from_rgb8(228, 88, 88),  // C
+    Color::from_rgb8(228, 158, 88), // C#
+    Color::from_rgb8(228, 228, 88), // D
+    Color::from_rgb8(158, 228, 88), // D#
+    Color::from_rgb8(88, 228, 88),  // E
+    Color::from_rgb8(88, 228, 158), // F
+    Color::from_rgb8(88, 158, 228), // F#
+    Color::from_rgb8(88, 228, 228), // G
+    Color::from_rgb8(88, 88, 228),  // G#
+    Color::from_rgb8(158, 88, 228), // A
+    Color::from_rgb8(228, 88, 158), // A#
+    Color::from_rgb8(228, 88, 228), // B
+];
+
 const PANEL_TOP: Color = Color::from_rgb8(23, 28, 35);
 const PANEL_BOTTOM: Color = Color::from_rgb8(11, 13, 17);
 const GLOW: Color = Color::from_rgb8(48, 61, 78);
 const GRID: Color = Color::from_rgb8(26, 31, 39);
-const GRID_MAJOR: Color = Color::from_rgb8(40, 47, 57);
+const GRID_MAJOR: Color = Color::from_rgb8(44, 52, 62);
 const STAGE_EDGE: Color = Color::from_rgb8(52, 60, 70);
+const MUTED: Color = Color::from_rgb8(122, 132, 142);
 
 const GRADIENT_STEPS: usize = 24;
 const GLOW_RINGS: usize = 12;
-/// Camera pixels between grid lines: the grid doubles as a ruler of the frame.
-const GRID_STEP_PX: f32 = 32.0;
-/// Every Nth grid line is drawn brighter.
-const GRID_MAJOR_EVERY: usize = 4;
-
-#[derive(Debug, Clone)]
-pub struct Skeleton {
-    /// The camera frame as RGBA pixels. Only drawn when `show_feed` is true.
-    pub image: Option<Handle>,
-    /// Header toggle: put the webcam image back behind the skeleton.
-    pub show_feed: bool,
-    pub landmarks: Vec<Landmark>,
-    pub frame_size: (usize, usize),
-    pub hand_box: Option<(f32, f32, f32, f32)>,
-    pub show_box: bool,
-    pub show_labels: bool,
-    pub detected: bool,
-    /// Milliseconds since the tracker last saw a hand.
-    pub lost_ms: u64,
-}
+/// Below this the trail is too dim to be worth a fill.
+const TRAIL_EPS: f32 = 0.02;
 
 fn tint(color: Color, alpha: f32) -> Color {
     Color {
@@ -137,10 +142,9 @@ impl Mapping {
     }
 }
 
-/// Gradient + glow + ruler grid. Drawn every tick; it is a handful of flat
-/// primitives, so it costs far less than the RGBA video upload it replaced.
-fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle, scale: f32) {
-    // Vertical gradient over the whole panel.
+/// Gradient + centre glow. Cheap flat primitives, far less than the RGBA video
+/// upload it replaced.
+fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle) {
     let strip = bounds.height / GRADIENT_STEPS as f32;
     for i in 0..GRADIENT_STEPS {
         let t = i as f32 / (GRADIENT_STEPS - 1) as f32;
@@ -153,7 +157,6 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle, scale: f32) 
         );
     }
 
-    // Soft centre glow, filled ring by ring from the outside in.
     let centre = Point::new(stage.x + stage.width * 0.5, stage.y + stage.height * 0.5);
     let radius = stage.width.min(stage.height) * 0.8;
     for ring in (0..GLOW_RINGS).rev() {
@@ -161,44 +164,134 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle, scale: f32) 
         frame.fill(&Path::circle(centre, radius * t), mix(GLOW, PANEL_BOTTOM, t));
     }
 
-    // Ruler grid, one line every GRID_STEP_PX camera pixels.
-    let step = GRID_STEP_PX * scale;
-    if step > 3.0 {
-        let cols = (stage.width / step).floor() as usize;
-        let rows = (stage.height / step).floor() as usize;
-        for i in 1..=cols {
-            let x = stage.x + step * i as f32;
-            frame.stroke(
-                &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
-                Stroke::default()
-                    .with_color(if i % GRID_MAJOR_EVERY == 0 {
-                        GRID_MAJOR
-                    } else {
-                        GRID
-                    })
-                    .with_width(1.0),
-            );
-        }
-        for i in 1..=rows {
-            let y = stage.y + step * i as f32;
-            frame.stroke(
-                &Path::line(Point::new(stage.x, y), Point::new(stage.x + stage.width, y)),
-                Stroke::default()
-                    .with_color(if i % GRID_MAJOR_EVERY == 0 {
-                        GRID_MAJOR
-                    } else {
-                        GRID
-                    })
-                    .with_width(1.0),
-            );
-        }
-    }
-
-    // The letterboxed frame region, so the coordinate space is visible.
     frame.stroke(
         &Path::rectangle(Point::new(stage.x, stage.y), Size::new(stage.width, stage.height)),
         Stroke::default().with_color(STAGE_EDGE).with_width(1.0),
     );
+}
+
+/// The playable range as a keyboard: 49 semitone columns, low to high left to
+/// right, each tinted with its pitch class. `trail[i]` is the current
+/// brightness of key `i` (already faded by the UI tick).
+fn keyboard(
+    frame: &mut Frame,
+    stage: Rectangle,
+    trail: &[f32; NOTE_COUNT],
+    current: Option<u8>,
+    volume: f32,
+) {
+    let key = stage.width / NOTE_COUNT as f32;
+
+    // 1. Every key, faintly coloured, so the ladder is legible with nothing held.
+    for i in 0..NOTE_COUNT {
+        frame.fill(
+            &Path::rectangle(
+                Point::new(stage.x + key * i as f32, stage.y),
+                Size::new(key, stage.height),
+            ),
+            tint(PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12], 0.05),
+        );
+    }
+
+    // 2. Key separators; the octave starts (every C) are drawn brighter.
+    for i in 1..NOTE_COUNT {
+        let x = stage.x + key * i as f32;
+        let major = (NOTE_LOW + i as u8) % 12 == 0;
+        frame.stroke(
+            &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
+            Stroke::default()
+                .with_color(if major { GRID_MAJOR } else { GRID })
+                .with_width(if major { 1.5 } else { 1.0 }),
+        );
+    }
+
+    // 3. The trail: notes you have just played, glowing and fading out.
+    for (i, level) in trail.iter().enumerate() {
+        if *level < TRAIL_EPS {
+            continue;
+        }
+        let x = stage.x + key * i as f32;
+        let color = PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12];
+        let is_current = current.map_or(false, |note| note_index(note) == i);
+
+        frame.fill(
+            &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
+            tint(color, 0.42 * level),
+        );
+        // Bright cap at the top of every lit key, so the fade reads even when
+        // the column itself is nearly transparent.
+        frame.fill(
+            &Path::rectangle(Point::new(x, stage.y), Size::new(key, 5.0)),
+            tint(color, 0.85 * level),
+        );
+
+        // The held key additionally carries a loudness bar rising from the floor.
+        if is_current {
+            let bar = stage.height * volume.clamp(0.0, 1.0);
+            frame.fill(
+                &Path::rectangle(
+                    Point::new(x, stage.y + stage.height - bar),
+                    Size::new(key, bar),
+                ),
+                tint(color, 0.55),
+            );
+        }
+    }
+
+    // 4. Outline the key being played and label it.
+    if let Some(note) = current {
+        let i = note_index(note);
+        let x = stage.x + key * i as f32;
+        let color = PITCH_COLORS[(note % 12) as usize];
+        frame.stroke(
+            &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
+            Stroke::default().with_color(color).with_width(2.0),
+        );
+        frame.fill_text(Text {
+            content: format!("{}  {:.0} Hz", note_name(note), note_frequency(note)),
+            position: Point::new(x, stage.y + 6.0),
+            max_width: stage.width,
+            color,
+            size: 13.0.into(),
+            ..Default::default()
+        });
+    }
+
+    // 5. Octave reference along the floor.
+    for i in 0..NOTE_COUNT {
+        let note = NOTE_LOW + i as u8;
+        if note % 12 != 0 {
+            continue;
+        }
+        frame.fill_text(Text {
+            content: note_name(note),
+            position: Point::new(stage.x + key * (i as f32 + 0.5) - 10.0, stage.y + stage.height - 18.0),
+            max_width: stage.width,
+            color: MUTED,
+            size: 11.0.into(),
+            ..Default::default()
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Skeleton {
+    /// The camera frame as RGBA pixels. Only drawn when `show_feed` is true.
+    pub image: Option<Handle>,
+    /// Header toggle: put the webcam image back behind the skeleton.
+    pub show_feed: bool,
+    pub landmarks: Vec<Landmark>,
+    pub frame_size: (usize, usize),
+    pub hand_box: Option<(f32, f32, f32, f32)>,
+    pub show_box: bool,
+    pub show_labels: bool,
+    pub detected: bool,
+    /// Milliseconds since the tracker last saw a hand.
+    pub lost_ms: u64,
+    /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW.
+    pub note_trail: [f32; NOTE_COUNT],
+    pub current_note: Option<u8>,
+    pub volume: f32,
 }
 
 impl<Message> Program<Message> for Skeleton {
@@ -222,7 +315,8 @@ impl<Message> Program<Message> for Skeleton {
             width: bounds.width - 2.0 * map.offset_x,
             height: bounds.height - 2.0 * map.offset_y,
         };
-        backdrop(&mut frame, bounds, stage, map.scale);
+        backdrop(&mut frame, bounds, stage);
+        keyboard(&mut frame, stage, &self.note_trail, self.current_note, self.volume);
 
         // Camera feed, only when the `feed` toggle is on.
         if self.show_feed {
@@ -240,13 +334,13 @@ impl<Message> Program<Message> for Skeleton {
                 },
                 position: frame.center(),
                 max_width: bounds.width,
-                color: Color::from_rgb8(140, 150, 160),
+                color: MUTED,
                 size: 18.0.into(),
                 ..Default::default()
             });
             frame.fill_text(Text {
                 content: format!("lost for {} ms", self.lost_ms),
-                position: Point::new(stage.x + 12.0, stage.y + stage.height - 14.0),
+                position: Point::new(stage.x + 12.0, stage.y + 6.0),
                 max_width: stage.width,
                 color: Color::from_rgb8(90, 100, 110),
                 size: 11.0.into(),
@@ -293,10 +387,7 @@ impl<Message> Program<Message> for Skeleton {
                 &line,
                 Stroke::default().with_color(tint(color, 0.25)).with_width(8.0),
             );
-            frame.stroke(
-                &line,
-                Stroke::default().with_color(color).with_width(2.5),
-            );
+            frame.stroke(&line, Stroke::default().with_color(color).with_width(2.5));
         }
 
         // Joints; fingertips get a halo so the finger chains stand out.
