@@ -23,3 +23,4 @@ opencv = { version = "0.100", features = ["clang-runtime"] }
 # Concurrency/Async (Useful for management)
 tokio = { version = "1.36", features = ["full"] }
 ort = "2.0.0-rc.13"
+iced = { version = "0.14.0", features = ["image", "canvas", "tokio"] }

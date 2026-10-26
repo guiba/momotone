@@ -1,4 +1,5 @@
 pub mod event_bus;
+pub mod geometry;
 pub mod types;
 
 use crate::core::types::GestureEvent;
@@ -14,6 +15,13 @@ pub struct Landmark {
     pub z: f32,
 }
 
+/// Wall-clock time each ONNX stage took for the frame that produced a result.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageTimings {
+    pub detector_us: f64,
+    pub landmarker_us: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HandDetectionResult {
     pub hand_landmarks: Option<Vec<Landmark>>,
@@ -21,6 +29,8 @@ pub struct HandDetectionResult {
     pub r#box: Option<(f32, f32, f32, f32)>,
     /// Detection confidence of the winning anchor (0..1).
     pub score: f32,
+    /// Per-stage inference cost of this frame, in microseconds.
+    pub timings: StageTimings,
 }
 
 /// Interface for an output sink (Audio or MIDI).

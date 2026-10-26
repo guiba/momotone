@@ -14,8 +14,8 @@ Ordered roughly by value-to-effort. `AGENTS.md` has the "Known Gaps" list this r
 - Set capture resolution/FPS explicitly in `WebcamSource::new` and feed both stages a downscaled frame (e.g. 640×480) instead of the raw camera frame — **S**
 - Skip the landmarker when the detector box is unchanged / below a stability threshold, or run it every Nth frame and reuse landmarks — **M**
 - Remove per-frame allocations in `process_frame`: `outputs.into_iter().collect()` and `landmarks.clone()` — **S**
-- Get `imshow` + `wait_key` (and `--dump-frame`, which writes a PNG *every* iteration) out of the hot loop; add `--no-display` — **S**
-- Split the pipeline into stages (capture → inference → sinks → display) on threads; either actually use `tokio` (declared in `Cargo.toml` but unused) or delete the dependency — **M/L**
+- ~~Get `imshow` + `wait_key` (and `--dump-frame`, which writes a PNG *every* iteration) out of the hot loop; add `--no-display`~~ **done** — the OpenCV window is gone (only `--image` dumps use it) and `--no-ui` runs the pipeline headless
+- ~~Split the pipeline into stages (capture → inference → sinks → display) on threads; either actually use `tokio` (declared in `Cargo.toml` but unused) or delete the dependency~~ **partly done** — the camera/inference/sink loop lives in `src/pipeline.rs` on its own thread, and `tokio` is now iced's executor; capture, inference and sinks still share one thread
 - Audio callback: drop the per-block `Mutex` lock (atomics or lock-free shared state), ramp frequency to avoid zipper clicks, add ADSR + note-off — **M**
 - Add a release profile (`lto = true`, `target-cpu = native`) and an `--fps`/per-stage latency printout so improvements are measurable — **S**
 - Clear the ~14 dead-code warnings so the real hot path is obvious: `sources/mock.rs`, `SimplePinchStrategy`, `FrequencyStrategy`, `Source`/`Tracker` traits, `no_gesture()` — **S**
@@ -38,8 +38,14 @@ Ordered roughly by value-to-effort. `AGENTS.md` has the "Known Gaps" list this r
 - `--calibrate` mode that samples the user's hand range and stores per-user min/max — **M**
 
 ### Visualization & UX
-- Draw the hand box (computed but never rendered), HUD FPS + detector confidence, gesture name — **S**
-- Headless / `--no-window` mode for CI and for machines without a display — **S**
+- ~~Draw the hand box (computed but never rendered), HUD FPS + detector confidence, gesture name~~ **done** — the iced dashboard (`src/dashboard/`) replaced OpenCV `imshow`: skeleton canvas, box toggle, note/volume/confidence meters, per-stage latency, FPS, jitter, finger extension, rolling sparklines and an event log
+- ~~Split the pipeline into stages (capture → inference → sinks → display) on threads~~ **partly done** — the frame loop now runs on its own thread (`src/pipeline.rs`) and the iced UI owns the main thread; capture/inference/sinks are still one thread
+- Feed the camera frames into the dashboard as an `image` widget (`image::Handle::Rgba` from the `Mat` pixels) instead of a separate OpenCV window — **M**
+- Landmark smoothing (EMA) before drawing and before strategies, with the smoothing strength shown in the rail — **S**
+- Note visualisation: a mini keyboard / octave strip showing the current note and recent notes, plus MIDI note-on/off state and active voice count — **M**
+- Audio visualiser: render the actual oscillator envelope or an RMS trace from the cpal callback — **M**
+- Finger-extension chips that already exist in the rail → turn them into discrete gesture triggers (open hand, fist, pinch) — **M**
+- Remove the remaining dead code so the dashboard's data path is obvious: `sources/mock.rs`, `Visualizer::draw_hud`, `SimplePinchStrategy`, `FrequencyStrategy`, `no_gesture()`, `Source`/`Tracker` traits — **S**
 
 ### Tooling
 - `cargo fmt` + `clippy` + `cargo check` in CI — **S**

@@ -8,11 +8,12 @@
 use anyhow::{anyhow, Context, Result};
 use opencv::prelude::*;
 use opencv::{core, imgproc};
+use std::time::Instant;
 
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::core::{HandDetectionResult, Landmark};
+use crate::core::{HandDetectionResult, Landmark, StageTimings};
 
 const NUM_KEYPOINTS: usize = 21;
 const DETECTOR_INPUT: usize = 192;
@@ -415,14 +416,21 @@ impl HandTrackerImpl {
             hand_landmarks: None,
             r#box: None,
             score: 0.0,
+            timings: StageTimings::default(),
         };
 
-        if let Some((x0, y0, w, h, conf)) = self.run_detector(frame)? {
+        let detector_start = Instant::now();
+        let detection = self.run_detector(frame)?;
+        result.timings.detector_us = detector_start.elapsed().as_secs_f64() * 1e6;
+
+        if let Some((x0, y0, w, h, conf)) = detection {
             result.r#box = Some((x0, y0, w, h));
             result.score = conf;
 
+            let landmarker_start = Instant::now();
             match self.run_landmarks(frame, x0, y0, w, h) {
                 Ok(landmarks) => {
+                    result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
                     result.hand_landmarks = Some(landmarks.clone());
                     if self.debug {
                         let (mut minx, mut miny, mut maxx, mut maxy) =

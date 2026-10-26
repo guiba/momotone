@@ -1,0 +1,175 @@
+//! The hand skeleton, drawn on an iced canvas.
+//!
+//! Landmarks arrive in *frame pixels*; the canvas scales them into the widget's
+//! bounds while preserving the frame's aspect ratio, so the skeleton is not
+//! stretched when the window is resized.
+
+use iced::widget::canvas::{Frame, Geometry, Path, Program, Stroke, Text};
+use iced::{mouse, Color, Point, Rectangle, Renderer, Theme};
+
+use crate::core::Landmark;
+
+/// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
+/// the palm, 1..5 are thumb..pinky. See `visualizer/mod.rs` for the same list
+/// in OpenCV form.
+const CONNECTIONS: [(usize, usize, usize); 21] = [
+    (0, 1, 0),
+    (0, 5, 0),
+    (5, 9, 0),
+    (9, 13, 0),
+    (13, 17, 0),
+    (0, 17, 0),
+    (1, 2, 1),
+    (2, 3, 1),
+    (3, 4, 1),
+    (5, 6, 2),
+    (6, 7, 2),
+    (7, 8, 2),
+    (9, 10, 3),
+    (10, 11, 3),
+    (11, 12, 3),
+    (13, 14, 4),
+    (14, 15, 4),
+    (15, 16, 4),
+    (17, 18, 5),
+    (18, 19, 5),
+    (19, 20, 5),
+];
+
+const GROUP_COLORS: [Color; 6] = [
+    Color::from_rgb8(150, 164, 178), // palm
+    Color::from_rgb8(255, 107, 107), // thumb
+    Color::from_rgb8(78, 161, 255),  // index
+    Color::from_rgb8(255, 209, 102), // middle
+    Color::from_rgb8(6, 214, 160),   // ring
+    Color::from_rgb8(199, 125, 255), // pinky
+];
+
+const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
+
+#[derive(Debug, Clone)]
+pub struct Skeleton {
+    pub landmarks: Vec<Landmark>,
+    pub frame_size: (usize, usize),
+    pub hand_box: Option<(f32, f32, f32, f32)>,
+    pub show_box: bool,
+    pub show_labels: bool,
+}
+
+struct Mapping {
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+impl Mapping {
+    fn new(frame_size: (usize, usize), bounds: Rectangle) -> Mapping {
+        let fw = frame_size.0.max(1) as f32;
+        let fh = frame_size.1.max(1) as f32;
+        let scale = (bounds.width / fw).min(bounds.height / fh);
+        Mapping {
+            scale,
+            offset_x: (bounds.width - fw * scale) * 0.5,
+            offset_y: (bounds.height - fh * scale) * 0.5,
+        }
+    }
+
+    fn point(&self, landmark: &Landmark) -> Point {
+        Point::new(
+            self.offset_x + landmark.x * self.scale,
+            self.offset_y + landmark.y * self.scale,
+        )
+    }
+}
+
+impl<Message> Program<Message> for Skeleton {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry<Renderer>> {
+        let mut frame = Frame::new(renderer, bounds.size());
+
+        if self.landmarks.len() < 21 {
+            frame.fill_text(Text {
+                content: "no hand detected - searching...".to_string(),
+                position: frame.center(),
+                max_width: bounds.width,
+                color: Color::from_rgb8(120, 130, 140),
+                size: 18.0.into(),
+                ..Default::default()
+            });
+            return vec![frame.into_geometry()];
+        }
+
+        let map = Mapping::new(self.frame_size, bounds);
+
+        // Detector box, when asked for.
+        if self.show_box {
+            if let Some((x, y, w, h)) = self.hand_box {
+                let top_left =
+                    Point::new(map.offset_x + x * map.scale, map.offset_y + y * map.scale);
+                frame.stroke(
+                    &Path::rectangle(top_left, iced::Size::new(w * map.scale, h * map.scale)),
+                    Stroke::default()
+                        .with_color(Color::from_rgb8(255, 190, 90))
+                        .with_width(1.5),
+                );
+            }
+        }
+
+        // Bones.
+        for (a, b, group) in CONNECTIONS {
+            frame.stroke(
+                &Path::line(map.point(&self.landmarks[a]), map.point(&self.landmarks[b])),
+                Stroke::default()
+                    .with_color(GROUP_COLORS[group])
+                    .with_width(2.5),
+            );
+        }
+
+        // Joints; fingertips are drawn larger so the finger chain reads clearly.
+        for (index, landmark) in self.landmarks.iter().enumerate() {
+            let position = map.point(landmark);
+            let is_tip = FINGER_TIPS.contains(&index);
+            let radius = if is_tip { 5.0 } else { 2.5 };
+            // Landmarks 1..4 are the thumb, then four landmarks per finger.
+            let group = if index == 0 {
+                0
+            } else if index <= 4 {
+                1
+            } else {
+                2 + (index - 5) / 4
+            };
+            frame.fill(
+                &Path::circle(position, radius),
+                if index == 0 {
+                    Color::from_rgb8(240, 244, 248)
+                } else {
+                    GROUP_COLORS[group]
+                },
+            );
+        }
+
+        if self.show_labels {
+            for (finger, tip) in FINGER_TIPS.iter().enumerate() {
+                let position = map.point(&self.landmarks[*tip]);
+                frame.fill_text(Text {
+                    content: crate::core::geometry::FINGER_NAMES[finger].to_string(),
+                    position: Point::new(position.x + 8.0, position.y - 8.0),
+                    max_width: bounds.width,
+                    color: GROUP_COLORS[finger + 1],
+                    size: 12.0.into(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+}

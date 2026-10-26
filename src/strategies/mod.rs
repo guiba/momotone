@@ -107,6 +107,7 @@ mod tests {
             hand_landmarks: Some(landmarks),
             r#box: Some((1000.0, 500.0, 200.0, 200.0)),
             score: 0.9,
+            timings: Default::default(),
         }
     }
 
@@ -145,6 +146,7 @@ mod tests {
             hand_landmarks: None,
             r#box: Some((0.0, 0.0, 10.0, 10.0)),
             score: 0.1,
+            timings: Default::default(),
         };
         assert!(FingerPositionStrategy.process(&empty).is_none());
     }

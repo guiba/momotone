@@ -1,6 +1,8 @@
 mod audio;
 mod core;
+mod dashboard;
 mod midi;
+mod pipeline;
 mod sources;
 mod strategies;
 mod vision;
@@ -9,14 +11,15 @@ mod visualizer;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
-use crate::core::types::GestureEvent;
 use crate::core::Sink;
-use crate::core::Strategy;
+use crate::dashboard::metrics::FrameMetrics;
 use crate::midi::MidiOutputEngine;
+use crate::pipeline::Pipeline;
 use crate::strategies::FingerPositionStrategy;
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTrackerImpl;
@@ -43,7 +46,7 @@ struct Args {
     #[arg(short, long, default_value_t = 0.5)]
     amplitude: f32,
 
-    /// Write every annotated frame to this PNG path (for debugging the box).
+    /// Write every annotated frame to this PNG path (image mode only).
     #[arg(long)]
     dump_frame: Option<String>,
 
@@ -51,12 +54,20 @@ struct Args {
     #[arg(long)]
     image: Option<String>,
 
-    /// Stop after this many webcam frames (useful with --dump-frame).
+    /// Stop after this many frames.
     #[arg(long)]
     max_frames: Option<u32>,
 
     #[arg(long, default_value = "OP-1")]
     port: String,
+
+    /// Webcam index.
+    #[arg(long, default_value_t = 0)]
+    camera: i32,
+
+    /// Run the pipeline without opening the iced dashboard.
+    #[arg(long, default_value_t = false)]
+    no_ui: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
@@ -74,158 +85,123 @@ fn main() -> Result<()> {
         args.mode
     );
 
+    // 1. Headless single-image mode: verify the detector offline.
+    if let Some(path) = &args.image {
+        let mut tracker = HandTrackerImpl::new(
+            &args.detector_path,
+            &args.landmarker_path,
+            &args.anchors_path,
+            args.debug,
+        )
+        .context("Failed to initialize hand tracker")?;
+
+        let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
+            .with_context(|| format!("Failed to read image {path}"))?;
+        let detection = tracker.process_frame(&frame)?;
+        Visualizer::new().draw_skeleton(&mut frame, &detection)?;
+
+        let out = args
+            .dump_frame
+            .clone()
+            .unwrap_or_else(|| "output_frame.png".to_string());
+        opencv::imgcodecs::imwrite(&out, &frame, &opencv::core::Vector::new())?;
+
+        println!(
+            "Detection: box={:?} score={:.3} landmarks={} detector={:.0}µs landmarker={:.0}µs",
+            detection.r#box,
+            detection.score,
+            detection.hand_landmarks.as_ref().map_or(0, |l| l.len()),
+            detection.timings.detector_us,
+            detection.timings.landmarker_us,
+        );
+        println!("Annotated frame written to {out}");
+        return Ok(());
+    }
+
+    // 2. Sinks.
     let (event_bus, event_rx) = EventBus::new();
-
-    // 1. Setup Sinks based on Mode
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
-
-    match args.mode {
+    let sink_label = match args.mode {
         Mode::Signal => {
             println!("Initializing Audio Engine...");
             let mut synth = Synthesizer::new(44100.0, 1);
             synth.start()?;
             sinks.push(Box::new(synth));
+            "audio"
         }
         Mode::Midi => {
             println!("Initializing MIDI Engine (Port: {})...", args.port);
             let mut midi_engine = MidiOutputEngine::new(&args.port);
             midi_engine.start()?;
             sinks.push(Box::new(midi_engine));
+            "midi"
         }
         Mode::Mock => {
-            println!("Running in Mock mode (Simulating video & gestures)");
+            println!("Running in Mock mode (synthetic hand, no camera or models)");
+            "none"
         }
-    }
+    };
 
-    // 2. Initialize Vision, Strategy and the Visualizer
-    let mut tracker = HandTrackerImpl::new(
-        &args.detector_path,
-        &args.landmarker_path,
-        &args.anchors_path,
+    // 3. Vision. Mock mode needs neither a webcam nor the ONNX assets.
+    let tracker = if args.mode == Mode::Mock {
+        None
+    } else {
+        Some(
+            HandTrackerImpl::new(
+                &args.detector_path,
+                &args.landmarker_path,
+                &args.anchors_path,
+                args.debug,
+            )
+            .context("Failed to initialize hand tracker")?,
+        )
+    };
+    let camera = if args.mode == Mode::Mock {
+        None
+    } else {
+        Some(WebcamSource::new(args.camera).context("Failed to open webcam")?)
+    };
+
+    let shared = Arc::new(Mutex::new(FrameMetrics {
+        mode: format!("{:?}", args.mode),
+        sink: sink_label.to_string(),
+        ..FrameMetrics::default()
+    }));
+
+    let running = Arc::new(AtomicBool::new(true));
+    let mut pipeline = Pipeline::new(
+        camera,
+        tracker,
+        Box::new(FingerPositionStrategy),
+        sinks,
+        event_bus,
+        event_rx,
+        shared.clone(),
+        args.max_frames,
         args.debug,
-    )
-    .context("Failed to initialize hand tracker")?;
-    let visualizer = Visualizer::new();
-    let strategy = FingerPositionStrategy;
+    );
 
-    // Headless single-image mode: useful for verifying detection offline.
-    if let Some(path) = &args.image {
-        let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
-            .with_context(|| format!("Failed to read image {path}"))?;
-        let detection = tracker.process_frame(&frame)?;
-        visualizer.draw_skeleton(&mut frame, &detection)?;
-        let out = args
-            .dump_frame
-            .clone()
-            .unwrap_or_else(|| "output_frame.png".to_string());
-        opencv::imgcodecs::imwrite(&out, &frame, &opencv::core::Vector::new())?;
-        println!(
-            "Detection: box={:?} score={:.3} landmarks={}",
-            detection.r#box,
-            detection.score,
-            detection.hand_landmarks.as_ref().map_or(0, |l| l.len())
-        );
-        println!("Annotated frame written to {out}");
+    // 4. Either run the loop in the foreground, or hand it to a thread and
+    //    give the main thread to the iced dashboard.
+    if args.no_ui {
+        pipeline.run(&running)?;
+        println!("Shutting down...");
         return Ok(());
     }
 
-    let mut camera = WebcamSource::new(0).context("Failed to open webcam")?;
-    // 3. Orchestration Loop
-    let mut last_event_time = Instant::now();
-    let mut iterations = 0;
-
-    loop {
-        iterations += 1;
-
-        // --- A. Vision Pipeline (The "Input") ---
-        let mut frame = camera.get_frame()?;
-
-        // Get detection result
-        let detection = tracker.process_frame(&frame)?;
-
-        // --- B. Strategy/Gesture Processing (The "Logic") ---
-        if args.mode == Mode::Mock {
-            if last_event_time.elapsed() > Duration::from_secs(2) {
-                let dummy_event = if (iterations / 10) % 2 == 0 {
-                    GestureEvent::new_signal(440.0, args.amplitude, "Simulated Signal")
-                } else {
-                    GestureEvent::new_note(60 + (iterations % 12) as u8, 1.0, "Simulated Note")
-                };
-                event_bus.dispatch(dummy_event);
-                last_event_time = Instant::now();
-            }
-        } else if detection.r#box.is_some() {
-            if let Some(gesture_event) = strategy.process(&detection) {
-                event_bus.dispatch(gesture_event);
-            }
+    let pipeline_flag = running.clone();
+    let handle = std::thread::spawn(move || {
+        if let Err(e) = pipeline.run(&pipeline_flag) {
+            eprintln!("[Pipeline] {e}");
         }
+    });
 
-        // --- C. Event Dispatch (The "Output") ---
-        while let Ok(event) = event_rx.try_recv() {
-            println!("[Event] {} -> {:?}", event.text, event.payload);
-            for sink in &mut sinks {
-                let _ = sink.handle_event(&event);
-            }
-        }
+    let ui_result = dashboard::run(shared);
 
-        // --- D. Visualization (The "Display") ---
-        visualizer.draw_skeleton(&mut frame, &detection)?;
-        let status = [
-            (
-                "MIDI",
-                if args.mode == Mode::Midi {
-                    "Connected"
-                } else {
-                    "N/A"
-                },
-            ),
-            (
-                "Audio",
-                if args.mode == Mode::Signal {
-                    "Running"
-                } else {
-                    "Off"
-                },
-            ),
-            (
-                "Tracking",
-                if detection.r#box.is_some() {
-                    "Active"
-                } else {
-                    "Searching..."
-                },
-            ),
-        ];
-
-        let event_text = if args.mode == Mode::Mock {
-            "Simulated Movement"
-        } else if detection.r#box.is_some() {
-            "Hand detected"
-        } else {
-            "Looking for hand..."
-        };
-
-        visualizer.draw_hud(&mut frame, event_text, (0, 255, 0), &status)?;
-
-        opencv::highgui::imshow("Gesture-to-Audio Rust (OpenCV)", &frame)?;
-
-        if let Some(path) = &args.dump_frame {
-            opencv::imgcodecs::imwrite(path, &frame, &opencv::core::Vector::new())?;
-        }
-
-        if args.max_frames.map_or(false, |n| iterations >= n) {
-            break;
-        }
-
-        if opencv::highgui::wait_key(1)? == 'q' as i32 {
-            break;
-        }
-    }
+    running.store(false, Ordering::Relaxed);
+    let _ = handle.join();
 
     println!("Shutting down...");
-    for mut sink in sinks {
-        let _ = sink.stop();
-    }
-
+    ui_result?;
     Ok(())
 }
