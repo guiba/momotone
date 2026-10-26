@@ -8,16 +8,20 @@
 use anyhow::{anyhow, Context, Result};
 use opencv::prelude::*;
 use opencv::{core, imgproc};
+use std::time::Instant;
 
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::core::{HandDetectionResult, Landmark};
+use crate::core::{HandDetectionResult, Landmark, StageTimings};
 
 const NUM_KEYPOINTS: usize = 21;
 const DETECTOR_INPUT: usize = 192;
 const LANDMARKER_INPUT: usize = 224;
-const SCORE_THRESHOLD: f32 = 0.3;
+/// Default detector confidence gate. A real hand scores ~0.9; an empty frame tops
+/// out around 0.15, so 0.7 is a strict gate that rejects near-misses and
+/// false positives. Overridable with `--score-threshold`.
+pub const DEFAULT_SCORE_THRESHOLD: f32 = 0.7;
 
 const INV_255: f32 = 1.0 / 255.0;
 
@@ -210,6 +214,7 @@ pub struct HandTrackerImpl {
     pub landmarker_session: Session,
     /// Anchor centres in normalised detector space (0..1).
     pub anchors: Vec<(f32, f32)>,
+    pub score_threshold: f32,
     pub debug: bool,
     /// Per-stage input buffers, allocated once here and refilled in place every
     /// frame (see `StageInput`).
@@ -222,6 +227,7 @@ impl HandTrackerImpl {
         detector_path: &str,
         landmarker_path: &str,
         anchors_path: &str,
+        score_threshold: f32,
         debug: bool,
     ) -> Result<Self> {
         let detector_session = Session::builder()
@@ -247,6 +253,7 @@ impl HandTrackerImpl {
             detector_session,
             landmarker_session,
             anchors,
+            score_threshold: score_threshold.clamp(0.0, 1.0),
             debug,
             detector_input: StageInput::new(DETECTOR_INPUT, DETECTOR_INPUT),
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
@@ -312,11 +319,12 @@ impl HandTrackerImpl {
 
         if self.debug {
             eprintln!(
-                "[Tracker] best anchor {best_idx} conf={best_conf:.3} (threshold {SCORE_THRESHOLD})"
+                "[Tracker] best anchor {best_idx} conf={best_conf:.3} (threshold {})",
+                self.score_threshold
             );
         }
 
-        if best_conf < SCORE_THRESHOLD {
+        if best_conf < self.score_threshold {
             return Ok(None);
         }
 
@@ -415,14 +423,21 @@ impl HandTrackerImpl {
             hand_landmarks: None,
             r#box: None,
             score: 0.0,
+            timings: StageTimings::default(),
         };
 
-        if let Some((x0, y0, w, h, conf)) = self.run_detector(frame)? {
+        let detector_start = Instant::now();
+        let detection = self.run_detector(frame)?;
+        result.timings.detector_us = detector_start.elapsed().as_secs_f64() * 1e6;
+
+        if let Some((x0, y0, w, h, conf)) = detection {
             result.r#box = Some((x0, y0, w, h));
             result.score = conf;
 
+            let landmarker_start = Instant::now();
             match self.run_landmarks(frame, x0, y0, w, h) {
                 Ok(landmarks) => {
+                    result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
                     result.hand_landmarks = Some(landmarks.clone());
                     if self.debug {
                         let (mut minx, mut miny, mut maxx, mut maxy) =

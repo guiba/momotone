@@ -47,15 +47,18 @@ unsafe impl Sync for StreamWrapper {}
 pub struct Synthesizer {
     sample_rate: f32,
     channels: u16,
+    /// Master gain applied to every event amplitude (`--amplitude`).
+    gain: f32,
     state: Arc<Mutex<SynthesizerState>>,
     stream: Option<StreamWrapper>,
 }
 
 impl Synthesizer {
-    pub fn new(sample_rate: f32, channels: u16) -> Self {
+    pub fn new(sample_rate: f32, channels: u16, gain: f32) -> Self {
         Self {
             sample_rate,
             channels,
+            gain: gain.clamp(0.0, 1.0),
             state: Arc::new(Mutex::new(SynthesizerState { voices: Vec::new() })),
             stream: None,
         }
@@ -68,25 +71,30 @@ impl Synthesizer {
                 frequency,
                 amplitude,
             } => {
+                let amplitude = (amplitude * self.gain).clamp(0.0, 1.0);
                 if state.voices.is_empty() {
-                    state.voices.push(Voice::new(*frequency, *amplitude));
+                    state.voices.push(Voice::new(*frequency, amplitude));
                 } else {
                     for voice in state.voices.iter_mut() {
                         voice.frequency = *frequency;
-                        voice.amplitude = *amplitude;
+                        voice.amplitude = amplitude;
                     }
                 }
             }
             GesturePayload::Note { note, velocity } => {
-                if *note == 0 {
+                // note 0 is the pipeline's "no gesture" release: it must silence
+                // the oscillator, otherwise the last note latches and keeps
+                // sounding after the hand leaves the frame.
+                if *note == 0 || *velocity <= 0.0 {
                     state.voices.clear();
                 } else {
+                    let amplitude = (velocity * self.gain).clamp(0.0, 1.0);
                     let freq = 440.0 * 2.0f32.powf((*note as i32 - 69) as f32 / 12.0);
                     if state.voices.is_empty() {
-                        state.voices.push(Voice::new(freq, *velocity));
+                        state.voices.push(Voice::new(freq, amplitude));
                     } else {
                         state.voices[0].frequency = freq;
-                        state.voices[0].amplitude = *velocity;
+                        state.voices[0].amplitude = amplitude;
                     }
                 }
             }
@@ -139,5 +147,45 @@ impl Sink for Synthesizer {
 
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
         self.update_from_event(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_note_starts_a_voice_and_the_release_kills_it() {
+        let synth = Synthesizer::new(44100.0, 1, 1.0);
+
+        synth
+            .update_from_event(&GestureEvent::new_note(60, 0.8, "Finger Position"))
+            .unwrap();
+        assert_eq!(synth.state.lock().unwrap().voices.len(), 1);
+
+        // The pipeline sends this the frame after the hand leaves: without it the
+        // oscillator would latch and keep sounding forever.
+        synth.update_from_event(&GestureEvent::no_gesture()).unwrap();
+        assert!(synth.state.lock().unwrap().voices.is_empty());
+    }
+
+    #[test]
+    fn zero_velocity_is_silent() {
+        let synth = Synthesizer::new(44100.0, 1, 1.0);
+        synth
+            .update_from_event(&GestureEvent::new_note(60, 0.0, "pinched"))
+            .unwrap();
+        assert!(synth.state.lock().unwrap().voices.is_empty());
+    }
+
+    #[test]
+    fn gain_scales_the_amplitude() {
+        let synth = Synthesizer::new(44100.0, 1, 0.25);
+        synth
+            .update_from_event(&GestureEvent::new_note(60, 1.0, "Finger Position"))
+            .unwrap();
+        let voice = &synth.state.lock().unwrap().voices[0];
+        assert!((voice.amplitude - 0.25).abs() < 1e-6);
+        assert!((voice.frequency - 261.6).abs() < 0.1);
     }
 }

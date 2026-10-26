@@ -1,17 +1,23 @@
 use anyhow::{anyhow, Result};
 use opencv::prelude::*;
-use opencv::videoio;
+use opencv::videoio::{self, VideoCaptureTrait, VideoCaptureTraitConst};
 
 pub struct WebcamSource {
     cap: videoio::VideoCapture,
 }
 
 impl WebcamSource {
-    pub fn new(camera_id: i32) -> Result<Self> {
-        let cap = videoio::VideoCapture::new(camera_id, videoio::CAP_ANY)?;
+    /// Opens the camera and asks for a capture resolution. Most webcams honour
+    /// this; if they do not, the native resolution is used and everything still
+    /// works (the dashboard scales to whatever arrives).
+    pub fn new(camera_id: i32, width: u32, height: u32) -> Result<Self> {
+        let mut cap = videoio::VideoCapture::new(camera_id, videoio::CAP_ANY)?;
         if !cap.is_opened()? {
             return Err(anyhow!("Could not open webcam index {}", camera_id));
         }
+        // Best effort: not every backend honours these.
+        let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, width as f64);
+        let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, height as f64);
         Ok(Self { cap })
     }
 
