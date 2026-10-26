@@ -65,6 +65,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     camera: i32,
 
+    /// Requested capture resolution (the inference stages crop to a square
+    /// anyway, so 640x480 keeps both the GPU and the dashboard cheap).
+    #[arg(long, default_value_t = 640)]
+    camera_width: u32,
+
+    #[arg(long, default_value_t = 480)]
+    camera_height: u32,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -159,7 +167,10 @@ fn main() -> Result<()> {
     let camera = if args.mode == Mode::Mock {
         None
     } else {
-        Some(WebcamSource::new(args.camera).context("Failed to open webcam")?)
+        Some(
+            WebcamSource::new(args.camera, args.camera_width, args.camera_height)
+                .context("Failed to open webcam")?,
+        )
     };
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
@@ -179,6 +190,7 @@ fn main() -> Result<()> {
         shared.clone(),
         args.max_frames,
         args.debug,
+        !args.no_ui,
     );
 
     // 4. Either run the loop in the foreground, or hand it to a thread and

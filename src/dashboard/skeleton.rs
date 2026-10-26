@@ -1,11 +1,13 @@
-//! The hand skeleton, drawn on an iced canvas.
+//! The stage: the camera feed plus the hand skeleton, drawn on one iced canvas.
 //!
-//! Landmarks arrive in *frame pixels*; the canvas scales them into the widget's
-//! bounds while preserving the frame's aspect ratio, so the skeleton is not
-//! stretched when the window is resized.
+//! Landmarks and the detector box arrive in *frame pixels*; `Mapping` scales
+//! them into the widget bounds while preserving the frame's aspect ratio, and
+//! the video is drawn into exactly the same letterboxed rectangle, so the
+//! overlay always lines up with the image.
 
-use iced::widget::canvas::{Frame, Geometry, Path, Program, Stroke, Text};
-use iced::{mouse, Color, Point, Rectangle, Renderer, Theme};
+use iced::widget::canvas::{Frame, Geometry, Image, Path, Program, Stroke, Text};
+use iced::widget::image::Handle;
+use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::Landmark;
 
@@ -49,11 +51,14 @@ const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
 
 #[derive(Debug, Clone)]
 pub struct Skeleton {
+    /// The camera frame as RGBA pixels, drawn under the skeleton.
+    pub image: Option<Handle>,
     pub landmarks: Vec<Landmark>,
     pub frame_size: (usize, usize),
     pub hand_box: Option<(f32, f32, f32, f32)>,
     pub show_box: bool,
     pub show_labels: bool,
+    pub detected: bool,
 }
 
 struct Mapping {
@@ -80,6 +85,15 @@ impl Mapping {
             self.offset_y + landmark.y * self.scale,
         )
     }
+
+    fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> Rectangle {
+        Rectangle {
+            x: self.offset_x + x * self.scale,
+            y: self.offset_y + y * self.scale,
+            width: w * self.scale,
+            height: h * self.scale,
+        }
+    }
 }
 
 impl<Message> Program<Message> for Skeleton {
@@ -94,28 +108,57 @@ impl<Message> Program<Message> for Skeleton {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry<Renderer>> {
         let mut frame = Frame::new(renderer, bounds.size());
+        let map = Mapping::new(self.frame_size, bounds);
+
+        // Camera feed, letterboxed to the frame aspect ratio.
+        if let Some(handle) = &self.image {
+            frame.draw_image(
+                Rectangle {
+                    x: map.offset_x,
+                    y: map.offset_y,
+                    width: bounds.width - 2.0 * map.offset_x,
+                    height: bounds.height - 2.0 * map.offset_y,
+                },
+                Image::new(handle.clone()),
+            );
+        } else {
+            // Mock mode / no camera: a faint grid so the stage is not blank.
+            for i in 1..8 {
+                let x = bounds.width * i as f32 / 8.0;
+                frame.stroke(
+                    &Path::line(Point::new(x, 0.0), Point::new(x, bounds.height)),
+                    Stroke::default()
+                        .with_color(Color::from_rgb8(30, 35, 42))
+                        .with_width(1.0),
+                );
+            }
+        }
 
         if self.landmarks.len() < 21 {
             frame.fill_text(Text {
-                content: "no hand detected - searching...".to_string(),
+                content: if self.detected {
+                    "hand found, landmark stage failed".to_string()
+                } else {
+                    "no hand detected - searching...".to_string()
+                },
                 position: frame.center(),
                 max_width: bounds.width,
-                color: Color::from_rgb8(120, 130, 140),
+                color: Color::from_rgb8(140, 150, 160),
                 size: 18.0.into(),
                 ..Default::default()
             });
             return vec![frame.into_geometry()];
         }
 
-        let map = Mapping::new(self.frame_size, bounds);
-
         // Detector box, when asked for.
         if self.show_box {
             if let Some((x, y, w, h)) = self.hand_box {
-                let top_left =
-                    Point::new(map.offset_x + x * map.scale, map.offset_y + y * map.scale);
+                let rect = map.rect(x, y, w, h);
                 frame.stroke(
-                    &Path::rectangle(top_left, iced::Size::new(w * map.scale, h * map.scale)),
+                    &Path::rectangle(
+                        Point::new(rect.x, rect.y),
+                        Size::new(rect.width, rect.height),
+                    ),
                     Stroke::default()
                         .with_color(Color::from_rgb8(255, 190, 90))
                         .with_width(1.5),
@@ -138,7 +181,7 @@ impl<Message> Program<Message> for Skeleton {
             let position = map.point(landmark);
             let is_tip = FINGER_TIPS.contains(&index);
             let radius = if is_tip { 5.0 } else { 2.5 };
-            // Landmarks 1..4 are the thumb, then four landmarks per finger.
+            // Landmark 0 is the wrist, 1..4 the thumb, then four per finger.
             let group = if index == 0 {
                 0
             } else if index <= 4 {

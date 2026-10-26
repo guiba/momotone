@@ -27,8 +27,6 @@ pub struct HandGeometry {
     pub tilt_deg: f32,
     /// Wrist -> middle-finger MCP distance, in frame pixels.
     pub palm_length: f32,
-    /// Mean landmark position (frame pixels).
-    pub centroid: (f32, f32),
 }
 
 fn distance(a: &Landmark, b: &Landmark) -> f32 {
@@ -55,19 +53,11 @@ pub fn hand_geometry(detection: &HandDetectionResult) -> Option<HandGeometry> {
     let dy = landmarks[17].y - landmarks[5].y;
     let tilt_deg = dy.atan2(dx).to_degrees();
 
-    let mut sx = 0.0;
-    let mut sy = 0.0;
-    for landmark in landmarks {
-        sx += landmark.x;
-        sy += landmark.y;
-    }
-
     Some(HandGeometry {
         spread: distance(&landmarks[4], &landmarks[8]) / palm_length,
         extension,
         tilt_deg,
         palm_length,
-        centroid: (sx / landmarks.len() as f32, sy / landmarks.len() as f32),
     })
 }
 

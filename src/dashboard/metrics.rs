@@ -32,6 +32,12 @@ pub struct FrameMetrics {
     /// Mean landmark displacement between consecutive frames, in pixels.
     pub jitter_px: f32,
 
+    /// The camera frame as RGBA pixels, handed to the dashboard so it can draw
+    /// the video and the skeleton in the same canvas. Only produced when the UI
+    /// is running.
+    pub frame_id: u64,
+    pub frame_pixels: Vec<u8>,
+
     // --- gesture output ---
     pub note: Option<u8>,
     pub volume: f32,

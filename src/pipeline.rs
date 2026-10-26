@@ -37,6 +37,7 @@ pub struct Pipeline {
     started: Instant,
     max_frames: Option<u32>,
     debug: bool,
+    emit_frames: bool,
 }
 
 impl Pipeline {
@@ -50,6 +51,7 @@ impl Pipeline {
         shared: Arc<Mutex<FrameMetrics>>,
         max_frames: Option<u32>,
         debug: bool,
+        emit_frames: bool,
     ) -> Self {
         Pipeline {
             camera,
@@ -65,6 +67,7 @@ impl Pipeline {
             started: Instant::now(),
             max_frames,
             debug,
+            emit_frames,
         }
     }
 
@@ -98,6 +101,7 @@ impl Pipeline {
 
         self.metrics.frames += 1;
         self.metrics.uptime_ms = self.started.elapsed().as_millis() as u64;
+        self.metrics.frame_id = self.metrics.frames;
 
         let frame_start = Instant::now();
 
@@ -113,6 +117,9 @@ impl Pipeline {
                     }
                 };
                 self.metrics.frame_size = (frame.cols() as usize, frame.rows() as usize);
+                if self.emit_frames {
+                    self.metrics.frame_pixels = frame_to_rgba(&frame);
+                }
                 tracker.process_frame(&frame)?
             }
             _ => {
@@ -241,6 +248,23 @@ impl Pipeline {
     }
 }
 
+/// BGR OpenCV frame -> RGBA bytes for the iced `image` handle.
+fn frame_to_rgba(frame: &Mat) -> Vec<u8> {
+    let count = (frame.cols() as usize) * (frame.rows() as usize) * (frame.channels() as usize);
+    // Safe: `frame` is a freshly captured, contiguous Mat, so its buffer holds
+    // exactly `count` bytes starting at `data()`.
+    let src = unsafe { std::slice::from_raw_parts(frame.data(), count) };
+    bgr_to_rgba(src)
+}
+
+fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(src.len() / 3 * 4);
+    for pixel in src.chunks_exact(3) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    rgba
+}
+
 fn landmark_jitter(previous: &[Landmark], current: &[Landmark]) -> f32 {
     if previous.len() != current.len() || current.is_empty() {
         return 0.0;
@@ -354,5 +378,14 @@ mod tests {
     fn jitter_is_zero_for_identical_landmarks() {
         let landmarks = synthetic_detection(0.0).hand_landmarks.unwrap();
         assert!((landmark_jitter(&landmarks, &landmarks) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bgr_pixels_become_rgba() {
+        // Two BGR pixels.
+        assert_eq!(
+            bgr_to_rgba(&[1, 2, 3, 4, 5, 6]),
+            vec![3, 2, 1, 255, 6, 5, 4, 255]
+        );
     }
 }

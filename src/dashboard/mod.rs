@@ -15,7 +15,8 @@ pub mod skeleton;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iced::widget::{button, canvas, column, container, row, rule, scrollable, space, text, Column};
+use iced::widget::image::Handle;
+use iced::widget::{button, canvas, column, container, row, rule, space, text, Column};
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
@@ -49,6 +50,7 @@ enum Message {
 pub struct Dashboard {
     shared: Arc<Mutex<FrameMetrics>>,
     metrics: FrameMetrics,
+    frame_image: Option<Handle>,
     volume_history: Vec<f32>,
     confidence_history: Vec<f32>,
     show_box: bool,
@@ -60,6 +62,7 @@ impl Dashboard {
         Dashboard {
             shared,
             metrics: FrameMetrics::default(),
+            frame_image: None,
             volume_history: Vec::new(),
             confidence_history: Vec::new(),
             show_box: true,
@@ -70,7 +73,17 @@ impl Dashboard {
     fn update(&mut self, message: Message) {
         match message {
             Message::Tick => {
-                if let Ok(shared) = self.shared.lock() {
+                if let Ok(mut shared) = self.shared.lock() {
+                    // Take ownership of the pixels instead of copying them: the
+                    // clone below then carries an empty buffer.
+                    if !shared.frame_pixels.is_empty() {
+                        let (width, height) = shared.frame_size;
+                        self.frame_image = Some(Handle::from_rgba(
+                            width as u32,
+                            height as u32,
+                            std::mem::take(&mut shared.frame_pixels),
+                        ));
+                    }
                     self.metrics = shared.clone();
                 }
                 push(&mut self.volume_history, self.metrics.volume);
@@ -108,11 +121,13 @@ impl Dashboard {
         .align_y(alignment::Vertical::Center);
 
         let stage = container(canvas(Skeleton {
+            image: self.frame_image.clone(),
             landmarks: self.metrics.landmarks.clone(),
             frame_size: self.metrics.frame_size,
             hand_box: self.metrics.hand_box,
             show_box: self.show_box,
             show_labels: self.show_labels,
+            detected: self.metrics.detected,
         }))
         .padding(12)
         .width(Length::Fill)
@@ -135,16 +150,28 @@ impl Dashboard {
             meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
             perf_card(&self.metrics),
             geometry_card(&self.metrics),
-            history_card(&self.volume_history, &self.confidence_history),
-            log_card(&self.metrics),
         ]
         .spacing(10)
-        .width(330);
+        .width(320);
+
+        // Bottom strip: time-series and log, away from the live numbers.
+        let strip = row![
+            sparkline_card("VOLUME", &self.volume_history, (0.0, 1.0), VOLUME),
+            sparkline_card(
+                "CONFIDENCE",
+                &self.confidence_history,
+                (0.0, 1.0),
+                CONFIDENCE
+            ),
+            log_card(&self.metrics),
+        ]
+        .spacing(10);
 
         column![
             header,
             rule::horizontal(1),
-            row![stage, scrollable(rail).height(Length::Fill)].spacing(12),
+            row![stage, rail].spacing(12),
+            strip,
         ]
         .padding(14)
         .spacing(10)
@@ -179,6 +206,7 @@ fn push(history: &mut Vec<f32>, value: f32) {
 fn card<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     container(column![text(title).size(11).color(MUTED), body.into()].spacing(6))
         .padding(12)
+        .width(Length::Fill)
         .style(|_theme| container::Style {
             text_color: Some(TEXT),
             background: Some(Background::Color(CARD)),
@@ -305,31 +333,22 @@ fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     )
 }
 
-fn history_card<'a>(volume: &'a [f32], confidence: &'a [f32]) -> Element<'a, Message> {
-    column![
-        card(
-            "VOLUME HISTORY",
-            canvas(Sparkline {
-                samples: volume.to_vec(),
-                range: (0.0, 1.0),
-                color: VOLUME,
-            })
-            .width(Length::Fill)
-            .height(60),
-        ),
-        card(
-            "CONFIDENCE HISTORY",
-            canvas(Sparkline {
-                samples: confidence.to_vec(),
-                range: (0.0, 1.0),
-                color: CONFIDENCE,
-            })
-            .width(Length::Fill)
-            .height(60),
-        ),
-    ]
-    .spacing(10)
-    .into()
+fn sparkline_card<'a>(
+    title: &'a str,
+    samples: &'a [f32],
+    range: (f32, f32),
+    color: Color,
+) -> Element<'a, Message> {
+    card(
+        title,
+        canvas(Sparkline {
+            samples: samples.to_vec(),
+            range,
+            color,
+        })
+        .width(Length::Fill)
+        .height(70),
+    )
 }
 
 fn log_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
@@ -337,6 +356,7 @@ fn log_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         .log
         .iter()
         .rev()
+        .take(6)
         .map(|entry| {
             text(format!(
                 "{}s  {}  {}",
