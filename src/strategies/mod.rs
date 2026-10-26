@@ -159,10 +159,11 @@ mod tests {
         assert!(FingerPositionStrategy.process(&empty).is_none());
     }
 
-    /// The note produced when the index tip sits at `index_x` in a 640 px wide
-    /// frame. The playable band is inset by NOTE_MARGIN on both sides, so
-    /// 64 px .. 576 px maps onto C2 .. C6.
-    fn note_at(index_x: f32) -> u8 {
+    /// The note produced when the index tip (landmark 8) sits at `index_x` in a
+    /// 640 px wide frame, with `hand_box` as whatever the detector reported.
+    /// The playable band is inset by NOTE_MARGIN on both sides, so 64 px .. 576
+    /// px maps onto C2 .. C6.
+    fn note_at(index_x: f32, hand_box: (f32, f32, f32, f32)) -> u8 {
         let landmarks = (0..21)
             .map(|i| Landmark {
                 x: if i == 8 { index_x } else { 300.0 },
@@ -173,7 +174,7 @@ mod tests {
         let event = FingerPositionStrategy
             .process(&HandDetectionResult {
                 hand_landmarks: Some(landmarks),
-                r#box: Some((200.0, 200.0, 200.0, 200.0)),
+                r#box: Some(hand_box),
                 frame_size: (640, 480),
                 score: 0.9,
                 timings: Default::default(),
@@ -187,14 +188,23 @@ mod tests {
 
     #[test]
     fn pitch_follows_the_horizontal_position() {
+        let palm = (200.0, 200.0, 200.0, 200.0);
         // The edges of the inset band are exactly C2 and C6, the middle is C4.
-        assert_eq!(note_at(64.0), 36);
-        assert_eq!(note_at(320.0), 60);
-        assert_eq!(note_at(576.0), 84);
+        assert_eq!(note_at(64.0, palm), 36);
+        assert_eq!(note_at(320.0, palm), 60);
+        assert_eq!(note_at(576.0, palm), 84);
         // Off the frame the note clamps instead of running past the range.
-        assert_eq!(note_at(0.0), 36);
-        assert_eq!(note_at(640.0), 84);
+        assert_eq!(note_at(0.0, palm), 36);
+        assert_eq!(note_at(640.0, palm), 84);
         // Sweeping right is strictly rising.
-        assert!(note_at(100.0) < note_at(250.0) && note_at(250.0) < note_at(500.0));
+        assert!(note_at(100.0, palm) < note_at(250.0, palm) && note_at(250.0, palm) < note_at(500.0, palm));
+    }
+
+    #[test]
+    fn the_detector_box_does_not_select_the_note() {
+        // Identical fingertip, completely different bounding boxes. If the box
+        // were driving the pitch these two would disagree.
+        assert_eq!(note_at(320.0, (200.0, 200.0, 200.0, 200.0)), note_at(320.0, (0.0, 0.0, 640.0, 480.0)));
+        assert_eq!(note_at(320.0, (600.0, 100.0, 40.0, 40.0)), 60);
     }
 }

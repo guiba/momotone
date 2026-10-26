@@ -49,6 +49,10 @@ pub struct FrameMetrics {
     pub landmarks: Vec<Landmark>,
     pub hand_box: Option<(f32, f32, f32, f32)>,
     pub frame_size: (usize, usize),
+    /// x of the index fingertip (landmark 8) in frame pixels - the anchor the
+    /// note is read from. Published so the dashboard can show it next to the
+    /// keyboard instead of guessing from the detector box.
+    pub pitch_x: f32,
     /// Milliseconds since the last frame in which a hand was found.
     pub lost_ms: u64,
     /// Mean landmark displacement between consecutive frames, in pixels.

@@ -363,6 +363,10 @@ fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         "HAND GEOMETRY",
         column![
             kv("status", status),
+            kv(
+                "pitch anchor",
+                format!("tip x {:.0} / {:.0} px", metrics.pitch_x, metrics.frame_size.0),
+            ),
             kv("landmarks", format!("{}", metrics.landmark_count)),
             kv("spread", format!("{:.2}", metrics.spread)),
             kv("tilt", format!("{:.0}°", metrics.tilt_deg)),

@@ -150,6 +150,8 @@ impl Pipeline {
         self.metrics.hand_box = detection.r#box;
         self.metrics.landmarks = detection.hand_landmarks.clone().unwrap_or_default();
         self.metrics.landmark_count = self.metrics.landmarks.len();
+        // The note anchor: landmark 8 is the index fingertip.
+        self.metrics.pitch_x = self.metrics.landmarks.get(8).map_or(0.0, |l| l.x);
 
         if self.metrics.detected {
             self.last_detection = Instant::now();
@@ -220,13 +222,14 @@ impl Pipeline {
 
         if self.debug && self.metrics.frames % 10 == 0 {
             println!(
-                "[Pipeline] fps {:.1} conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px",
+                "[Pipeline] fps {:.1} conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
                 self.metrics.fps,
                 self.metrics.confidence,
                 self.metrics.note,
                 self.metrics.volume,
                 self.metrics.spread,
                 self.metrics.jitter_px,
+                self.metrics.pitch_x,
             );
         }
 
