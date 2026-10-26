@@ -63,11 +63,13 @@ pub struct Dashboard {
     /// Per-semitone brightness of the on-screen keyboard. Set to 1.0 when a
     /// note is played, exponentially faded on every UI tick.
     note_trail: [f32; NOTE_COUNT],
+    /// Time constant of that fade, in seconds (`--fade-ms`).
+    fade_tau: f32,
     last_tick: Instant,
 }
 
 impl Dashboard {
-    fn new(shared: Arc<Mutex<FrameMetrics>>) -> Self {
+    fn new(shared: Arc<Mutex<FrameMetrics>>, fade_ms: f32) -> Self {
         Dashboard {
             shared,
             metrics: FrameMetrics::default(),
@@ -78,6 +80,7 @@ impl Dashboard {
             show_labels: false,
             show_feed: false,
             note_trail: [0.0; NOTE_COUNT],
+            fade_tau: fade_ms.max(1.0) / 1000.0,
             last_tick: Instant::now(),
         }
     }
@@ -89,7 +92,7 @@ impl Dashboard {
                 // rate is independent of the tick interval.
                 let dt = self.last_tick.elapsed().as_secs_f32();
                 self.last_tick = Instant::now();
-                fade_trail(&mut self.note_trail, dt);
+                fade_trail(&mut self.note_trail, dt, self.fade_tau);
 
                 if let Ok(mut shared) = self.shared.lock() {
                     // Only build an image handle when the feed is actually shown:
@@ -136,7 +139,12 @@ impl Dashboard {
     fn view(&self) -> Element<'_, Message> {
         let header = row![
             text("Hand Gesture HUD").size(20),
-            text(format!("{} · {}", self.metrics.mode, self.metrics.sink))
+            text(format!(
+                "{} · {} · trail {:.0} ms",
+                self.metrics.mode,
+                self.metrics.sink,
+                self.fade_tau * 1000.0
+            ))
                 .size(12)
                 .color(MUTED),
             space::horizontal(),
@@ -224,9 +232,9 @@ fn app_title(_state: &Dashboard) -> String {
     "Hand Gesture HUD".to_string()
 }
 
-pub fn run(shared: Arc<Mutex<FrameMetrics>>) -> iced::Result {
+pub fn run(shared: Arc<Mutex<FrameMetrics>>, fade_ms: f32) -> iced::Result {
     iced::application(
-        move || Dashboard::new(shared.clone()),
+        move || Dashboard::new(shared.clone(), fade_ms),
         Dashboard::update,
         Dashboard::view,
     )

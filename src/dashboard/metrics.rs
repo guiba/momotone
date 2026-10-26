@@ -11,9 +11,10 @@ use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
 /// Maximum number of events kept in the on-screen log.
 pub const LOG_CAPACITY: usize = 12;
 
-/// E-folding time of the on-screen note trail. A note lit up now is at ~37 %
-/// of its brightness after this many seconds, and effectively gone after ~3 s.
-const FADE_TAU: f32 = 0.45;
+/// Default e-folding time of the on-screen note trail, in milliseconds. A key
+/// lit up now is at ~37 % of its brightness after one time constant and
+/// effectively gone after three. `--fade-ms` overrides it.
+pub const DEFAULT_FADE_MS: f32 = 450.0;
 
 /// Index of `note` in the trail/keyboard, clamped into the playable range.
 pub fn note_index(note: u8) -> usize {
@@ -25,9 +26,11 @@ pub fn note_frequency(note: u8) -> f32 {
     440.0 * 2.0f32.powf((note as f32 - 69.0) / 12.0)
 }
 
-/// Exponentially fade the whole keyboard trail by `dt_secs`.
-pub fn fade_trail(trail: &mut [f32; NOTE_COUNT], dt_secs: f32) {
-    let decay = (-dt_secs / FADE_TAU).exp();
+/// Exponentially fade the whole keyboard trail by `dt_secs`, using `tau_secs`
+/// as the time constant.
+pub fn fade_trail(trail: &mut [f32; NOTE_COUNT], dt_secs: f32, tau_secs: f32) {
+    let tau = tau_secs.max(1e-3);
+    let decay = (-dt_secs / tau).exp();
     for level in trail.iter_mut() {
         *level *= decay;
     }
@@ -126,15 +129,30 @@ mod tests {
 
     #[test]
     fn the_trail_fades_exponentially_and_drops_old_notes() {
+        let tau = DEFAULT_FADE_MS / 1000.0;
         let mut trail = [0.0; NOTE_COUNT];
         trail[note_index(60)] = 1.0;
         // After one time constant the note is at 1/e of its brightness...
-        fade_trail(&mut trail, FADE_TAU);
+        fade_trail(&mut trail, tau, tau);
         assert!((trail[note_index(60)] - 0.367879).abs() < 1e-3);
         // ...and after a few constants it is below the drawing threshold.
-        fade_trail(&mut trail, 3.0 * FADE_TAU);
+        fade_trail(&mut trail, 3.0 * tau, tau);
         assert!(trail[note_index(60)] < 0.02);
         // Untouched cells stay at zero.
         assert_eq!(trail[note_index(36)], 0.0);
+    }
+
+    #[test]
+    fn a_longer_tau_keeps_the_tail_longer() {
+        let mut fast = [0.0; NOTE_COUNT];
+        let mut slow = [0.0; NOTE_COUNT];
+        fast[note_index(48)] = 1.0;
+        slow[note_index(48)] = 1.0;
+        fade_trail(&mut fast, 0.2, 0.45);
+        fade_trail(&mut slow, 0.2, 2.0);
+        assert!(slow[note_index(48)] > fast[note_index(48)]);
+        // A zero/negative tau is clamped rather than freezing the trail.
+        fade_trail(&mut fast, 1.0, 0.0);
+        assert!(fast[note_index(48)] < 0.02);
     }
 }

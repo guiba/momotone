@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::Sink;
-use crate::dashboard::metrics::FrameMetrics;
+use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
 use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
 use crate::strategies::FingerPositionStrategy;
@@ -83,6 +83,12 @@ struct Args {
     /// right, which is also where the high notes are.
     #[arg(long, default_value_t = false)]
     no_mirror: bool,
+
+    /// How long the keyboard trail lingers after a key is released, in
+    /// milliseconds. This is the decay time constant: after this many ms a lit
+    /// key is at ~37 % of its brightness, so 450 ms reads as a ~1.5 s tail.
+    #[arg(long, default_value_t = DEFAULT_FADE_MS)]
+    fade_ms: f32,
 
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
@@ -221,7 +227,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(shared);
+    let ui_result = dashboard::run(shared, args.fade_ms);
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
