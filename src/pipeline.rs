@@ -33,6 +33,10 @@ pub struct Pipeline {
     shared: Arc<Mutex<FrameMetrics>>,
     metrics: FrameMetrics,
     previous_landmarks: Vec<Landmark>,
+    /// True while a gesture is actively driving the sinks. Used to send exactly
+    /// one release event when it stops, so the audio/MIDI sinks do not latch the
+    /// last note and keep sounding after the hand leaves the frame.
+    gesture_active: bool,
     last_detection: Instant,
     started: Instant,
     max_frames: Option<u32>,
@@ -63,6 +67,7 @@ impl Pipeline {
             shared,
             metrics: FrameMetrics::default(),
             previous_landmarks: Vec::new(),
+            gesture_active: false,
             last_detection: Instant::now(),
             started: Instant::now(),
             max_frames,
@@ -165,7 +170,9 @@ impl Pipeline {
             self.metrics.palm_length = 0.0;
         }
 
-        // Gesture -> sinks.
+        // Gesture -> sinks. A sink that never receives anything keeps whatever it
+        // was last told, so the *absence* of a gesture has to be announced too:
+        // without the release event the synthesizer keeps oscillating forever.
         if let Some(event) = self.strategy.process(&detection) {
             match &event.payload {
                 GesturePayload::Note { note, velocity } => {
@@ -182,11 +189,18 @@ impl Pipeline {
                     self.metrics.note = None;
                 }
             }
+            self.gesture_active = true;
             self.event_bus.dispatch(event);
         } else {
             self.metrics.note = None;
             self.metrics.volume = 0.0;
             self.metrics.frequency = None;
+
+            if self.gesture_active {
+                let release = GestureEvent::no_gesture();
+                self.gesture_active = false;
+                self.event_bus.dispatch(release);
+            }
         }
 
         while let Ok(event) = self.event_rx.try_recv() {
@@ -221,6 +235,7 @@ impl Pipeline {
 
     fn push_log(&mut self, event: &GestureEvent) {
         let detail = match &event.payload {
+            GesturePayload::Note { note: 0, .. } => "release".to_string(),
             GesturePayload::Note { note, velocity } => {
                 format!(
                     "note {} ({}) vel {:.2}",
@@ -387,5 +402,100 @@ mod tests {
             bgr_to_rgba(&[1, 2, 3, 4, 5, 6]),
             vec![3, 2, 1, 255, 6, 5, 4, 255]
         );
+    }
+
+    /// A sink that records every event it is handed, so the tests can inspect
+    /// what the pipeline actually dispatched.
+    #[derive(Clone)]
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<GestureEvent>>>,
+    }
+
+    impl Sink for RecordingSink {
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// Fires on the first frame only, then goes silent - i.e. the hand leaves.
+    struct FirstFrameOnly {
+        armed: AtomicBool,
+    }
+
+    impl Strategy for FirstFrameOnly {
+        fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
+            if detection.hand_landmarks.is_none() || !self.armed.load(Ordering::Relaxed) {
+                return None;
+            }
+            self.armed.store(false, Ordering::Relaxed);
+            Some(GestureEvent::new_note(60, 0.8, "Finger Position"))
+        }
+    }
+
+    fn test_pipeline(strategy: Box<dyn Strategy>) -> (Pipeline, Arc<Mutex<Vec<GestureEvent>>>) {
+        let (bus, rx) = EventBus::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = Pipeline::new(
+            None,
+            None,
+            strategy,
+            vec![Box::new(RecordingSink {
+                events: events.clone(),
+            })],
+            bus,
+            rx,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+            None,
+            false,
+            false,
+        );
+        (pipeline, events)
+    }
+
+    #[test]
+    fn a_release_event_is_sent_when_the_gesture_ends() {
+        let (mut pipeline, events) = test_pipeline(Box::new(FirstFrameOnly {
+            armed: AtomicBool::new(true),
+        }));
+
+        pipeline.tick().unwrap(); // hand present -> note
+        pipeline.tick().unwrap(); // hand gone   -> release
+        pipeline.tick().unwrap(); // still gone  -> nothing more
+
+        let sent = events.lock().unwrap();
+        assert_eq!(sent.len(), 2, "exactly one note and one release");
+        match sent[0].payload {
+            GesturePayload::Note { note, velocity } => {
+                assert_eq!(note, 60);
+                assert!((velocity - 0.8).abs() < 1e-6);
+            }
+            _ => panic!("expected the gesture note first"),
+        }
+        match sent[1].payload {
+            GesturePayload::Note { note, velocity } => {
+                assert_eq!(note, 0, "release must silence the sink");
+                assert_eq!(velocity, 0.0);
+            }
+            _ => panic!("expected the release event second"),
+        }
+    }
+
+    #[test]
+    fn nothing_is_emitted_while_no_gesture_has_started() {
+        let (mut pipeline, events) = test_pipeline(Box::new(FirstFrameOnly {
+            armed: AtomicBool::new(false),
+        }));
+        pipeline.tick().unwrap();
+        pipeline.tick().unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pipeline.metrics.volume, 0.0);
+        assert!(!pipeline.gesture_active);
     }
 }

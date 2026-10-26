@@ -4,8 +4,8 @@ Short list of what to do next. Effort tags: **S** (a few hours), **M** (a day-is
 Ordered roughly by value-to-effort. `AGENTS.md` has the "Known Gaps" list this roadmap is built on.
 
 ## Now — bugs blocking usable output
-- Fix the MIDI range: strategy emits notes 36–84, `MidiOutputEngine` adds +60 → up to 144 (> 127). Drop the offset or narrow the strategy range — otherwise MIDI is silently clipped — **S**
-- Send note-off events: notes are re-triggered every frame with no release, so MIDI receivers pile up held notes — **S**
+- ~~Fix the MIDI range: strategy emits notes 36–84, `MidiOutputEngine` adds +60 → up to 144 (> 127)~~ **done** — the +60 offset is gone; notes are used as-is (36–84, C2–C6) and clamped to 0–127
+- ~~Send note-off events: notes are re-triggered every frame with no release~~ **done** — the pipeline tracks `gesture_active` and dispatches a `no_gesture()` release when the gesture ends; `MidiOutputEngine` now holds `held_note` and sends `0x80` before a new note and on release, and the synthesizer clears its voice. Detector gate raised to 0.7 (`--score-threshold`)
 - Add hysteresis / quantisation to the pitch mapping so a shaky hand does not jitter across semitones — **S**
 
 ## Performance

@@ -7,6 +7,9 @@ use std::sync::Mutex;
 pub struct MidiOutputEngine {
     port_name: String,
     connection: Option<Mutex<MidiOutputConnection>>,
+    /// The note currently held down, so the engine can send a proper note-off
+    /// when the gesture ends instead of leaving it ringing forever.
+    held_note: Option<u8>,
 }
 
 impl MidiOutputEngine {
@@ -14,7 +17,19 @@ impl MidiOutputEngine {
         Self {
             port_name: port_name.to_string(),
             connection: None,
+            held_note: None,
         }
+    }
+
+    fn send(&self, message: &[u8]) -> Result<()> {
+        let conn = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow!("MIDI not connected"))?;
+        conn.lock()
+            .map_err(|_| anyhow!("MIDI connection lock poisoned"))?
+            .send(message)
+            .map_err(|e| anyhow!("MIDI send failed: {e}"))
     }
 }
 
@@ -40,65 +55,68 @@ impl Sink for MidiOutputEngine {
     }
 
     fn stop(&mut self) -> Result<()> {
+        // Release any held note before dropping the connection.
+        let _ = self.note_off(0);
         // Connection is closed when dropped
         self.connection = None;
         Ok(())
     }
 
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
-        let mut conn = match self.connection.as_mut() {
-            Some(c) => c.lock().unwrap(),
-            None => return Ok(()), // If not started, ignore events
-        };
+        if self.connection.is_none() {
+            return Ok(()); // not started, ignore events
+        }
 
         match &event.payload {
             GesturePayload::Note { note, velocity } => {
-                if *note == 0 {
-                    // Note off for all (simplification)
-                    conn.send(&[0xB0, *note as u8 + 60, 0])?; // Using 60 as base offset if needed
+                // note 0 is the pipeline's "no gesture" release event.
+                if *note == 0 || *velocity <= 0.0 {
+                    self.note_off(0)?;
                 } else {
-                    // Note on
-                    let note_val = *note;
-                    let vel_val = (*velocity * 127.0) as u8;
-                    conn.send(&[0x90, note_val + 60, vel_val])?; // Offset by 60 to be in range
+                    // `FingerPositionStrategy` already emits MIDI numbers (36-84);
+                    // the old +60 offset pushed values past 127 and wrapped them.
+                    self.note_on(*note, *velocity)?;
                 }
             }
-            _ => {}
+            GesturePayload::Signal { .. } => {}
         }
         Ok(())
     }
 }
 
-// Helper implementation for MIDI specifically (replaces the Python logic)
+// MIDI-specific helpers (replaces the Python logic)
 impl MidiOutputEngine {
     pub fn note_on(&mut self, note: u8, velocity: f32) -> Result<()> {
-        if let Some(conn_mutex) = &self.connection {
-            let vel = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
-            // Offset to ensure MIDI range is usable (e.g., starting at C3/60)
-            conn_mutex.lock().unwrap().send(&[0x90, note + 60, vel])?;
-            Ok(())
-        } else {
-            Err(anyhow!("MIDI not connected"))
+        let vel = (velocity.clamp(0.0, 1.0) * 127.0) as u8;
+        if vel == 0 {
+            return self.note_off(note);
         }
+
+        // Release a different held note before striking the next one, otherwise
+        // every frame leaves a new note ringing.
+        if let Some(previous) = self.held_note {
+            if previous != note {
+                self.send(&[0x80, previous, 0])?;
+            }
+        }
+        self.send(&[0x90, note, vel])?;
+        self.held_note = Some(note);
+        Ok(())
     }
 
+    /// `note == 0` means "release whatever is held" (the no-gesture event).
     pub fn note_off(&mut self, note: u8) -> Result<()> {
-        if let Some(conn_mutex) = &self.connection {
-            conn_mutex.lock().unwrap().send(&[0x80, note + 60, 0])?;
-            Ok(())
-        } else {
-            Err(anyhow!("MIDI not connected"))
+        let target = if note == 0 { self.held_note } else { Some(note) };
+        if let Some(note) = target {
+            self.send(&[0x80, note, 0])?;
+            self.held_note = None;
         }
+        Ok(())
     }
 
     pub fn control_change(&mut self, cc: u8, value: f32) -> Result<()> {
-        if let Some(conn_mutex) = &self.connection {
-            let vel = (value.clamp(0.0, 1.0) * 127.0) as u8;
-            conn_mutex.lock().unwrap().send(&[0xB0, cc, vel])?;
-            Ok(())
-        } else {
-            Err(anyhow!("MIDI not connected"))
-        }
+        let vel = (value.clamp(0.0, 1.0) * 127.0) as u8;
+        self.send(&[0xB0, cc, vel])
     }
 }
 

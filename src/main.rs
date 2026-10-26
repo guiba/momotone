@@ -46,6 +46,11 @@ struct Args {
     #[arg(short, long, default_value_t = 0.5)]
     amplitude: f32,
 
+    /// Detector confidence gate (0-1). Raise it if the tracker fires on things
+    /// that are not hands; lower it if hands at an angle are missed.
+    #[arg(long, default_value_t = crate::vision::tracker::DEFAULT_SCORE_THRESHOLD)]
+    score_threshold: f32,
+
     /// Write every annotated frame to this PNG path (image mode only).
     #[arg(long)]
     dump_frame: Option<String>,
@@ -99,6 +104,7 @@ fn main() -> Result<()> {
             &args.detector_path,
             &args.landmarker_path,
             &args.anchors_path,
+            args.score_threshold,
             args.debug,
         )
         .context("Failed to initialize hand tracker")?;
@@ -131,8 +137,8 @@ fn main() -> Result<()> {
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     let sink_label = match args.mode {
         Mode::Signal => {
-            println!("Initializing Audio Engine...");
-            let mut synth = Synthesizer::new(44100.0, 1);
+            println!("Initializing Audio Engine... (gain {:.2})", args.amplitude);
+            let mut synth = Synthesizer::new(44100.0, 1, args.amplitude);
             synth.start()?;
             sinks.push(Box::new(synth));
             "audio"
@@ -159,6 +165,7 @@ fn main() -> Result<()> {
                 &args.detector_path,
                 &args.landmarker_path,
                 &args.anchors_path,
+                args.score_threshold,
                 args.debug,
             )
             .context("Failed to initialize hand tracker")?,
