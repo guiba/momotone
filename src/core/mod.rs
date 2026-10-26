@@ -22,11 +22,23 @@ pub struct StageTimings {
     pub landmarker_us: f64,
 }
 
+/// The playable MIDI range: C2 (36) to C6 (84), 49 semitones.
+pub const NOTE_LOW: u8 = 36;
+pub const NOTE_HIGH: u8 = 84;
+pub const NOTE_COUNT: usize = (NOTE_HIGH - NOTE_LOW + 1) as usize;
+/// Fraction of the frame width left unused at each edge. The outermost notes
+/// would otherwise need the hand pressed against the frame border, where the
+/// detector loses it.
+pub const NOTE_MARGIN: f32 = 0.10;
+
 #[derive(Debug, Clone, Default)]
 pub struct HandDetectionResult {
     pub hand_landmarks: Option<Vec<Landmark>>,
     /// (x, y, w, h) bounding box of the detected hand, in frame pixels.
     pub r#box: Option<(f32, f32, f32, f32)>,
+    /// Size of the frame those pixels live in, so strategies can normalise
+    /// against the whole view rather than the hand box.
+    pub frame_size: (usize, usize),
     /// Detection confidence of the winning anchor (0..1).
     pub score: f32,
     /// Per-stage inference cost of this frame, in microseconds.

@@ -108,6 +108,7 @@ mod tests {
         HandDetectionResult {
             hand_landmarks: Some(landmarks),
             r#box: Some((60.0, 100.0, 200.0, 250.0)),
+            frame_size: (640, 480),
             score: 0.9,
             timings: Default::default(),
         }

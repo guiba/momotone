@@ -16,7 +16,8 @@ use iced::widget::image::Handle;
 use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::Landmark;
-use crate::dashboard::metrics::{note_frequency, note_index, note_name, NOTE_COUNT, NOTE_LOW};
+use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
+use crate::dashboard::metrics::{note_frequency, note_index, note_name};
 
 /// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
 /// the palm, 1..5 are thumb..pinky. See `visualizer/mod.rs` for the same list
@@ -170,9 +171,11 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle) {
     );
 }
 
-/// The playable range as a keyboard: 49 semitone columns, low to high left to
-/// right, each tinted with its pitch class. `trail[i]` is the current
-/// brightness of key `i` (already faded by the UI tick).
+/// The playable range as a keyboard: `NOTE_COUNT` semitone columns, low to high
+/// left to right, each tinted with its pitch class. The band is inset by
+/// `NOTE_MARGIN` on both sides so a column lines up with the x position the
+/// strategy reads - the lit key is the one the hand is actually over.
+/// `trail[i]` is the current brightness of key `i` (already faded by the UI tick).
 fn keyboard(
     frame: &mut Frame,
     stage: Rectangle,
@@ -180,23 +183,29 @@ fn keyboard(
     current: Option<u8>,
     volume: f32,
 ) {
-    let key = stage.width / NOTE_COUNT as f32;
+    let inset = NOTE_MARGIN * stage.width;
+    let band_x = stage.x + inset;
+    let band_w = stage.width - 2.0 * inset;
+    let key = band_w / NOTE_COUNT as f32;
 
     // 1. Every key, faintly coloured, so the ladder is legible with nothing held.
     for i in 0..NOTE_COUNT {
         frame.fill(
             &Path::rectangle(
-                Point::new(stage.x + key * i as f32, stage.y),
+                Point::new(band_x + key * i as f32, stage.y),
                 Size::new(key, stage.height),
             ),
             tint(PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12], 0.05),
         );
     }
 
-    // 2. Key separators; the octave starts (every C) are drawn brighter.
-    for i in 1..NOTE_COUNT {
-        let x = stage.x + key * i as f32;
-        let major = (NOTE_LOW + i as u8) % 12 == 0;
+    // 2. Key separators. Octave starts (every C) and the two frame margins that
+    // no note can reach are drawn brighter.
+    for i in 0..=NOTE_COUNT {
+        let x = band_x + key * i as f32;
+        let major = i == 0
+            || i == NOTE_COUNT
+            || (NOTE_LOW + i.min(NOTE_COUNT - 1) as u8) % 12 == 0;
         frame.stroke(
             &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
             Stroke::default()
@@ -210,7 +219,7 @@ fn keyboard(
         if *level < TRAIL_EPS {
             continue;
         }
-        let x = stage.x + key * i as f32;
+        let x = band_x + key * i as f32;
         let color = PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12];
         let is_current = current.map_or(false, |note| note_index(note) == i);
 
@@ -241,7 +250,7 @@ fn keyboard(
     // 4. Outline the key being played and label it.
     if let Some(note) = current {
         let i = note_index(note);
-        let x = stage.x + key * i as f32;
+        let x = band_x + key * i as f32;
         let color = PITCH_COLORS[(note % 12) as usize];
         frame.stroke(
             &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
@@ -265,7 +274,7 @@ fn keyboard(
         }
         frame.fill_text(Text {
             content: note_name(note),
-            position: Point::new(stage.x + key * (i as f32 + 0.5) - 10.0, stage.y + stage.height - 18.0),
+            position: Point::new(band_x + key * (i as f32 + 0.5) - 10.0, stage.y + stage.height - 18.0),
             max_width: stage.width,
             color: MUTED,
             size: 11.0.into(),
@@ -317,6 +326,23 @@ impl<Message> Program<Message> for Skeleton {
         };
         backdrop(&mut frame, bounds, stage);
         keyboard(&mut frame, stage, &self.note_trail, self.current_note, self.volume);
+
+        // Play head: the note comes from the x position of the index tip, so a
+        // vertical line through that fingertip ties the gesture to the key.
+        if let Some(note) = self.current_note {
+            if self.landmarks.len() > 8 {
+                let tip = map.point(&self.landmarks[8]);
+                frame.stroke(
+                    &Path::line(
+                        Point::new(tip.x, stage.y),
+                        Point::new(tip.x, stage.y + stage.height),
+                    ),
+                    Stroke::default()
+                        .with_color(tint(PITCH_COLORS[(note % 12) as usize], 0.35))
+                        .with_width(1.5),
+                );
+            }
+        }
 
         // Camera feed, only when the `feed` toggle is on.
         if self.show_feed {

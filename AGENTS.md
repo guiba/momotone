@@ -45,10 +45,10 @@ WebcamSource.get_frame()  ->  HandTrackerImpl.process_frame()  ->  Strategy.proc
     *   Anchor offsets are converted to frame pixels and the palm box is **expanded ×2** to cover the whole hand (`r#box` = `(x, y, w, h)` in frame pixels).
     *   Stage 2 — `run_landmarks()`: crops the box (side = max(w,h) × 1.2) into **224×224** and runs the landmark model; the 63 floats are mapped back to **frame pixel coordinates** (`Landmark { x, y, z }`). `--debug` prints the winning anchor, the landmark bbox and all 21 landmark coordinates.
     *   The tracker computes geometry only — it draws nothing. All overlays live in `src/visualizer/mod.rs`.
-    *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, score: f32, timings: StageTimings }` (defined in `src/core/mod.rs`); `timings.detector_us` / `timings.landmarker_us` are measured per frame and feed the dashboard's performance card.
+    *   Results are `HandDetectionResult { hand_landmarks: Option<Vec<Landmark>>, r#box: Option<(f32,f32,f32,f32)>, frame_size: (usize,usize), score: f32, timings: StageTimings }` (defined in `src/core/mod.rs`); `frame_size` lets strategies normalise against the whole view. `timings.detector_us` / `timings.landmarker_us` are measured per frame and feed the dashboard's performance card.
 
 3.  **Strategy Phase** (`src/strategies/mod.rs`): implements `Strategy` from `src/core/mod.rs`.
-    *   `FingerPositionStrategy` — the one used by `main.rs`. Index-tip Y normalised against the hand box → note **36–84**; thumb↔index distance → velocity/volume 0–1, where fingers spread apart is loud and a pinch is silent (saturates at `MAX_SPREAD = 0.6` of the hand box height). Unit tests in `src/strategies/mod.rs` cover the direction of the mapping.
+    *   `FingerPositionStrategy` — the one used by `main.rs`. Index-tip **X** across the frame → note **36–84** (C2 on the left, C6 on the right), normalised by `detection.frame_size` and inset by `NOTE_MARGIN = 0.10` on both edges so the extreme keys are reachable. Thumb↔index distance → velocity/volume 0–1, where fingers spread apart is loud and a pinch is silent (saturates at `MAX_SPREAD = 0.6` of the hand box height). Unit tests in `src/strategies/mod.rs` cover the direction of both mappings.
     *   `SimplePinchStrategy` (thumb/index distance < 0.05) and `FrequencyStrategy` exist but are **not wired in**.
 
 4.  **Orchestration** (`src/pipeline.rs`):

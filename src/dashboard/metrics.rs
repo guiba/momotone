@@ -6,15 +6,10 @@
 
 use std::collections::VecDeque;
 
-use crate::core::Landmark;
+use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
 
 /// Maximum number of events kept in the on-screen log.
 pub const LOG_CAPACITY: usize = 12;
-
-/// The note range `FingerPositionStrategy` can produce: MIDI 36 (C2) to 84 (C6).
-pub const NOTE_LOW: u8 = 36;
-pub const NOTE_HIGH: u8 = 84;
-pub const NOTE_COUNT: usize = (NOTE_HIGH - NOTE_LOW + 1) as usize;
 
 /// E-folding time of the on-screen note trail. A note lit up now is at ~37 %
 /// of its brightness after this many seconds, and effectively gone after ~3 s.

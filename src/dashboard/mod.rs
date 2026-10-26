@@ -22,8 +22,9 @@ use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, 
 use iced::{time, Subscription};
 
 use crate::core::geometry::FINGER_NAMES;
+use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
-use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics, NOTE_COUNT};
+use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
 
 /// Number of samples kept for the rolling sparklines (~4 s at 30 fps).
