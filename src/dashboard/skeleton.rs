@@ -49,6 +49,11 @@ const GROUP_COLORS: [Color; 6] = [
 
 const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
 
+/// Panel background and the dark under-stroke that keeps the bones readable on
+/// a bright camera frame.
+const PANEL: Color = Color::from_rgb8(16, 19, 24);
+const OUTLINE: Color = Color::from_rgb8(10, 12, 16);
+
 #[derive(Debug, Clone)]
 pub struct Skeleton {
     /// The camera frame as RGBA pixels, drawn under the skeleton.
@@ -110,23 +115,28 @@ impl<Message> Program<Message> for Skeleton {
         let mut frame = Frame::new(renderer, bounds.size());
         let map = Mapping::new(self.frame_size, bounds);
 
+        // The panel itself, so the letterbox bars are part of the stage.
+        frame.fill(
+            &Path::rectangle(Point::new(0.0, 0.0), bounds.size()),
+            PANEL,
+        );
+
         // Camera feed, letterboxed to the frame aspect ratio.
+        let stage = Rectangle {
+            x: map.offset_x,
+            y: map.offset_y,
+            width: bounds.width - 2.0 * map.offset_x,
+            height: bounds.height - 2.0 * map.offset_y,
+        };
+
         if let Some(handle) = &self.image {
-            frame.draw_image(
-                Rectangle {
-                    x: map.offset_x,
-                    y: map.offset_y,
-                    width: bounds.width - 2.0 * map.offset_x,
-                    height: bounds.height - 2.0 * map.offset_y,
-                },
-                Image::new(handle.clone()),
-            );
+            frame.draw_image(stage, Image::new(handle.clone()));
         } else {
             // Mock mode / no camera: a faint grid so the stage is not blank.
             for i in 1..8 {
-                let x = bounds.width * i as f32 / 8.0;
+                let x = stage.x + stage.width * i as f32 / 8.0;
                 frame.stroke(
-                    &Path::line(Point::new(x, 0.0), Point::new(x, bounds.height)),
+                    &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
                     Stroke::default()
                         .with_color(Color::from_rgb8(30, 35, 42))
                         .with_width(1.0),
@@ -166,10 +176,16 @@ impl<Message> Program<Message> for Skeleton {
             }
         }
 
-        // Bones.
+        // Bones: a dark under-stroke first, then the coloured bone on top, so
+        // the skeleton reads against both dark and bright frames.
         for (a, b, group) in CONNECTIONS {
+            let line = Path::line(map.point(&self.landmarks[a]), map.point(&self.landmarks[b]));
             frame.stroke(
-                &Path::line(map.point(&self.landmarks[a]), map.point(&self.landmarks[b])),
+                &line,
+                Stroke::default().with_color(OUTLINE).with_width(5.0),
+            );
+            frame.stroke(
+                &line,
                 Stroke::default()
                     .with_color(GROUP_COLORS[group])
                     .with_width(2.5),
@@ -180,7 +196,7 @@ impl<Message> Program<Message> for Skeleton {
         for (index, landmark) in self.landmarks.iter().enumerate() {
             let position = map.point(landmark);
             let is_tip = FINGER_TIPS.contains(&index);
-            let radius = if is_tip { 5.0 } else { 2.5 };
+            let radius = if is_tip { 5.5 } else { 3.0 };
             // Landmark 0 is the wrist, 1..4 the thumb, then four per finger.
             let group = if index == 0 {
                 0
@@ -189,8 +205,10 @@ impl<Message> Program<Message> for Skeleton {
             } else {
                 2 + (index - 5) / 4
             };
+            let joint = Path::circle(position, radius);
+            frame.fill(&joint, OUTLINE);
             frame.fill(
-                &Path::circle(position, radius),
+                &Path::circle(position, radius - 1.2),
                 if index == 0 {
                     Color::from_rgb8(240, 244, 248)
                 } else {

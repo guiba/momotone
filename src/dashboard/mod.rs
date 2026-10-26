@@ -120,16 +120,22 @@ impl Dashboard {
         .spacing(10)
         .align_y(alignment::Vertical::Center);
 
-        let stage = container(canvas(Skeleton {
-            image: self.frame_image.clone(),
-            landmarks: self.metrics.landmarks.clone(),
-            frame_size: self.metrics.frame_size,
-            hand_box: self.metrics.hand_box,
-            show_box: self.show_box,
-            show_labels: self.show_labels,
-            detected: self.metrics.detected,
-        }))
-        .padding(12)
+        // The stage is the dominant panel: it fills the whole middle band, and
+        // the camera frame is letterboxed inside it by `Skeleton`.
+        let stage = container(
+            canvas(Skeleton {
+                image: self.frame_image.clone(),
+                landmarks: self.metrics.landmarks.clone(),
+                frame_size: self.metrics.frame_size,
+                hand_box: self.metrics.hand_box,
+                show_box: self.show_box,
+                show_labels: self.show_labels,
+                detected: self.metrics.detected,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill),
+        )
+        .padding(8)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_theme| container::Style {
@@ -152,7 +158,12 @@ impl Dashboard {
             geometry_card(&self.metrics),
         ]
         .spacing(10)
-        .width(320);
+        .width(300);
+
+        // `height(Length::Fill)` is what makes the stage take the whole middle
+        // band: a `row!` defaults to `Length::Shrink`, which would collapse the
+        // stage to the intrinsic height of the rail cards.
+        let body = row![stage, rail].spacing(12).height(Length::Fill);
 
         // Bottom strip: time-series and log, away from the live numbers.
         let strip = row![
@@ -167,12 +178,7 @@ impl Dashboard {
         ]
         .spacing(10);
 
-        column![
-            header,
-            rule::horizontal(1),
-            row![stage, rail].spacing(12),
-            strip,
-        ]
+        column![header, rule::horizontal(1), body, strip]
         .padding(14)
         .spacing(10)
         .into()
@@ -192,7 +198,7 @@ pub fn run(shared: Arc<Mutex<FrameMetrics>>) -> iced::Result {
     .subscription(Dashboard::subscription)
     .theme(Dashboard::theme)
     .title(app_title)
-    .window_size(Size::new(1100.0, 720.0))
+    .window_size(Size::new(1300.0, 860.0))
     .run()
 }
 
@@ -347,7 +353,7 @@ fn sparkline_card<'a>(
             color,
         })
         .width(Length::Fill)
-        .height(70),
+        .height(60),
     )
 }
 
