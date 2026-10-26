@@ -1,7 +1,8 @@
 //! The iced dashboard: a native HUD window replacing the OpenCV `imshow` view.
 //!
 //! Layout is two columns:
-//!   * left  - the hand skeleton, drawn on an iced canvas
+//!   * left  - the hand skeleton on a dark stage (the webcam feed is off by
+//!             default; the `feed` button puts it back)
 //!   * right - a telemetry rail: note, volume, confidence, performance,
 //!             hand geometry, rolling history, and the event log
 //!
@@ -44,6 +45,7 @@ enum Message {
     Tick,
     ToggleBox,
     ToggleLabels,
+    ToggleFeed,
     ClearHistory,
 }
 
@@ -55,6 +57,9 @@ pub struct Dashboard {
     confidence_history: Vec<f32>,
     show_box: bool,
     show_labels: bool,
+    /// The stage is a backdrop + skeleton by default; the camera is only
+    /// uploaded when this is on.
+    show_feed: bool,
 }
 
 impl Dashboard {
@@ -67,6 +72,7 @@ impl Dashboard {
             confidence_history: Vec::new(),
             show_box: true,
             show_labels: false,
+            show_feed: false,
         }
     }
 
@@ -74,15 +80,19 @@ impl Dashboard {
         match message {
             Message::Tick => {
                 if let Ok(mut shared) = self.shared.lock() {
-                    // Take ownership of the pixels instead of copying them: the
-                    // clone below then carries an empty buffer.
-                    if !shared.frame_pixels.is_empty() {
+                    // Only build an image handle when the feed is actually shown:
+                    // a 640x480 RGBA frame is 1.2 MB per tick otherwise. Take
+                    // ownership of the pixels so the clone below carries an empty
+                    // buffer either way.
+                    if self.show_feed && !shared.frame_pixels.is_empty() {
                         let (width, height) = shared.frame_size;
                         self.frame_image = Some(Handle::from_rgba(
                             width as u32,
                             height as u32,
                             std::mem::take(&mut shared.frame_pixels),
                         ));
+                    } else {
+                        shared.frame_pixels.clear();
                     }
                     self.metrics = shared.clone();
                 }
@@ -91,6 +101,7 @@ impl Dashboard {
             }
             Message::ToggleBox => self.show_box = !self.show_box,
             Message::ToggleLabels => self.show_labels = !self.show_labels,
+            Message::ToggleFeed => self.show_feed = !self.show_feed,
             Message::ClearHistory => {
                 self.volume_history.clear();
                 self.confidence_history.clear();
@@ -113,6 +124,8 @@ impl Dashboard {
                 .size(12)
                 .color(MUTED),
             space::horizontal(),
+            button(text(if self.show_feed { "hide feed" } else { "feed" }))
+                .on_press(Message::ToggleFeed),
             button(text("box")).on_press(Message::ToggleBox),
             button(text("labels")).on_press(Message::ToggleLabels),
             button(text("clear")).on_press(Message::ClearHistory),
@@ -121,16 +134,19 @@ impl Dashboard {
         .align_y(alignment::Vertical::Center);
 
         // The stage is the dominant panel: it fills the whole middle band, and
-        // the camera frame is letterboxed inside it by `Skeleton`.
+        // `Skeleton` maps the frame's coordinate space into a letterboxed
+        // rectangle inside it.
         let stage = container(
             canvas(Skeleton {
                 image: self.frame_image.clone(),
+                show_feed: self.show_feed,
                 landmarks: self.metrics.landmarks.clone(),
                 frame_size: self.metrics.frame_size,
                 hand_box: self.metrics.hand_box,
                 show_box: self.show_box,
                 show_labels: self.show_labels,
                 detected: self.metrics.detected,
+                lost_ms: self.metrics.lost_ms,
             })
             .width(Length::Fill)
             .height(Length::Fill),
