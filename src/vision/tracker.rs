@@ -21,7 +21,14 @@ const LANDMARKER_INPUT: usize = 224;
 /// Default detector confidence gate. A real hand scores ~0.9; an empty frame tops
 /// out around 0.15, so 0.7 is a strict gate that rejects near-misses and
 /// false positives. Overridable with `--score-threshold`.
-pub const DEFAULT_SCORE_THRESHOLD: f32 = 0.7;
+pub const DEFAULT_SCORE_THRESHOLD: f32 = 0.6;
+
+/// How many consecutive frames without a detection before the detector window
+/// stops following the last palm position and returns to the centred square.
+const ROI_STALE_FRAMES: u32 = 10;
+/// Smoothing factor of the palm anchor: 1.0 would track the palm exactly, 0.3
+/// keeps the window steady against landmark jitter.
+const ROI_ANCHOR_WEIGHT: f64 = 0.3;
 
 const INV_255: f32 = 1.0 / 255.0;
 
@@ -209,6 +216,44 @@ fn warp_affine(frame: &Mat, map: Affine, out_size: core::Size, dst: &mut Mat) ->
     Ok(map)
 }
 
+/// The largest axis-aligned square the detector can take from the frame, slid so
+/// that it contains `palm` (where the hand was last frame). Without history this
+/// is exactly the centred square the pipeline used before.
+///
+/// This is what makes the outer keys playable: at 640x480 a centred square only
+/// ever samples x = 80..560, so a hand pushed to the right edge was never seen by
+/// the model at all.
+fn detector_crop(palm: Option<(f64, f64)>, fw: f64, fh: f64) -> (f64, f64, f64) {
+    let side = fw.min(fh);
+    match palm {
+        Some((px, py)) => (
+            (px - side * 0.5).clamp(0.0, fw - side),
+            (py - side * 0.5).clamp(0.0, fh - side),
+            side,
+        ),
+        None => ((fw - side) * 0.5, (fh - side) * 0.5, side),
+    }
+}
+
+/// Low-pass the palm anchor so a jittery detection does not shake the window.
+fn smooth_palm(previous: Option<(f64, f64)>, next: (f64, f64)) -> (f64, f64) {
+    match previous {
+        Some((px, py)) => (
+            px + ROI_ANCHOR_WEIGHT * (next.0 - px),
+            py + ROI_ANCHOR_WEIGHT * (next.1 - py),
+        ),
+        None => next,
+    }
+}
+
+/// Palm centre and the radius of the x2-expanded hand box, in frame pixels.
+struct PalmBox {
+    cx: f64,
+    cy: f64,
+    half: f64,
+    score: f32,
+}
+
 pub struct HandTrackerImpl {
     pub detector_session: Session,
     pub landmarker_session: Session,
@@ -220,6 +265,12 @@ pub struct HandTrackerImpl {
     /// frame (see `StageInput`).
     detector_input: StageInput,
     landmarker_input: StageInput,
+    /// Palm centre the detector reported recently, smoothed. The detector's
+    /// square window is slid to keep this point inside, so a hand pushed against
+    /// the frame edge is still sampled instead of being cropped out of the model
+    /// input (see `detector_crop`).
+    roi_palm: Option<(f64, f64)>,
+    roi_stale: u32,
 }
 
 impl HandTrackerImpl {
@@ -257,19 +308,27 @@ impl HandTrackerImpl {
             debug,
             detector_input: StageInput::new(DETECTOR_INPUT, DETECTOR_INPUT),
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
+            roi_palm: None,
+            roi_stale: 0,
         })
     }
 
-    /// Detector stage: returns the hand box in frame pixel coordinates.
-    fn run_detector(&mut self, frame: &Mat) -> Result<Option<(f32, f32, f32, f32, f32)>> {
+    /// Detector stage: returns the palm centre and the x2-expanded hand radius,
+    /// in frame pixels.
+    fn run_detector(&mut self, frame: &Mat) -> Result<Option<PalmBox>> {
         let fw = frame.cols() as f64;
         let fh = frame.rows() as f64;
 
-        // The detector wants a square input: take the largest centred square.
-        let side = fw.min(fh);
+        // The detector wants a square input. The window follows the palm so a
+        // hand at the frame edge is still fully sampled instead of being cut out
+        // of the model input.
+        let (tx, ty, side) = detector_crop(self.roi_palm, fw, fh);
         let k = side / DETECTOR_INPUT as f64; // detector pixel -> frame pixel
-        let tx = 0.5 * (fw - side);
-        let ty = 0.5 * (fh - side);
+
+        if self.debug {
+            let palm = self.roi_palm;
+            eprintln!("[Tracker] detector window x={tx:.0} y={ty:.0} side={side:.0} palm={palm:?}");
+        }
 
         let map = sample_affine_to_tensor(
             frame,
@@ -325,6 +384,7 @@ impl HandTrackerImpl {
         }
 
         if best_conf < self.score_threshold {
+            self.note_miss();
             return Ok(None);
         }
 
@@ -342,36 +402,41 @@ impl HandTrackerImpl {
         let frame_cy = map.frame_y(cx, cy);
         let half = bw.max(bh) * 2.0 * 0.5 * map.m00; // expand to cover the whole hand
 
-        let x0 = (frame_cx - half).max(0.0);
-        let y0 = (frame_cy - half).max(0.0);
-        let x1 = (frame_cx + half).min(fw);
-        let y1 = (frame_cy + half).min(fh);
-
-        if x1 <= x0 || y1 <= y0 {
+        if half <= 0.0 || frame_cx.is_nan() || frame_cy.is_nan() {
+            self.note_miss();
             return Ok(None);
         }
 
-        Ok(Some((
-            x0 as f32,
-            y0 as f32,
-            (x1 - x0) as f32,
-            (y1 - y0) as f32,
-            best_conf,
-        )))
+        // Remember where the hand is so the next frame's window contains it.
+        self.roi_palm = Some(smooth_palm(self.roi_palm, (frame_cx, frame_cy)));
+        self.roi_stale = 0;
+
+        Ok(Some(PalmBox {
+            cx: frame_cx,
+            cy: frame_cy,
+            half,
+            score: best_conf,
+        }))
     }
 
-    /// Landmarker stage: crop the detected box into a 224x224 square and run it.
-    fn run_landmarks(
-        &mut self,
-        frame: &Mat,
-        box_x0: f32,
-        box_y0: f32,
-        box_w: f32,
-        box_h: f32,
-    ) -> Result<Vec<Landmark>> {
-        let cx = box_x0 as f64 + box_w as f64 * 0.5;
-        let cy = box_y0 as f64 + box_h as f64 * 0.5;
-        let side = (box_w.max(box_h) as f64) * 1.2;
+    /// A missed frame keeps the window where it was; after enough misses the
+    /// anchor is dropped so the search starts from the centred square again.
+    fn note_miss(&mut self) {
+        self.roi_stale += 1;
+        if self.roi_stale >= ROI_STALE_FRAMES {
+            self.roi_palm = None;
+            self.roi_stale = 0;
+        }
+    }
+
+    /// Landmarker stage: crop a square around the palm into 224x224 and run it.
+    fn run_landmarks(&mut self, frame: &Mat, cx: f64, cy: f64, half: f64) -> Result<Vec<Landmark>> {
+        // The box the detector produced is the palm expanded x2. Cropping a square
+        // slightly larger than it, centred on the *true* palm centre, keeps the
+        // fingers inside the crop even when the hand is clipped by the frame edge:
+        // warpAffine pads the off-frame half with black instead of sliding the crop
+        // left, which is what used to happen with a clamped box.
+        let side = half * 2.0 * 1.2;
         let s = side / LANDMARKER_INPUT as f64; // crop pixel -> frame pixel
 
         let map = sample_affine_to_tensor(
@@ -431,12 +496,21 @@ impl HandTrackerImpl {
         let detection = self.run_detector(frame)?;
         result.timings.detector_us = detector_start.elapsed().as_secs_f64() * 1e6;
 
-        if let Some((x0, y0, w, h, conf)) = detection {
-            result.r#box = Some((x0, y0, w, h));
-            result.score = conf;
+        if let Some(detection) = detection {
+            // The palm box is reported unclamped: a constant 2 x half square keeps
+            // the strategy's spread normalisation stable even when the hand is
+            // clipped by the edge of the view (the canvas/ OpenCV clip the overlay
+            // when it is drawn).
+            result.r#box = Some((
+                (detection.cx - detection.half) as f32,
+                (detection.cy - detection.half) as f32,
+                (2.0 * detection.half) as f32,
+                (2.0 * detection.half) as f32,
+            ));
+            result.score = detection.score;
 
             let landmarker_start = Instant::now();
-            match self.run_landmarks(frame, x0, y0, w, h) {
+            match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
                 Ok(landmarks) => {
                     result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
                     result.hand_landmarks = Some(landmarks.clone());
@@ -573,6 +647,43 @@ mod tests {
         assert!(near(px(&data, 3, 1, 1, 0), 90.0 / 255.0)); // frame pixel (1,0) -> R
         assert!(near(px(&data, 3, 1, 2, 0), 120.0 / 255.0)); // frame pixel (1,1) -> R
         assert!((map.tx + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_detector_window_follows_the_palm() {
+        // 640x480: the square window is 480 wide, so a centred crop only ever
+        // sampled x = 80..560 - the outer 80 px on each side were invisible.
+        let centred = detector_crop(None, 640.0, 480.0);
+        assert_eq!((centred.0, centred.1, centred.2), (80.0, 0.0, 480.0));
+
+        // Hand hard against the right edge: the window slides to contain it.
+        let right = detector_crop(Some((620.0, 240.0)), 640.0, 480.0);
+        assert_eq!((right.0, right.1), (160.0, 0.0));
+        assert!(right.0 + right.2 >= 620.0);
+
+        // ...and the left edge.
+        let left = detector_crop(Some((20.0, 240.0)), 640.0, 480.0);
+        assert_eq!((left.0, left.1), (0.0, 0.0));
+        assert!(left.0 <= 20.0 && left.0 + left.2 >= 20.0);
+
+        // A palm in the middle still gets the centred square.
+        let mid = detector_crop(Some((320.0, 240.0)), 640.0, 480.0);
+        assert_eq!((mid.0, mid.1), (80.0, 0.0));
+    }
+
+    #[test]
+    fn the_anchor_is_smoothed_and_never_overshoots() {
+        assert_eq!(smooth_palm(None, (100.0, 50.0)), (100.0, 50.0));
+
+        let moved = smooth_palm(Some((0.0, 0.0)), (100.0, 0.0));
+        assert!((moved.0 - 30.0).abs() < 1e-9);
+
+        // Converges on the palm without ever passing it.
+        let mut anchor = (0.0, 0.0);
+        for _ in 0..50 {
+            anchor = smooth_palm(Some(anchor), (100.0, 0.0));
+        }
+        assert!(anchor.0 < 100.0 && anchor.0 > 99.0);
     }
 
     #[test]
