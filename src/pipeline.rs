@@ -150,6 +150,8 @@ impl Pipeline {
         self.metrics.hand_box = detection.r#box;
         self.metrics.landmarks = detection.hand_landmarks.clone().unwrap_or_default();
         self.metrics.landmark_count = self.metrics.landmarks.len();
+        // The note anchor: landmark 8 is the index fingertip.
+        self.metrics.pitch_x = self.metrics.landmarks.get(8).map_or(0.0, |l| l.x);
 
         if self.metrics.detected {
             self.last_detection = Instant::now();
@@ -220,13 +222,14 @@ impl Pipeline {
 
         if self.debug && self.metrics.frames % 10 == 0 {
             println!(
-                "[Pipeline] fps {:.1} conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px",
+                "[Pipeline] fps {:.1} conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
                 self.metrics.fps,
                 self.metrics.confidence,
                 self.metrics.note,
                 self.metrics.volume,
                 self.metrics.spread,
                 self.metrics.jitter_px,
+                self.metrics.pitch_x,
             );
         }
 
@@ -296,7 +299,9 @@ fn landmark_jitter(previous: &[Landmark], current: &[Landmark]) -> f32 {
 /// webcam or the ONNX models (`--mode mock`).
 fn synthetic_detection(seconds: f64) -> HandDetectionResult {
     let t = seconds as f32;
-    let cx = 320.0 + 90.0 * (t * 0.7).sin();
+    // The centre sweeps almost the full 640 px view so the mock hand walks the
+    // whole keyboard, low notes on the left and high notes on the right.
+    let cx = 320.0 + 240.0 * (t * 0.7).sin();
     let cy = 250.0 + 50.0 * (t * 0.45).cos();
     let curl = 0.45 + 0.45 * (t * 1.1).sin();
     let thumb_angle = 55.0 + 25.0 * (t * 0.8).cos();
@@ -337,6 +342,7 @@ fn synthetic_detection(seconds: f64) -> HandDetectionResult {
     HandDetectionResult {
         hand_landmarks: Some(landmarks),
         r#box: Some((minx, miny, maxx - minx, maxy - miny)),
+        frame_size: (640, 480),
         score: 0.85 + 0.12 * (t * 0.6).sin(),
         timings: Default::default(),
     }

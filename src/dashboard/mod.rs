@@ -1,7 +1,8 @@
 //! The iced dashboard: a native HUD window replacing the OpenCV `imshow` view.
 //!
 //! Layout is two columns:
-//!   * left  - the hand skeleton, drawn on an iced canvas
+//!   * left  - the hand skeleton on a dark stage (the webcam feed is off by
+//!             default; the `feed` button puts it back)
 //!   * right - a telemetry rail: note, volume, confidence, performance,
 //!             hand geometry, rolling history, and the event log
 //!
@@ -13,7 +14,7 @@ pub mod metrics;
 pub mod skeleton;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::widget::image::Handle;
 use iced::widget::{button, canvas, column, container, row, rule, space, text, Column};
@@ -21,14 +22,14 @@ use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, 
 use iced::{time, Subscription};
 
 use crate::core::geometry::FINGER_NAMES;
+use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
-use crate::dashboard::metrics::{note_name, FrameMetrics};
+use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
 
 /// Number of samples kept for the rolling sparklines (~4 s at 30 fps).
 const HISTORY: usize = 120;
 const UI_TICK_MS: u64 = 33;
-
 const BG: Color = Color::from_rgb8(16, 19, 24);
 const CARD: Color = Color::from_rgb8(24, 28, 34);
 const CARD_BORDER: Color = Color::from_rgb8(46, 53, 62);
@@ -44,6 +45,7 @@ enum Message {
     Tick,
     ToggleBox,
     ToggleLabels,
+    ToggleFeed,
     ClearHistory,
 }
 
@@ -55,6 +57,13 @@ pub struct Dashboard {
     confidence_history: Vec<f32>,
     show_box: bool,
     show_labels: bool,
+    /// The stage is a backdrop + skeleton by default; the camera is only
+    /// uploaded when this is on.
+    show_feed: bool,
+    /// Per-semitone brightness of the on-screen keyboard. Set to 1.0 when a
+    /// note is played, exponentially faded on every UI tick.
+    note_trail: [f32; NOTE_COUNT],
+    last_tick: Instant,
 }
 
 impl Dashboard {
@@ -67,30 +76,48 @@ impl Dashboard {
             confidence_history: Vec::new(),
             show_box: true,
             show_labels: false,
+            show_feed: false,
+            note_trail: [0.0; NOTE_COUNT],
+            last_tick: Instant::now(),
         }
     }
 
     fn update(&mut self, message: Message) {
         match message {
             Message::Tick => {
+                // Fade the keyboard trail against the wall clock, so the decay
+                // rate is independent of the tick interval.
+                let dt = self.last_tick.elapsed().as_secs_f32();
+                self.last_tick = Instant::now();
+                fade_trail(&mut self.note_trail, dt);
+
                 if let Ok(mut shared) = self.shared.lock() {
-                    // Take ownership of the pixels instead of copying them: the
-                    // clone below then carries an empty buffer.
-                    if !shared.frame_pixels.is_empty() {
+                    // Only build an image handle when the feed is actually shown:
+                    // a 640x480 RGBA frame is 1.2 MB per tick otherwise. Take
+                    // ownership of the pixels so the clone below carries an empty
+                    // buffer either way.
+                    if self.show_feed && !shared.frame_pixels.is_empty() {
                         let (width, height) = shared.frame_size;
                         self.frame_image = Some(Handle::from_rgba(
                             width as u32,
                             height as u32,
                             std::mem::take(&mut shared.frame_pixels),
                         ));
+                    } else {
+                        shared.frame_pixels.clear();
                     }
                     self.metrics = shared.clone();
                 }
                 push(&mut self.volume_history, self.metrics.volume);
                 push(&mut self.confidence_history, self.metrics.confidence);
+                // Lighting a key restarts its fade from full brightness.
+                if let Some(note) = self.metrics.note {
+                    self.note_trail[note_index(note)] = 1.0;
+                }
             }
             Message::ToggleBox => self.show_box = !self.show_box,
             Message::ToggleLabels => self.show_labels = !self.show_labels,
+            Message::ToggleFeed => self.show_feed = !self.show_feed,
             Message::ClearHistory => {
                 self.volume_history.clear();
                 self.confidence_history.clear();
@@ -113,6 +140,8 @@ impl Dashboard {
                 .size(12)
                 .color(MUTED),
             space::horizontal(),
+            button(text(if self.show_feed { "hide feed" } else { "feed" }))
+                .on_press(Message::ToggleFeed),
             button(text("box")).on_press(Message::ToggleBox),
             button(text("labels")).on_press(Message::ToggleLabels),
             button(text("clear")).on_press(Message::ClearHistory),
@@ -121,16 +150,22 @@ impl Dashboard {
         .align_y(alignment::Vertical::Center);
 
         // The stage is the dominant panel: it fills the whole middle band, and
-        // the camera frame is letterboxed inside it by `Skeleton`.
+        // `Skeleton` maps the frame's coordinate space into a letterboxed
+        // rectangle inside it.
         let stage = container(
             canvas(Skeleton {
                 image: self.frame_image.clone(),
+                show_feed: self.show_feed,
                 landmarks: self.metrics.landmarks.clone(),
                 frame_size: self.metrics.frame_size,
                 hand_box: self.metrics.hand_box,
                 show_box: self.show_box,
                 show_labels: self.show_labels,
                 detected: self.metrics.detected,
+                lost_ms: self.metrics.lost_ms,
+                note_trail: self.note_trail,
+                current_note: self.metrics.note,
+                volume: self.metrics.volume,
             })
             .width(Length::Fill)
             .height(Length::Fill),
@@ -328,6 +363,10 @@ fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         "HAND GEOMETRY",
         column![
             kv("status", status),
+            kv(
+                "pitch anchor",
+                format!("tip x {:.0} / {:.0} px", metrics.pitch_x, metrics.frame_size.0),
+            ),
             kv("landmarks", format!("{}", metrics.landmark_count)),
             kv("spread", format!("{:.2}", metrics.spread)),
             kv("tilt", format!("{:.0}°", metrics.tilt_deg)),

@@ -78,6 +78,12 @@ struct Args {
     #[arg(long, default_value_t = 480)]
     camera_height: u32,
 
+    /// Stop mirroring the webcam. By default the frame is flipped horizontally
+    /// so the stage behaves like a mirror: your right hand shows up on the
+    /// right, which is also where the high notes are.
+    #[arg(long, default_value_t = false)]
+    no_mirror: bool,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -175,7 +181,7 @@ fn main() -> Result<()> {
         None
     } else {
         Some(
-            WebcamSource::new(args.camera, args.camera_width, args.camera_height)
+            WebcamSource::new(args.camera, args.camera_width, args.camera_height, !args.no_mirror)
                 .context("Failed to open webcam")?,
         )
     };

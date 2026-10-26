@@ -422,6 +422,7 @@ impl HandTrackerImpl {
         let mut result = HandDetectionResult {
             hand_landmarks: None,
             r#box: None,
+            frame_size: (frame.cols() as usize, frame.rows() as usize),
             score: 0.0,
             timings: StageTimings::default(),
         };
