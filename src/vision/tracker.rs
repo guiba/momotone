@@ -343,6 +343,8 @@ impl HandTrackerImpl {
             [1usize, DETECTOR_INPUT, DETECTOR_INPUT, 3],
             self.detector_input.data.as_slice(),
         ))?;
+        // `collect()` materialises `SessionOutputs`, which borrows the session, so
+        // the extracted slices stay valid after the loop.
         let outputs: Vec<_> = self
             .detector_session
             .run(vec![("input_1", input)])?
@@ -513,7 +515,6 @@ impl HandTrackerImpl {
             match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
                 Ok(landmarks) => {
                     result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
-                    result.hand_landmarks = Some(landmarks.clone());
                     if self.debug {
                         let (mut minx, mut miny, mut maxx, mut maxy) =
                             (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -533,6 +534,8 @@ impl HandTrackerImpl {
                             );
                         }
                     }
+                    // Move instead of clone: the Vec is handed straight to the result.
+                    result.hand_landmarks = Some(landmarks);
                 }
                 Err(e) => {
                     if self.debug {
