@@ -112,9 +112,10 @@ Useful `Args`: `--mode signal|midi|mock`, `--amplitude` (audio master gain), `--
 
 ## Known Gaps / Things To Fix
 See `ROADMAP.md` for the prioritised list of next features and performance work (effort-tagged).
-- `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `Visualizer::draw_hud` is unused.
-- Unit tests cover the strategies, the resampling helper, the geometry helpers, the synthetic mock hand, the gesture **release** path in the pipeline and the synthesizer's voice lifecycle (`cargo test`); the bench is `#[ignore]`d. Still no lint/CI.
-- The camera, inference and sinks share one pipeline thread; only the UI is separate. Splitting capture/inference/sinks into stages is still open (see ROADMAP).
+- `Landmark.z` is read nowhere; `SimplePinchStrategy`/`FrequencyStrategy` are never constructed; `Visualizer::draw_hud`, `sources/mock.rs` and the core `Source`/`Tracker` traits are unused scaffolding (13 dead-code warnings in total).
+- Unit tests cover the strategies (pitch range, box-independence), the resampling helper and the palm-anchored detector window, the geometry helpers, the synthetic mock hand, the gesture **release** and **pause** paths in the pipeline, the keyboard trail decay and the synthesizer's voice lifecycle (`cargo test`). The bench is `#[ignore]`d; nothing exercises the ONNX stages on a fixture image. Still no lint/CI.
+- The camera, inference and sinks share one pipeline thread; the UI tick is separate and Start/Stop pauses the loop via an `AtomicBool`. Splitting capture/inference/sinks into stages is still open (see ROADMAP).
+- `frame_to_rgba` runs every frame when the UI is open even though the dashboard discards the pixels unless `show_feed` is on.
 
 ## Development Guidelines for AI Assistants
 

@@ -1,61 +1,87 @@
 # Roadmap — gesture_rust
 
-Short list of what to do next. Effort tags: **S** (a few hours), **M** (a day-ish), **L** (multi-day).
-Ordered roughly by value-to-effort. `AGENTS.md` has the "Known Gaps" list this roadmap is built on.
+Effort tags: **S** (a few hours), **M** (a day-ish), **L** (multi-day). Ordered by value-to-effort.
+Status: measured on `master` after the mirror/ROI/UI work (see "Recently done" at the bottom).
 
-## Now — bugs blocking usable output
-- ~~Fix the MIDI range: strategy emits notes 36–84, `MidiOutputEngine` adds +60 → up to 144 (> 127)~~ **done** — the +60 offset is gone; notes are used as-is (36–84, C2–C6) and clamped to 0–127
-- ~~Send note-off events: notes are re-triggered every frame with no release~~ **done** — the pipeline tracks `gesture_active` and dispatches a `no_gesture()` release when the gesture ends; `MidiOutputEngine` now holds `held_note` and sends `0x80` before a new note and on release, and the synthesizer clears its voice. Detector gate raised to 0.7 (`--score-threshold`)
-- Add hysteresis / quantisation to the pitch mapping so a shaky hand does not jitter across semitones — **S**
+## Measured baseline
+
+| What | Number | Where |
+| :--- | :--- | :--- |
+| Frame loop | **30 fps** (camera-limited) | `cargo run --release -- --debug --no-ui` |
+| Detector input sampling (192×192) | 133 µs (reused buffer) vs 247 µs legacy | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
+| Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
+| RGBA upload when the feed is off | ~1.2 MB/frame built then discarded | `Pipeline::tick` → `frame_to_rgba` |
+| Mirroring | one extra `Mat` allocation per frame (~920 KB) | `WebcamSource::get_frame` |
+| Dead-code warnings | 13 | `cargo build` |
+
+Sampling is **not** the bottleneck: ~227 µs per frame out of a ~33 ms budget. Inference (`ort` sessions) and per-frame copying are.
+
+## Now — highest value next
+
+1. **Gate the RGBA upload on the feed toggle** — `frame_to_rgba` runs every frame whenever the UI is open, and the dashboard `clear()`s the pixels when `show_feed` is false. **S**
+2. **Kill the per-frame clones** — `self.metrics.clone()` copies the landmark Vec and the 12-entry event log (with its `String`s) each tick; `previous_landmarks.clone()` and `landmarks.clone()` in the tracker add more. Publish only what the UI reads, or swap `VecDeque<EventLogEntry>` for a fixed ring buffer of `[(u64, u8, f32)]`. **S**
+3. **Pitch hysteresis / smoothing** — the hand jitters a pixel or two, which walks across semitones. EMA the index-tip x, or quantise with a ±1-note hysteresis band. **S**
+4. **Release profile + per-stage latency printout** — no `lto`/`target-cpu` in `Cargo.toml`, and `--debug` prints fps but not `detector_us`/`landmarker_us`. Add both so perf work is measurable. **S**
+5. **Clear the 13 dead-code warnings** — `sources/mock.rs` (`MockSource`, `MockSourceImpl`, `SourceTrait`), `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, core `Source`/`Tracker` traits, `GestureEvent::new_signal`, `MidiOutputEngine::control_change`, `StreamWrapper`'s unread field. **S**
 
 ## Performance
-- ~~Replace hand-written bilinear `sample_affine_to_tensor()` (tracker.rs) with OpenCV `warpAffine`/`resize` + one bulk BGR→RGB→f32 conversion~~ **done** — `resize` on the crop (warpAffine fallback when the crop runs off the frame), one bulk BGR→RGB `/255` pass, and the sampler now returns the mapping it actually applied (`Resampled { tensor, map }`) so box/landmark conversion stays consistent. Measured with `cargo test --release -- --include-ignored bench_sampling`: 192×192 190 µs → 109 µs, 224×224 270 µs → 66 µs per stage
-- ~~Reuse one input buffer/tensor per stage instead of allocating + copying (`vec![0.0f32; …]`, `Array4::from_shape_vec`, `Value::from_array`) every frame~~ **done** — `StageInput` (OpenCV scratch Mat + f32 buffer) is allocated once in `HandTrackerImpl::new` and refilled in place; ort now gets a zero-copy `TensorRef` view of it and `ndarray` was dropped from `Cargo.toml`. Honest note: `cargo test --release -- --include-ignored bench_sampling` shows only ~3% (192×192 101.5 µs reused vs 104.6 µs fresh; 224×224 59.5 µs vs 58.8 µs) because malloc reuses the freed blocks and ort was already wrapping the `Vec` without copying — the real per-frame cost is now `cv::resize` itself, so the capture-resolution item below is the bigger win
-- ~~Set capture resolution/FPS explicitly in `WebcamSource::new` and feed both stages a downscaled frame (e.g. 640×480) instead of the raw camera frame~~ **done** — `WebcamSource::new(camera_id, width, height)` requests 640×480 by default (`--camera-width` / `--camera-height`); FPS is still not pinned
-- Skip the landmarker when the detector box is unchanged / below a stability threshold, or run it every Nth frame and reuse landmarks — **M**
-- Remove per-frame allocations in `process_frame`: `outputs.into_iter().collect()` and `landmarks.clone()` — **S**
-- ~~Get `imshow` + `wait_key` (and `--dump-frame`, which writes a PNG *every* iteration) out of the hot loop; add `--no-display`~~ **done** — the OpenCV window is gone (only `--image` dumps use it) and `--no-ui` runs the pipeline headless
-- ~~Split the pipeline into stages (capture → inference → sinks → display) on threads; either actually use `tokio` (declared in `Cargo.toml` but unused) or delete the dependency~~ **partly done** — the camera/inference/sink loop lives in `src/pipeline.rs` on its own thread, and `tokio` is now iced's executor; capture, inference and sinks still share one thread
-- Audio callback: drop the per-block `Mutex` lock (atomics or lock-free shared state), ramp frequency to avoid zipper clicks, add ADSR + note-off — **M**
-- Add a release profile (`lto = true`, `target-cpu = native`) and an `--fps`/per-stage latency printout so improvements are measurable — **S**
-- Clear the ~14 dead-code warnings so the real hot path is obvious: `sources/mock.rs`, `SimplePinchStrategy`, `FrequencyStrategy`, `Source`/`Tracker` traits, `no_gesture()` — **S**
+
+- **Skip the landmarker when the hand is static** — if the detector box and anchor are unchanged (or confidence is within a stability band), reuse the previous landmarks instead of running the 224×224 model every frame. **M**
+- **Mirror flip in place** — `core::flip(&frame, &mut frame, 1)` avoids the second `Mat`; alternatively flip the landmarks' x in the tracker and skip the pixel copy altogether. **S**
+- **Audio callback lock** — the cpal callback takes a `Mutex<SynthesizerState>` per audio block. Move to atomics / a double-buffered state so the hot path is lock-free. **M**
+- **Split capture, inference and sinks onto their own threads** — one thread still does camera read → detector → landmarker → strategy → sinks. **M**
+- **Trim `tokio`** — declared with `features = ["full"]` and only used as iced's async executor; a slimmer feature set removes an unnecessary dependency weight. **S**
+- **Cache the keyboard backdrop** — `keyboard()` re-fills all 49 base cells plus separators every UI tick; the static part (cells, separators, octave labels) could be drawn once or only when the panel size changes. **S**
+- **GPU / alternative ONNX Runtime execution provider** for `ort`. **L**
+- **Single-shot hand model** instead of detector + landmarker, or a retrained lighter BlazeHand variant. **L**
+- **Pin capture FPS** — resolution is requested (`--camera-width`/`--camera-height`) but FPS is not; `CAP_PROP_FPS` is still unset. **S**
 
 ## Features
+
 ### Gesture layer
-- Landmark smoothing (EMA / simple Kalman-lite) before any strategy runs — **S**
-- Discrete gesture set: open hand, fist, pinch, peace; per-gesture mapping configurable instead of hardcoded — **M**
-- Finger-extension detection (tip vs. MCP distance) so each finger is an on/off switch — **M**
-- Gesture "chords": combine several gestures into a chord/scale/scale-mode selection — **M**
+- **Landmark smoothing (EMA / Kalman-lite)** before any strategy runs — also fixes the jitter in item 3 above. **S**
+- **Discrete gesture set**: open hand, fist, pinch, peace, with per-gesture mapping configured rather than hardcoded. **M**
+- **Finger extension as switches** — `hand_geometry()` already computes per-finger extension; turn each into an on/off gate. **M**
+- **Gesture chords** — combine several gestures into chord/scale selection. **M**
+- **Use `Landmark.z`** — depth is parsed but read by nothing. **M**
+- **Two hands** — NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs modulation). **L**
 
 ### Output sinks
-- OSC sink (implement `Sink`, push into `sinks` in `main.rs`) — **S**
-- MIDI polyphony with a voice pool and proper note release — **M**
-- JSON/CSV event log for offline analysis of gesture traces — **S**
+- **OSC sink** — implement `Sink` and push it into `sinks` in `main.rs`. **S**
+- **MIDI polyphony** — `MidiOutputEngine` is monophonic (`held_note: Option<u8>`); add a voice pool. **M**
+- **JSON/CSV event log** for offline analysis of gesture traces. **S**
 
 ### Input & evaluation
-- `--video <file>` playback source so runs are reproducible — **M**
-- Benchmark harness: recorded clip + FPS/accuracy report, so perf work is verifiable — **M**
-- `--calibrate` mode that samples the user's hand range and stores per-user min/max — **M**
+- **`--video <file>` playback source** so runs are reproducible. **M**
+- **Benchmark harness**: recorded clip + FPS/accuracy report. **M**
+- **`--calibrate`** — sample the user's comfortable hand range and store per-user min/max, replacing the fixed `NOTE_MARGIN`. **M**
 
-### Visualization & UX
-- ~~Draw the hand box (computed but never rendered), HUD FPS + detector confidence, gesture name~~ **done** — the iced dashboard (`src/dashboard/`) replaced OpenCV `imshow`: skeleton canvas, box toggle, note/volume/confidence meters, per-stage latency, FPS, jitter, finger extension, rolling sparklines and an event log
-- ~~Split the pipeline into stages (capture → inference → sinks → display) on threads~~ **partly done** — the frame loop now runs on its own thread (`src/pipeline.rs`) and the iced UI owns the main thread; capture/inference/sinks are still one thread
-- ~~Feed the camera frames into the dashboard as an `image` widget (`image::Handle::Rgba` from the `Mat` pixels) instead of a separate OpenCV window~~ **done** — the stage canvas draws the RGBA frame and the skeleton in the same iced window
-- Landmark smoothing (EMA) before drawing and before strategies, with the smoothing strength shown in the rail — **S**
-- Note visualisation: a mini keyboard / octave strip showing the current note and recent notes, plus MIDI note-on/off state and active voice count — **M**
-- Audio visualiser: render the actual oscillator envelope or an RMS trace from the cpal callback — **M**
-- Finger-extension chips that already exist in the rail → turn them into discrete gesture triggers (open hand, fist, pinch) — **M**
-- Remove the remaining dead code so the dashboard's data path is obvious: `sources/mock.rs`, `Visualizer::draw_hud`, `SimplePinchStrategy`, `FrequencyStrategy`, `no_gesture()`, `Source`/`Tracker` traits — **S**
+### Visualisation & UX
+- **Keyboard shortcuts** for Start/Stop and the toggles (iced key events) so the app is operable without hunting for buttons. **S**
+- **Stage overlay while paused** — a "stopped" banner on the keyboard so the state is obvious from a glance, not just in the Status card. **S**
+- **In-UI fade control** — expose `--fade-ms` as a slider/stepper in the Advanced tab. **S**
+- **Note-name labels on the keyboard** (currently only the octave Cs); highlight the current pitch class. **S**
+- **Audio visualiser** — render the oscillator envelope or an RMS trace from the cpal callback. **M**
+- **Voice count / MIDI note-on-off state** in the rail. **S**
 
 ### Tooling
-- `cargo fmt` + `clippy` + `cargo check` in CI — **S**
-- Tracker fixture tests using `--image` snapshots (gold box + 21 landmarks) — **M**
-- Replace `println!`/`eprintln!` with `tracing` — **S**
-- TOML config file for model paths, thresholds, note ranges (CLI overrides it) — **M**
+- **CI**: `cargo fmt` + `clippy` + `cargo check`. **S**
+- **Tracker fixture tests** using `--image` snapshots (gold box + 21 landmarks) so the inference path is tested, not just the geometry helpers. **M**
+- **Replace `println!`/`eprintln!` with `tracing`**. **S**
+- **TOML config** for model paths, thresholds, note ranges, with CLI overrides. **M**
 
-## Stretch / later
-- GPU or other ONNX Runtime execution provider for `ort` — **L**
-- Single-shot hand-mesh model instead of the two-stage detector + landmarker — **L**
-- Two hands: NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs. modulation) — **L**
-- Retrain/re-export a lighter BlazeHand variant for lower latency — **L**
-- Use `Landmark.z` for depth-based gestures (currently read nowhere) — **M**
+## Recently done
+
+- **Mirrored capture** — webcam frames are flipped horizontally by default (`--no-mirror` to disable), so the hand and the keyboard agree on left/right.
+- **Palm-anchored detector window** — the 192×192 square slides to contain the last palm centre instead of sitting dead-centred; at 640×480 the centred crop only sampled x = 80..560, which is why the outer keys were unreachable. Anchor is EMA-smoothed and dropped after 10 misses.
+- **Note keyboard on the stage** — 49 semitone columns with pitch-class colours, a per-note trail with `--fade-ms` decay, a volume bar on the held key, and a play-head line at the index tip.
+- **Pitch from the index tip's x** across the frame (previously its height inside the hand box), with a 10 % inset band.
+- **Start/Stop button** — pauses the pipeline thread without tearing down camera or sinks, releasing the held note so audio/MIDI go silent.
+- **Basic / Advanced tabs** on a scrollable rail; the bottom strip is gone and the stage takes the full middle band.
+- **Landmarker crop centred on the true palm** rather than a frame-clamped box, so a clipped hand keeps its fingers in the crop.
+
+## Open gaps worth a look
+
+- `--max-frames` still terminates the pipeline even with the UI open, but Stop/Start has no equivalent headless flag.
+- `FrameMetrics.paused` is published but the stage canvas (`Skeleton`) does not use it.
+- Tests cover strategies, geometry, sampling, the trail and the release path; nothing exercises the ROI window logic beyond `detector_crop`, and no test runs the ONNX stages on a fixture image.
