@@ -199,11 +199,15 @@ impl Pipeline {
         self.metrics.detector_us = detection.timings.detector_us;
         self.metrics.landmarker_us = detection.timings.landmarker_us;
 
-        // Tracking state.
+        // Tracking state. `clone_from` keeps the Vec's capacity, so the landmark
+        // list stops reallocating every frame.
         self.metrics.detected = detection.r#box.is_some();
         self.metrics.confidence = detection.score;
         self.metrics.hand_box = detection.r#box;
-        self.metrics.landmarks = detection.hand_landmarks.clone().unwrap_or_default();
+        match &detection.hand_landmarks {
+            Some(landmarks) => self.metrics.landmarks.clone_from(landmarks),
+            None => self.metrics.landmarks.clear(),
+        }
         self.metrics.landmark_count = self.metrics.landmarks.len();
         // The note anchor: landmark 8 is the index fingertip.
         self.metrics.pitch_x = self.metrics.landmarks.get(8).map_or(0.0, |l| l.x);
@@ -213,7 +217,7 @@ impl Pipeline {
         }
         self.metrics.lost_ms = self.last_detection.elapsed().as_millis() as u64;
         self.metrics.jitter_px = landmark_jitter(&self.previous_landmarks, &self.metrics.landmarks);
-        self.previous_landmarks = self.metrics.landmarks.clone();
+        self.previous_landmarks.clone_from(&self.metrics.landmarks);
 
         if let Some(geometry) = hand_geometry(&detection) {
             self.metrics.spread = geometry.spread;
