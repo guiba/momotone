@@ -22,6 +22,8 @@ use crate::vision::tracker::HandTrackerImpl;
 
 /// Mock mode emulates a 30 fps camera so the telemetry looks real.
 const MOCK_CADENCE_MS: u64 = 33;
+/// How often the paused loop checks the Start/Stop flag and refreshes the UI.
+const PAUSE_POLL_MS: u64 = 50;
 
 pub struct Pipeline {
     camera: Option<WebcamSource>,
@@ -42,6 +44,9 @@ pub struct Pipeline {
     max_frames: Option<u32>,
     debug: bool,
     emit_frames: bool,
+    /// Set by the dashboard's Start/Stop button. While it is false the loop
+    /// captures nothing and runs no inference.
+    active: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -56,6 +61,7 @@ impl Pipeline {
         max_frames: Option<u32>,
         debug: bool,
         emit_frames: bool,
+        active: Arc<AtomicBool>,
     ) -> Self {
         Pipeline {
             camera,
@@ -73,12 +79,21 @@ impl Pipeline {
             max_frames,
             debug,
             emit_frames,
+            active,
         }
     }
 
-    /// Runs until the UI asks for shutdown or `--max-frames` is reached.
+    /// Runs until the UI asks for shutdown or `--max-frames` is reached. The
+    /// `active` flag (the dashboard's Stop button) pauses the loop without
+    /// tearing down the camera or the sinks.
     pub fn run(&mut self, running: &AtomicBool) -> Result<()> {
         while running.load(Ordering::Relaxed) {
+            if !self.active.load(Ordering::Relaxed) {
+                self.pause();
+                std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
+                continue;
+            }
+
             if !self.tick()? {
                 break;
             }
@@ -96,6 +111,37 @@ impl Pipeline {
         Ok(())
     }
 
+    /// While stopped, release whatever the sinks are holding and publish a
+    /// "paused" snapshot once, so the note does not latch and the keyboard trail
+    /// fades to nothing.
+    fn pause(&mut self) {
+        if self.gesture_active {
+            self.gesture_active = false;
+            self.event_bus.dispatch(GestureEvent::no_gesture());
+        }
+        while let Ok(event) = self.event_rx.try_recv() {
+            for sink in &mut self.sinks {
+                let _ = sink.handle_event(&event);
+            }
+        }
+
+        if self.metrics.paused {
+            return;
+        }
+        self.metrics.paused = true;
+        self.metrics.detected = false;
+        self.metrics.note = None;
+        self.metrics.volume = 0.0;
+        self.metrics.frequency = None;
+        self.metrics.landmarks.clear();
+        self.metrics.landmark_count = 0;
+        self.metrics.hand_box = None;
+        self.metrics.pitch_x = 0.0;
+        if let Ok(mut shared) = self.shared.lock() {
+            *shared = self.metrics.clone();
+        }
+    }
+
     /// One camera frame end to end. Returns `false` when the camera is gone.
     pub fn tick(&mut self) -> Result<bool> {
         // Mock mode has no camera, so pace it like one to keep the telemetry
@@ -107,6 +153,7 @@ impl Pipeline {
         self.metrics.frames += 1;
         self.metrics.uptime_ms = self.started.elapsed().as_millis() as u64;
         self.metrics.frame_id = self.metrics.frames;
+        self.metrics.paused = false;
 
         let frame_start = Instant::now();
 
@@ -430,6 +477,18 @@ mod tests {
         }
     }
 
+    /// Fires on every frame, i.e. a hand that never leaves the view.
+    struct AlwaysOn;
+
+    impl Strategy for AlwaysOn {
+        fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
+            detection
+                .hand_landmarks
+                .as_ref()
+                .map(|_| GestureEvent::new_note(60, 0.8, "Finger Position"))
+        }
+    }
+
     /// Fires on the first frame only, then goes silent - i.e. the hand leaves.
     struct FirstFrameOnly {
         armed: AtomicBool,
@@ -461,8 +520,29 @@ mod tests {
             None,
             false,
             false,
+            Arc::new(AtomicBool::new(true)),
         );
         (pipeline, events)
+    }
+
+    #[test]
+    fn pausing_releases_the_note_and_marks_the_snapshot() {
+        let (mut pipeline, events) = test_pipeline(Box::new(AlwaysOn));
+
+        // With no camera the pipeline synthesises a hand, so the strategy fires.
+        pipeline.tick().unwrap();
+
+        pipeline.active.store(false, Ordering::Relaxed);
+        pipeline.pause();
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(recorded
+            .iter()
+            .any(|e| matches!(e.payload, GesturePayload::Note { note: 0, .. })),
+            "stopping must release the held note");
+        assert!(pipeline.metrics.paused);
+        assert!(pipeline.metrics.note.is_none());
+        assert_eq!(pipeline.metrics.volume, 0.0);
     }
 
     #[test]

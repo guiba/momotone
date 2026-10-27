@@ -46,6 +46,8 @@ pub struct EventLogEntry {
 #[derive(Debug, Clone, Default)]
 pub struct FrameMetrics {
     // --- tracking ---
+    /// True when the dashboard's Stop button has paused the pipeline.
+    pub paused: bool,
     pub detected: bool,
     pub confidence: f32,
     pub landmark_count: usize,
