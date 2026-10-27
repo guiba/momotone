@@ -30,6 +30,16 @@ const ROI_STALE_FRAMES: u32 = 10;
 /// keeps the window steady against landmark jitter.
 const ROI_ANCHOR_WEIGHT: f64 = 0.3;
 
+/// Landmark reuse: a palm that has not moved produces the same 224x224 crop, so
+/// the landmarker can be skipped and its previous keypoints reused. A palm may
+/// drift by this many pixels (and this much of its size) and still count as
+/// stationary.
+const LANDMARKER_REUSE_MOVE_PX: f64 = 3.0;
+const LANDMARKER_REUSE_SIZE_TOL: f64 = 0.03;
+/// Never reuse for more than this many consecutive frames: hand *shape* can
+/// change while the palm stays put, and volume is read from the fingertips.
+const LANDMARKER_REUSE_MAX_FRAMES: u32 = 3;
+
 const INV_255: f32 = 1.0 / 255.0;
 
 /// Affine mapping from output (model) pixels to frame pixels:
@@ -271,6 +281,72 @@ pub struct HandTrackerImpl {
     /// input (see `detector_crop`).
     roi_palm: Option<(f64, f64)>,
     roi_stale: u32,
+    /// Keypoints reused while the palm is stationary (see `LandmarkCache`).
+    landmark_cache: LandmarkCache,
+}
+
+/// A palm that has not moved and not changed size produces the same crop, so the
+/// landmarker's output is still valid. The reference palm is deliberately *not*
+/// updated while reuse is active, which bounds the drift to `LANDMARKER_REUSE_MAX_FRAMES`
+/// frames.
+fn palm_is_steady(palm: (f64, f64, f64), previous: Option<(f64, f64, f64)>) -> bool {
+    let Some((previous_x, previous_y, previous_half)) = previous else {
+        return false;
+    };
+    if previous_half <= 0.0 {
+        return false;
+    }
+    (palm.0 - previous_x).abs() < LANDMARKER_REUSE_MOVE_PX
+        && (palm.1 - previous_y).abs() < LANDMARKER_REUSE_MOVE_PX
+        && (palm.2 - previous_half).abs() / previous_half < LANDMARKER_REUSE_SIZE_TOL
+}
+
+/// The state behind that decision: the keypoints of the last landmarker run and
+/// the palm they belong to. Keeping it separate from the ONNX sessions makes it
+/// testable without the models.
+struct LandmarkCache {
+    landmarks: Vec<Landmark>,
+    palm: Option<(f64, f64, f64)>,
+    streak: u32,
+    enabled: bool,
+}
+
+impl LandmarkCache {
+    fn new(enabled: bool) -> Self {
+        LandmarkCache {
+            landmarks: Vec::new(),
+            palm: None,
+            streak: 0,
+            enabled,
+        }
+    }
+
+    /// Keypoints to use for this frame, or `None` when the model has to run.
+    fn reuse(&mut self, palm: (f64, f64, f64)) -> Option<Vec<Landmark>> {
+        if !self.enabled
+            || self.landmarks.is_empty()
+            || self.streak >= LANDMARKER_REUSE_MAX_FRAMES
+            || !palm_is_steady(palm, self.palm)
+        {
+            return None;
+        }
+        self.streak += 1;
+        Some(self.landmarks.clone())
+    }
+
+    fn refresh(&mut self, palm: (f64, f64, f64), landmarks: &[Landmark]) {
+        // clear + extend_from_slice keeps the existing allocation.
+        self.landmarks.clear();
+        self.landmarks.extend_from_slice(landmarks);
+        self.palm = Some(palm);
+        self.streak = 0;
+    }
+
+    fn clear(&mut self) {
+        self.landmarks.clear();
+        self.palm = None;
+        self.streak = 0;
+    }
 }
 
 impl HandTrackerImpl {
@@ -280,6 +356,7 @@ impl HandTrackerImpl {
         anchors_path: &str,
         score_threshold: f32,
         debug: bool,
+        reuse_landmarks: bool,
     ) -> Result<Self> {
         let detector_session = Session::builder()
             .with_context(|| format!("Failed to load detector {detector_path}"))?
@@ -310,6 +387,7 @@ impl HandTrackerImpl {
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
             roi_palm: None,
             roi_stale: 0,
+            landmark_cache: LandmarkCache::new(reuse_landmarks),
         })
     }
 
@@ -511,38 +589,56 @@ impl HandTrackerImpl {
             ));
             result.score = detection.score;
 
-            let landmarker_start = Instant::now();
-            match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
-                Ok(landmarks) => {
-                    result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
-                    if self.debug {
-                        let (mut minx, mut miny, mut maxx, mut maxy) =
-                            (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                        for lm in &landmarks {
-                            minx = minx.min(lm.x);
-                            maxx = maxx.max(lm.x);
-                            miny = miny.min(lm.y);
-                            maxy = maxy.max(lm.y);
-                        }
-                        eprintln!(
-                            "[Tracker] landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
-                        );
-                        for (i, lm) in landmarks.iter().enumerate() {
-                            eprintln!(
-                                "[Tracker] lm[{i}] = ({:.1}, {:.1}, {:.3})",
-                                lm.x, lm.y, lm.z
-                            );
-                        }
-                    }
-                    // Move instead of clone: the Vec is handed straight to the result.
-                    result.hand_landmarks = Some(landmarks);
+            let palm = (detection.cx, detection.cy, detection.half);
+            if let Some(landmarks) = self.landmark_cache.reuse(palm) {
+                // Same palm, same crop: the keypoints from the previous run are
+                // still valid, so the 224x224 model is not executed this frame.
+                result.hand_landmarks = Some(landmarks);
+                result.timings.landmarker_us = 0.0;
+                if self.debug {
+                    eprintln!("[Tracker] palm steady, reusing landmarks ({} frame{} in a row)",
+                        self.landmark_cache.streak,
+                        if self.landmark_cache.streak > 1 { "s" } else { "" });
                 }
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("[Tracker] landmarker stage skipped: {e}");
+            } else {
+                let landmarker_start = Instant::now();
+                match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
+                    Ok(landmarks) => {
+                        result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
+                        if self.debug {
+                            let (mut minx, mut miny, mut maxx, mut maxy) =
+                                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                            for lm in &landmarks {
+                                minx = minx.min(lm.x);
+                                maxx = maxx.max(lm.x);
+                                miny = miny.min(lm.y);
+                                maxy = maxy.max(lm.y);
+                            }
+                            eprintln!(
+                                "[Tracker] landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
+                            );
+                            for (i, lm) in landmarks.iter().enumerate() {
+                                eprintln!(
+                                    "[Tracker] lm[{i}] = ({:.1}, {:.1}, {:.3})",
+                                    lm.x, lm.y, lm.z
+                                );
+                            }
+                        }
+                        self.landmark_cache.refresh(palm, &landmarks);
+                        result.hand_landmarks = Some(landmarks);
+                    }
+                    Err(e) => {
+                        if self.debug {
+                            eprintln!("[Tracker] landmarker stage skipped: {e}");
+                        }
+                        self.landmark_cache.clear();
                     }
                 }
             }
+        } else {
+            // No hand: the cache is worthless and must not be reused on the next
+            // sighting.
+            self.landmark_cache.clear();
         }
 
         Ok(result)
@@ -672,6 +768,57 @@ mod tests {
         // A palm in the middle still gets the centred square.
         let mid = detector_crop(Some((320.0, 240.0)), 640.0, 480.0);
         assert_eq!((mid.0, mid.1), (80.0, 0.0));
+    }
+
+    #[test]
+    fn a_still_palm_reuses_its_landmarks() {
+        let reference = Some((320.0, 240.0, 100.0));
+        // Sub-pixel tracking jitter is below the tolerance.
+        assert!(palm_is_steady((321.5, 241.0, 101.0), reference));
+        // A hand that actually moved is not steady.
+        assert!(!palm_is_steady((340.0, 240.0, 100.0), reference));
+        // ...and neither is one that changed size appreciably (3 % of 100 px = 3 px).
+        assert!(!palm_is_steady((320.0, 240.0, 110.0), reference));
+        // No previous run means nothing to reuse.
+        assert!(!palm_is_steady((320.0, 240.0, 100.0), None));
+    }
+
+    #[test]
+    fn the_cache_reuses_only_while_the_palm_is_still_and_never_forever() {
+        let palm = (320.0, 240.0, 100.0);
+        let keypoints: Vec<Landmark> = (0..21)
+            .map(|i| Landmark { x: i as f32, y: 0.0, z: 0.0 })
+            .collect();
+        let mut cache = LandmarkCache::new(true);
+
+        // Nothing cached yet: the landmarker has to run.
+        assert!(cache.reuse(palm).is_none());
+        cache.refresh(palm, &keypoints);
+
+        // Steady palm: reuse is allowed for exactly MAX_FRAMES consecutive frames,
+        // then the streak cap forces a fresh model run.
+        let mut consecutive = 0;
+        for _ in 0..10 {
+            if cache.reuse(palm).is_some() {
+                consecutive += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(consecutive, LANDMARKER_REUSE_MAX_FRAMES);
+
+        // A moved palm breaks the streak immediately.
+        cache.refresh(palm, &keypoints);
+        assert!(cache.reuse((400.0, 240.0, 100.0)).is_none());
+
+        // Losing the hand empties the cache.
+        cache.clear();
+        assert!(cache.reuse(palm).is_none());
+
+        // Disabled with --landmarker-always.
+        let mut strict = LandmarkCache::new(false);
+        strict.refresh(palm, &keypoints);
+        assert!(strict.reuse(palm).is_none());
     }
 
     #[test]

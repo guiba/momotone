@@ -31,7 +31,7 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 
 ## Performance
 
-- **Skip the landmarker when the hand is static** — if the detector box and anchor are unchanged (or confidence is within a stability band), reuse the previous landmarks instead of running the 224×224 model every frame. **M**
+- ~~Skip the landmarker when the hand is static~~ **done** — `LandmarkCache` reuses the previous keypoints while the palm is within 3 px and 3 % of its last size, capped at 3 consecutive frames so a hand that reshapes without moving its palm is never served stale landmarks for long, and cleared whenever the detector loses the hand. The landmarker stage costs ~4-5.4 ms when it runs, so a still hand saves most of it. Verify with `cargo run -- --debug` (`palm steady, reusing landmarks`) and compare against `--landmarker-always`. **Note:** fps is camera-paced at ~30, so the win is latency and CPU headroom, not frame rate.
 - **Mirror flip in place** — `core::flip(&frame, &mut frame, 1)` avoids the second `Mat`; alternatively flip the landmarks' x in the tracker and skip the pixel copy altogether. **S**
 - **Audio callback lock** — the cpal callback takes a `Mutex<SynthesizerState>` per audio block. Move to atomics / a double-buffered state so the hot path is lock-free. **M**
 - **Split capture, inference and sinks onto their own threads** — one thread still does camera read → detector → landmarker → strategy → sinks. **M**

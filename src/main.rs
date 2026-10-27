@@ -90,6 +90,11 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_FADE_MS)]
     fade_ms: f32,
 
+    /// Run the landmark model on every frame even when the palm is stationary,
+    /// disabling the reuse fast path (useful for A/B testing the stage timings).
+    #[arg(long, default_value_t = false)]
+    landmarker_always: bool,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -118,6 +123,7 @@ fn main() -> Result<()> {
             &args.anchors_path,
             args.score_threshold,
             args.debug,
+            !args.landmarker_always,
         )
         .context("Failed to initialize hand tracker")?;
 
@@ -179,6 +185,7 @@ fn main() -> Result<()> {
                 &args.anchors_path,
                 args.score_threshold,
                 args.debug,
+                !args.landmarker_always,
             )
             .context("Failed to initialize hand tracker")?,
         )
