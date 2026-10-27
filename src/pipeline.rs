@@ -281,8 +281,11 @@ impl Pipeline {
 
         if self.debug && self.metrics.frames % 10 == 0 {
             println!(
-                "[Pipeline] fps {:.1} conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
+                "[Pipeline] fps {:.1} frame {:.2} ms (detector {:.0} us, landmarker {:.0} us) conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
                 self.metrics.fps,
+                self.metrics.frame_ms,
+                self.metrics.detector_us,
+                self.metrics.landmarker_us,
                 self.metrics.confidence,
                 self.metrics.note,
                 self.metrics.volume,

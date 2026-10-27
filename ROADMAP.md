@@ -7,21 +7,26 @@ Status: measured on `master` after the mirror/ROI/UI work (see "Recently done" a
 
 | What | Number | Where |
 | :--- | :--- | :--- |
-| Frame loop | **30 fps** (camera-limited) | `cargo run --release -- --debug --no-ui` |
+| Frame loop | **30 fps**, 31 ms/frame | `cargo run --release -- --debug --no-ui` |
+| Camera read | ~21 ms of that frame | `frame_ms - detector_us` |
+| Detector stage (192×192, hand absent) | **9.5 ms** | same run, `--debug` |
+| Detector stage (192×192, fixture image) | 7.2 ms | `cargo run --release -- --image output_frame.png --debug --max-frames 40` |
 | Detector input sampling (192×192) | 133 µs (reused buffer) vs 247 µs legacy | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
 | Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
-| RGBA upload when the feed is off | ~1.2 MB/frame built then discarded | `Pipeline::tick` → `frame_to_rgba` |
+| Frame snapshot copy | 0.44 µs | not worth optimising |
+| RGBA upload when the feed is off | 0.16 ms/frame built then discarded (now gated) | `cargo test --release -- --include-ignored bench_feed_upload --nocapture` |
 | Mirroring | one extra `Mat` allocation per frame (~920 KB) | `WebcamSource::get_frame` |
 | Dead-code warnings | 13 | `cargo build` |
 
-Sampling is **not** the bottleneck: ~227 µs per frame out of a ~33 ms budget. Inference (`ort` sessions) and per-frame copying are.
+Inference is the bottleneck: the detector alone is ~10 ms and the landmarker runs every
+frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 
 ## Now — highest value next
 
 1. **Gate the RGBA upload on the feed toggle** — `frame_to_rgba` runs every frame whenever the UI is open, and the dashboard `clear()`s the pixels when `show_feed` is false. **S**
 2. ~~Kill the per-frame clones~~ **done, but it was not the bottleneck** — the tracker now moves the landmark Vec into the result instead of cloning it, and `Pipeline::tick` refills `metrics.landmarks` / `previous_landmarks` with `clone_from` so their buffers are reused. Measured: copying the whole `FrameMetrics` snapshot costs **0.44 µs/frame** (0.0015 % of a 33 ms frame), so a hand-written `copy_from` was not worth the maintenance risk of a field-by-field copy drifting out of sync with the struct.
 3. ~~Pitch hysteresis / smoothing~~ **done** — the index-tip x runs through an EMA (`PITCH_EMA_ALPHA = 0.35`) before quantisation, and the smoother resets when the hand is lost. Test `the_smoothing_kills_jitter_but_follows_a_sweep` compares note flapping with and without it.
-4. **Release profile + per-stage latency printout** — no `lto`/`target-cpu` in `Cargo.toml`, and `--debug` prints fps but not `detector_us`/`landmarker_us`. Add both so perf work is measurable. **S**
+4. ~~Release profile + per-stage latency printout~~ **done** — `[profile.release] lto = "fat"`, `codegen-units = 1`, and `--debug` now prints `frame 31.07 ms (detector 9548 us, landmarker 0 us)`.
 5. **Clear the 13 dead-code warnings** — `sources/mock.rs` (`MockSource`, `MockSourceImpl`, `SourceTrait`), `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, core `Source`/`Tracker` traits, `GestureEvent::new_signal`, `MidiOutputEngine::control_change`, `StreamWrapper`'s unread field. **S**
 
 ## Performance
