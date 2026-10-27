@@ -1,5 +1,6 @@
 pub mod event_bus;
 pub mod geometry;
+pub mod scale;
 pub mod types;
 
 use crate::core::types::GestureEvent;

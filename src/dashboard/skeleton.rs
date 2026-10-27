@@ -180,6 +180,7 @@ fn keyboard(
     frame: &mut Frame,
     stage: Rectangle,
     trail: &[f32; NOTE_COUNT],
+    playable: &[u8],
     current: Option<u8>,
     volume: f32,
 ) {
@@ -188,14 +189,17 @@ fn keyboard(
     let band_w = stage.width - 2.0 * inset;
     let key = band_w / NOTE_COUNT as f32;
 
-    // 1. Every key, faintly coloured, so the ladder is legible with nothing held.
+    // 1. Every key, faintly coloured. Keys the current scale allows are brighter,
+    // so the playable pattern is legible even when nothing is held.
     for i in 0..NOTE_COUNT {
+        let note = NOTE_LOW + i as u8;
+        let alpha = if playable.contains(&note) { 0.11 } else { 0.03 };
         frame.fill(
             &Path::rectangle(
                 Point::new(band_x + key * i as f32, stage.y),
                 Size::new(key, stage.height),
             ),
-            tint(PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12], 0.05),
+            tint(PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12], alpha),
         );
     }
 
@@ -266,17 +270,23 @@ fn keyboard(
         });
     }
 
-    // 5. Octave reference along the floor.
+    // 5. Note labels along the floor. With a coarse scale there is room to name
+    // every playable key; with the chromatic set only the octave Cs fit.
+    let label_every_key = playable.len() <= 14;
     for i in 0..NOTE_COUNT {
         let note = NOTE_LOW + i as u8;
-        if note % 12 != 0 {
+        if !label_every_key {
+            if note % 12 != 0 {
+                continue;
+            }
+        } else if !playable.contains(&note) {
             continue;
         }
         frame.fill_text(Text {
             content: note_name(note),
             position: Point::new(band_x + key * (i as f32 + 0.5) - 10.0, stage.y + stage.height - 18.0),
             max_width: stage.width,
-            color: MUTED,
+            color: if playable.contains(&note) { MUTED } else { Color::from_rgb8(70, 78, 86) },
             size: 11.0.into(),
             ..Default::default()
         });
@@ -299,6 +309,8 @@ pub struct Skeleton {
     pub lost_ms: u64,
     /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW.
     pub note_trail: [f32; NOTE_COUNT],
+    /// The notes the active scale allows; the rest of the keyboard is dimmed.
+    pub playable: Vec<u8>,
     pub current_note: Option<u8>,
     pub volume: f32,
 }
@@ -325,7 +337,14 @@ impl<Message> Program<Message> for Skeleton {
             height: bounds.height - 2.0 * map.offset_y,
         };
         backdrop(&mut frame, bounds, stage);
-        keyboard(&mut frame, stage, &self.note_trail, self.current_note, self.volume);
+        keyboard(
+            &mut frame,
+            stage,
+            &self.note_trail,
+            &self.playable,
+            self.current_note,
+            self.volume,
+        );
 
         // Play head: the note comes from the x position of the index tip, so a
         // vertical line through that fingertip ties the gesture to the key.

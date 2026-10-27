@@ -178,9 +178,12 @@ impl Dashboard {
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
-                "{} · {} · trail {:.0} ms",
+                "{} · {} · {} · {} {} · trail {:.0} ms",
                 self.metrics.mode,
                 self.metrics.sink,
+                self.metrics.scale,
+                self.metrics.root,
+                self.metrics.playable.len(),
                 self.fade_tau * 1000.0
             ))
                 .size(12)
@@ -217,6 +220,7 @@ impl Dashboard {
                 detected: self.metrics.detected,
                 lost_ms: self.metrics.lost_ms,
                 note_trail: self.note_trail,
+                playable: self.metrics.playable.clone(),
                 current_note: self.metrics.note,
                 volume: self.metrics.volume,
             })
