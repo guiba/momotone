@@ -89,6 +89,12 @@ pub struct FrameMetrics {
     // --- context ---
     pub mode: String,
     pub sink: String,
+    /// The scale the pitch is quantised to, e.g. "major pentatonic".
+    pub scale: String,
+    /// Root letter of that scale, e.g. "C".
+    pub root: String,
+    /// Notes the scale makes playable inside NOTE_LOW..=NOTE_HIGH, ascending.
+    pub playable: Vec<u8>,
     pub log: VecDeque<EventLogEntry>,
 }
 

@@ -1,0 +1,23 @@
+feat: quantise pitch to a scale
+
+src/core/scale.rs adds seven presets (major/minor pentatonic, major, minor,
+dorian, whole tone, chromatic) plus root-name parsing and playable_notes(root,
+scale), which returns the notes inside NOTE_LOW..=NOTE_HIGH that belong to the
+scale.
+
+FingerPositionStrategy now maps the EMA-smoothed index-tip x onto that set
+instead of 49 chromatic semitones, so every reachable key is consonant with
+every other one. With the default C major pentatonic (21 notes) a column is
+~102 px wide on a 640 px frame, so landmark jitter can no longer cross a
+boundary at all.
+
+--scale and --root select the preset; the stage dims keys the scale does not
+allow and labels the playable ones when the set is small enough.
+
+Also fixes a latent bug: Pipeline kept its own FrameMetrics::default() and
+overwrote the shared snapshot every tick, wiping mode/sink (now also scale/root/
+playable) that main had seeded. The pipeline seeds its copy from the shared
+context.
+
+Tests: 43 passed (adds scale preset/root parsing/transposition tests, off-scale
+walk of the whole band, and the context-preservation test).

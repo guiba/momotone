@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
+use crate::core::scale::playable_notes;
 use crate::core::Sink;
 use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
 use crate::midi::MidiOutputEngine;
@@ -100,6 +101,16 @@ struct Args {
     #[arg(long, default_value_t = false)]
     landmarker_always: bool,
 
+    /// Scale the pitch is quantised to. Quantising means every reachable key is
+    /// consonant with every other one, so sweeping the hand cannot clash. Use
+    /// `chromatic` for the old every-semitone behaviour.
+    #[arg(long, default_value = "major pentatonic")]
+    scale: String,
+
+    /// Root of the scale: C, D, Eb, F# ...
+    #[arg(long, default_value = "C")]
+    root: String,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -119,6 +130,20 @@ fn main() -> Result<()> {
         "Starting Gesture-to-Audio Engine in {:?} mode...",
         args.mode
     );
+
+    let scale = core::scale::preset(&args.scale).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown scale '{}'; available: {}",
+            args.scale,
+            core::scale::PRESETS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let root = core::scale::root_class(&args.root)
+        .ok_or_else(|| anyhow::anyhow!("unknown root note '{}'", args.root))?;
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
@@ -225,6 +250,9 @@ fn main() -> Result<()> {
     let shared = Arc::new(Mutex::new(FrameMetrics {
         mode: format!("{:?}", args.mode),
         sink: sink_label.to_string(),
+        scale: scale.name.to_string(),
+        root: args.root.clone(),
+        playable: playable_notes(root, &scale),
         ..FrameMetrics::default()
     }));
 
@@ -237,7 +265,7 @@ fn main() -> Result<()> {
     let mut pipeline = Pipeline::new(
         camera,
         tracker,
-        Box::new(FingerPositionStrategy::default()),
+        Box::new(FingerPositionStrategy::new(root, &scale)),
         sinks,
         event_bus,
         event_rx,

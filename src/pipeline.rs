@@ -67,6 +67,21 @@ impl Pipeline {
         active: Arc<AtomicBool>,
         feed_wanted: Arc<AtomicBool>,
     ) -> Self {
+        // `main` seeds the snapshot with the run's context (mode, sink, scale).
+        // The pipeline keeps its own copy so publishing a frame does not wipe
+        // those fields back to their defaults.
+        let context = shared
+            .lock()
+            .map(|snapshot| FrameMetrics {
+                mode: snapshot.mode.clone(),
+                sink: snapshot.sink.clone(),
+                scale: snapshot.scale.clone(),
+                root: snapshot.root.clone(),
+                playable: snapshot.playable.clone(),
+                ..FrameMetrics::default()
+            })
+            .unwrap_or_default();
+
         Pipeline {
             camera,
             tracker,
@@ -75,7 +90,7 @@ impl Pipeline {
             event_bus,
             event_rx,
             shared,
-            metrics: FrameMetrics::default(),
+            metrics: context,
             previous_landmarks: Vec::new(),
             gesture_active: false,
             last_detection: Instant::now(),
@@ -577,6 +592,41 @@ mod tests {
         want.store(true, Ordering::Relaxed);
         assert!(should_upload_feed(true, &want));
         assert!(!should_upload_feed(false, &want), "headless never uploads");
+    }
+
+    #[test]
+    fn publishing_preserves_the_run_context() {
+        let (bus, rx) = EventBus::new();
+        let shared = Arc::new(Mutex::new(FrameMetrics {
+            mode: "Signal".to_string(),
+            sink: "audio".to_string(),
+            scale: "major pentatonic".to_string(),
+            root: "C".to_string(),
+            playable: vec![36, 38, 40, 43, 45],
+            ..FrameMetrics::default()
+        }));
+        let mut pipeline = Pipeline::new(
+            None,
+            None,
+            Box::new(AlwaysOn),
+            Vec::new(),
+            bus,
+            rx,
+            shared.clone(),
+            None,
+            false,
+            false,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        pipeline.tick().unwrap();
+
+        let snapshot = shared.lock().unwrap();
+        assert_eq!(snapshot.scale, "major pentatonic");
+        assert_eq!(snapshot.root, "C");
+        assert_eq!(snapshot.playable.len(), 5);
+        assert_eq!(snapshot.mode, "Signal");
+        assert!(snapshot.detected, "the mock hand should register");
     }
 
     #[test]

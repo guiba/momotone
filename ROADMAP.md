@@ -43,6 +43,15 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 
 ## Features
 
+### Instruments & layouts
+- ~~Quantise pitch to a scale~~ **done** — `src/core/scale.rs` holds seven presets (major/minor pentatonic, major, minor, dorian, whole tone, chromatic) plus `playable_notes(root, scale)`; `FingerPositionStrategy` maps the smoothed index-tip x onto that set. `--scale` / `--root` choose it, and the keyboard dims the keys the scale does not allow. Every reachable cell is now consonant with every other one.
+- **Degree × octave matrix** — the keyboard becomes a 2D grid: columns = scale degree, rows = octave. Needs the vertical axis mapping (index-tip y with EMA + hysteresis, or palm-centre y) and a `GridLayout` that turns `(x_norm, y_norm)` into a cell. Trail becomes `Vec<f32>` sized `rows × cols`. **M**
+- **Retrigger on cell change** — one attack per cell transition instead of a continuous re-tune, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **S**
+- **Waveform + ADSR in `Voice`** — sine/triangle/square/saw plus attack/decay, so a grid press reads as an instrument instead of a theremin. Detuned pairs give a pad. **M**
+- **Dashboard pickers** — scale, root, octave span and waveform controls in the rail, backed by a shared `Arc<Mutex<PerformanceConfig>>` the pipeline reads each tick (same shape as the Start/Stop and feed flags). **S**
+- **Vertical band calibration** — learn the y range the user actually occupies from recent landmark bounding boxes, so the top row is not unreachable. **M**
+- **Named instrument presets** — bundle scale + root + octave span + waveform + envelope (e.g. *Kalimba*: C pentatonic, pluck). **S**
+
 ### Gesture layer
 - **Landmark smoothing (EMA / Kalman-lite)** before any strategy runs — also fixes the jitter in item 3 above. **S**
 - **Discrete gesture set**: open hand, fist, pinch, peace, with per-gesture mapping configured rather than hardcoded. **M**
