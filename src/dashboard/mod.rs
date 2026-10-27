@@ -3,8 +3,12 @@
 //! Layout is two columns:
 //!   * left  - the hand skeleton on a dark stage (the webcam feed is off by
 //!             default; the `feed` button puts it back)
-//!   * right - a telemetry rail: note, volume, confidence, performance,
-//!             hand geometry, rolling history, and the event log
+//!   * right - a telemetry rail with a **basic** view (note, volume, confidence,
+//!             status) and an **advanced** view (performance, hand geometry,
+//!             rolling history, event log)
+//!
+//! The header carries a Start/Stop button that pauses the pipeline thread: no
+//! capture, no inference, and the sinks are released so the note goes silent.
 //!
 //! The pipeline thread writes a `FrameMetrics` into an `Arc<Mutex<_>>`; the UI
 //! clones it on a 33 ms tick, so the camera loop never blocks on rendering.
@@ -13,11 +17,12 @@ pub mod gauges;
 pub mod metrics;
 pub mod skeleton;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::image::Handle;
-use iced::widget::{button, canvas, column, container, row, rule, space, text, Column};
+use iced::widget::{button, canvas, column, container, row, rule, space, text, Column, Scrollable};
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
@@ -40,9 +45,18 @@ const CONFIDENCE: Color = Color::from_rgb8(78, 161, 255);
 const NOTE: Color = Color::from_rgb8(255, 209, 102);
 const ALARM: Color = Color::from_rgb8(255, 107, 107);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Basic,
+    Advanced,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Message {
     Tick,
+    ToggleRun,
+    ShowBasic,
+    ShowAdvanced,
     ToggleBox,
     ToggleLabels,
     ToggleFeed,
@@ -51,6 +65,9 @@ enum Message {
 
 pub struct Dashboard {
     shared: Arc<Mutex<FrameMetrics>>,
+    /// Cleared by the Stop button; the pipeline loop checks it every frame.
+    active: Arc<AtomicBool>,
+    tab: Tab,
     metrics: FrameMetrics,
     frame_image: Option<Handle>,
     volume_history: Vec<f32>,
@@ -69,9 +86,15 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
-    fn new(shared: Arc<Mutex<FrameMetrics>>, fade_ms: f32) -> Self {
+    fn new(
+        shared: Arc<Mutex<FrameMetrics>>,
+        active: Arc<AtomicBool>,
+        fade_ms: f32,
+    ) -> Self {
         Dashboard {
             shared,
+            active,
+            tab: Tab::Basic,
             metrics: FrameMetrics::default(),
             frame_image: None,
             volume_history: Vec::new(),
@@ -118,6 +141,11 @@ impl Dashboard {
                     self.note_trail[note_index(note)] = 1.0;
                 }
             }
+            Message::ToggleRun => {
+                self.active.store(!self.active.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            Message::ShowBasic => self.tab = Tab::Basic,
+            Message::ShowAdvanced => self.tab = Tab::Advanced,
             Message::ToggleBox => self.show_box = !self.show_box,
             Message::ToggleLabels => self.show_labels = !self.show_labels,
             Message::ToggleFeed => self.show_feed = !self.show_feed,
@@ -137,6 +165,8 @@ impl Dashboard {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let running = self.active.load(Ordering::Relaxed);
+
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
@@ -148,11 +178,18 @@ impl Dashboard {
                 .size(12)
                 .color(MUTED),
             space::horizontal(),
-            button(text(if self.show_feed { "hide feed" } else { "feed" }))
-                .on_press(Message::ToggleFeed),
-            button(text("box")).on_press(Message::ToggleBox),
-            button(text("labels")).on_press(Message::ToggleLabels),
-            button(text("clear")).on_press(Message::ClearHistory),
+            big_button(
+                if running { "Stop" } else { "Start" },
+                Message::ToggleRun,
+                if running { ALARM } else { VOLUME },
+            ),
+            small_button(
+                if self.show_feed { "hide feed" } else { "feed" },
+                Message::ToggleFeed,
+            ),
+            small_button("box", Message::ToggleBox),
+            small_button("labels", Message::ToggleLabels),
+            small_button("clear", Message::ClearHistory),
         ]
         .spacing(10)
         .align_y(alignment::Vertical::Center);
@@ -193,38 +230,45 @@ impl Dashboard {
             snap: false,
         });
 
-        let rail = column![
-            note_card(&self.metrics),
-            meter_card("Volume", self.metrics.volume, VOLUME),
-            meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
-            perf_card(&self.metrics),
-            geometry_card(&self.metrics),
+        let tabs = row![
+            tab_button("basic", self.tab == Tab::Basic, Message::ShowBasic),
+            tab_button("advanced", self.tab == Tab::Advanced, Message::ShowAdvanced),
         ]
-        .spacing(10)
-        .width(300);
+        .spacing(8);
+
+        let cards: Column<'_, Message> = match self.tab {
+            Tab::Basic => column![
+                note_card(&self.metrics),
+                meter_card("Volume", self.metrics.volume, VOLUME),
+                meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
+                status_card(&self.metrics),
+            ]
+            .spacing(10),
+            Tab::Advanced => column![
+                perf_card(&self.metrics),
+                geometry_card(&self.metrics),
+                sparkline_card("VOLUME", &self.volume_history, (0.0, 1.0), VOLUME),
+                sparkline_card("CONFIDENCE", &self.confidence_history, (0.0, 1.0), CONFIDENCE),
+                log_card(&self.metrics),
+            ]
+            .spacing(10),
+        };
+
+        // The rail scrolls, so the advanced tab can hold more cards than the
+        // window height allows.
+        let rail = column![tabs, cards].spacing(10).width(320);
 
         // `height(Length::Fill)` is what makes the stage take the whole middle
         // band: a `row!` defaults to `Length::Shrink`, which would collapse the
         // stage to the intrinsic height of the rail cards.
-        let body = row![stage, rail].spacing(12).height(Length::Fill);
+        let body = row![stage, Scrollable::new(rail).height(Length::Fill)]
+            .spacing(12)
+            .height(Length::Fill);
 
-        // Bottom strip: time-series and log, away from the live numbers.
-        let strip = row![
-            sparkline_card("VOLUME", &self.volume_history, (0.0, 1.0), VOLUME),
-            sparkline_card(
-                "CONFIDENCE",
-                &self.confidence_history,
-                (0.0, 1.0),
-                CONFIDENCE
-            ),
-            log_card(&self.metrics),
-        ]
-        .spacing(10);
-
-        column![header, rule::horizontal(1), body, strip]
-        .padding(14)
-        .spacing(10)
-        .into()
+        column![header, rule::horizontal(1), body]
+            .padding(14)
+            .spacing(10)
+            .into()
     }
 }
 
@@ -232,9 +276,73 @@ fn app_title(_state: &Dashboard) -> String {
     "Hand Gesture HUD".to_string()
 }
 
-pub fn run(shared: Arc<Mutex<FrameMetrics>>, fade_ms: f32) -> iced::Result {
+/// The Start/Stop control: deliberately chunky, it is the primary action.
+fn big_button<'a>(label: &'a str, message: Message, color: Color) -> Element<'a, Message> {
+    button(text(label).size(15))
+        .on_press(message)
+        .padding(12)
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(color)),
+            text_color: Color::from_rgb8(255, 255, 255),
+            border: Border {
+                color: color,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        })
+        .into()
+}
+
+/// Secondary toggles: readable but not competing with Start/Stop.
+fn small_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .on_press(message)
+        .padding(8)
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(CARD)),
+            text_color: TEXT,
+            border: Border {
+                color: CARD_BORDER,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        })
+        .into()
+}
+
+fn tab_button<'a>(label: &'a str, selected: bool, message: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .on_press(message)
+        .padding(8)
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(if selected {
+                CARD_BORDER
+            } else {
+                CARD
+            })),
+            text_color: if selected { TEXT } else { MUTED },
+            border: Border {
+                color: CARD_BORDER,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        })
+        .into()
+}
+
+pub fn run(
+    shared: Arc<Mutex<FrameMetrics>>,
+    active: Arc<AtomicBool>,
+    fade_ms: f32,
+) -> iced::Result {
     iced::application(
-        move || Dashboard::new(shared.clone(), fade_ms),
+        move || Dashboard::new(shared.clone(), active.clone(), fade_ms),
         Dashboard::update,
         Dashboard::view,
     )
@@ -281,26 +389,30 @@ fn kv<'a>(key: &'a str, value: String) -> Element<'a, Message> {
 }
 
 fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {
-    let head: Element<'_, Message> = match metrics.note {
-        Some(note) => row![
-            text(note_name(note)).size(30).color(NOTE),
-            space::horizontal(),
-            text(format!("MIDI {note}")).size(12).color(MUTED),
-        ]
-        .spacing(10)
-        .align_y(alignment::Vertical::Center)
-        .into(),
-        None => match metrics.frequency {
-            Some(freq) => row![
-                text(format!("{freq:.0} Hz")).size(24).color(NOTE),
+    let head: Element<'_, Message> = if metrics.paused {
+        text("stopped").size(22).color(MUTED).into()
+    } else {
+        match metrics.note {
+            Some(note) => row![
+                text(note_name(note)).size(30).color(NOTE),
                 space::horizontal(),
-                text("signal").size(12).color(MUTED),
+                text(format!("MIDI {note}")).size(12).color(MUTED),
             ]
             .spacing(10)
             .align_y(alignment::Vertical::Center)
             .into(),
-            None => text("no gesture").size(18).color(ALARM).into(),
-        },
+            None => match metrics.frequency {
+                Some(freq) => row![
+                    text(format!("{freq:.0} Hz")).size(24).color(NOTE),
+                    space::horizontal(),
+                    text("signal").size(12).color(MUTED),
+                ]
+                .spacing(10)
+                .align_y(alignment::Vertical::Center)
+                .into(),
+                None => text("no gesture").size(18).color(ALARM).into(),
+            },
+        }
     };
 
     card(
@@ -340,6 +452,29 @@ fn perf_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     )
 }
 
+fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
+    let status = if metrics.paused {
+        "paused".to_string()
+    } else if metrics.detected {
+        "tracking".to_string()
+    } else {
+        format!("lost {} ms", metrics.lost_ms)
+    };
+
+    card(
+        "STATUS",
+        column![
+            kv("state", status),
+            kv(
+                "pitch anchor",
+                format!("tip x {:.0} / {:.0} px", metrics.pitch_x, metrics.frame_size.0),
+            ),
+            kv("landmarks", format!("{}", metrics.landmark_count)),
+        ]
+        .spacing(4),
+    )
+}
+
 fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     let fingers: Vec<Element<'a, Message>> = metrics
         .extension
@@ -361,21 +496,9 @@ fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         })
         .collect();
 
-    let status = if metrics.detected {
-        "tracking".to_string()
-    } else {
-        format!("lost {} ms", metrics.lost_ms)
-    };
-
     card(
         "HAND GEOMETRY",
         column![
-            kv("status", status),
-            kv(
-                "pitch anchor",
-                format!("tip x {:.0} / {:.0} px", metrics.pitch_x, metrics.frame_size.0),
-            ),
-            kv("landmarks", format!("{}", metrics.landmark_count)),
             kv("spread", format!("{:.2}", metrics.spread)),
             kv("tilt", format!("{:.0}°", metrics.tilt_deg)),
             kv("jitter", format!("{:.1} px", metrics.jitter_px)),
