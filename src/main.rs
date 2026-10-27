@@ -201,6 +201,9 @@ fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     // Start/Stop button: cleared by the UI, checked by the pipeline every frame.
     let active = Arc::new(AtomicBool::new(true));
+    // The stage hides the camera by default, so the pipeline skips the per-frame
+    // RGBA conversion until the feed button is pressed.
+    let feed = Arc::new(AtomicBool::new(false));
     let mut pipeline = Pipeline::new(
         camera,
         tracker,
@@ -213,6 +216,7 @@ fn main() -> Result<()> {
         args.debug,
         !args.no_ui,
         active.clone(),
+        feed.clone(),
     );
 
     // 4. Either run the loop in the foreground, or hand it to a thread and
@@ -230,7 +234,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(shared, active, args.fade_ms);
+    let ui_result = dashboard::run(shared, active, feed, args.fade_ms);
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
