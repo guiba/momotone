@@ -10,13 +10,25 @@ pub struct WebcamSource {
     /// image; flipping it makes the stage behave like a mirror, which is also
     /// how the keyboard reads (low notes left, high notes right).
     mirror: bool,
+    /// Capture rate asked for at open time (`--camera-fps`).
+    requested_fps: u32,
 }
 
 impl WebcamSource {
-    /// Opens the camera and asks for a capture resolution. Most webcams honour
-    /// this; if they do not, the native resolution is used and everything still
-    /// works (the dashboard scales to whatever arrives).
-    pub fn new(camera_id: i32, width: u32, height: u32, mirror: bool) -> Result<Self> {
+    /// Opens the camera and asks for a capture resolution and frame rate. Most
+    /// webcams honour these; if they do not, the native settings are used and
+    /// everything still works (the dashboard scales to whatever arrives).
+    ///
+    /// Pinning the rate matters for CPU: a camera defaulting to 60 fps would run
+    /// the ONNX stages twice as often for no gain, since the whole loop is paced
+    /// by whatever the device delivers.
+    pub fn new(
+        camera_id: i32,
+        width: u32,
+        height: u32,
+        fps: u32,
+        mirror: bool,
+    ) -> Result<Self> {
         let mut cap = videoio::VideoCapture::new(camera_id, videoio::CAP_ANY)?;
         if !cap.is_opened()? {
             return Err(anyhow!("Could not open webcam index {}", camera_id));
@@ -24,7 +36,21 @@ impl WebcamSource {
         // Best effort: not every backend honours these.
         let _ = cap.set(videoio::CAP_PROP_FRAME_WIDTH, width as f64);
         let _ = cap.set(videoio::CAP_PROP_FRAME_HEIGHT, height as f64);
-        Ok(Self { cap, mirror })
+        let _ = cap.set(videoio::CAP_PROP_FPS, fps as f64);
+        Ok(Self {
+            cap,
+            mirror,
+            requested_fps: fps,
+        })
+    }
+
+    /// The rate the driver actually reports (0 when it will not say).
+    pub fn reported_fps(&self) -> f64 {
+        self.cap.get(videoio::CAP_PROP_FPS).unwrap_or(0.0)
+    }
+
+    pub fn requested_fps(&self) -> u32 {
+        self.requested_fps
     }
 
     /// One captured frame, in the coordinate space the rest of the pipeline

@@ -39,7 +39,7 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 - **Cache the keyboard backdrop** — `keyboard()` re-fills all 49 base cells plus separators every UI tick; the static part (cells, separators, octave labels) could be drawn once or only when the panel size changes. **S**
 - **GPU / alternative ONNX Runtime execution provider** for `ort`. **L**
 - **Single-shot hand model** instead of detector + landmarker, or a retrained lighter BlazeHand variant. **L**
-- **Pin capture FPS** — resolution is requested (`--camera-width`/`--camera-height`) but FPS is not; `CAP_PROP_FPS` is still unset. **S**
+- ~~Pin capture FPS~~ **done** — `WebcamSource::new` sets `CAP_PROP_FPS` (`--camera-fps`, default 30) and `--debug` prints what was requested versus what the driver reports, so a camera defaulting to 60 fps no longer doubles the inference load unnoticed.
 
 ## Features
 
