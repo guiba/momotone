@@ -20,7 +20,7 @@ Sampling is **not** the bottleneck: ~227 µs per frame out of a ~33 ms budget. I
 
 1. **Gate the RGBA upload on the feed toggle** — `frame_to_rgba` runs every frame whenever the UI is open, and the dashboard `clear()`s the pixels when `show_feed` is false. **S**
 2. ~~Kill the per-frame clones~~ **done, but it was not the bottleneck** — the tracker now moves the landmark Vec into the result instead of cloning it, and `Pipeline::tick` refills `metrics.landmarks` / `previous_landmarks` with `clone_from` so their buffers are reused. Measured: copying the whole `FrameMetrics` snapshot costs **0.44 µs/frame** (0.0015 % of a 33 ms frame), so a hand-written `copy_from` was not worth the maintenance risk of a field-by-field copy drifting out of sync with the struct.
-3. **Pitch hysteresis / smoothing** — the hand jitters a pixel or two, which walks across semitones. EMA the index-tip x, or quantise with a ±1-note hysteresis band. **S**
+3. ~~Pitch hysteresis / smoothing~~ **done** — the index-tip x runs through an EMA (`PITCH_EMA_ALPHA = 0.35`) before quantisation, and the smoother resets when the hand is lost. Test `the_smoothing_kills_jitter_but_follows_a_sweep` compares note flapping with and without it.
 4. **Release profile + per-stage latency printout** — no `lto`/`target-cpu` in `Cargo.toml`, and `--debug` prints fps but not `detector_us`/`landmarker_us`. Add both so perf work is measurable. **S**
 5. **Clear the 13 dead-code warnings** — `sources/mock.rs` (`MockSource`, `MockSourceImpl`, `SourceTrait`), `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, core `Source`/`Tracker` traits, `GestureEvent::new_signal`, `MidiOutputEngine::control_change`, `StreamWrapper`'s unread field. **S**
 
