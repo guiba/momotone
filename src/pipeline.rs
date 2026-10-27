@@ -47,6 +47,9 @@ pub struct Pipeline {
     /// Set by the dashboard's Start/Stop button. While it is false the loop
     /// captures nothing and runs no inference.
     active: Arc<AtomicBool>,
+    /// Set by the dashboard's `feed` toggle. The camera frame is only converted
+    /// to RGBA (1.2 MB per frame at 640x480) when the stage actually shows it.
+    feed_wanted: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -62,6 +65,7 @@ impl Pipeline {
         debug: bool,
         emit_frames: bool,
         active: Arc<AtomicBool>,
+        feed_wanted: Arc<AtomicBool>,
     ) -> Self {
         Pipeline {
             camera,
@@ -80,6 +84,7 @@ impl Pipeline {
             debug,
             emit_frames,
             active,
+            feed_wanted,
         }
     }
 
@@ -169,8 +174,11 @@ impl Pipeline {
                     }
                 };
                 self.metrics.frame_size = (frame.cols() as usize, frame.rows() as usize);
-                if self.emit_frames {
+                if should_upload_feed(self.emit_frames, &self.feed_wanted) {
                     self.metrics.frame_pixels = frame_to_rgba(&frame);
+                } else {
+                    // Keep the shared snapshot free of pixels the UI will discard.
+                    self.metrics.frame_pixels.clear();
                 }
                 tracker.process_frame(&frame)?
             }
@@ -311,6 +319,12 @@ impl Pipeline {
             detail,
         });
     }
+}
+
+/// The stage only needs camera pixels while the feed toggle is on; headless runs
+/// never need them.
+fn should_upload_feed(emit_frames: bool, want: &AtomicBool) -> bool {
+    emit_frames && want.load(Ordering::Relaxed)
 }
 
 /// BGR OpenCV frame -> RGBA bytes for the iced `image` handle.
@@ -521,8 +535,41 @@ mod tests {
             false,
             false,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
         );
         (pipeline, events)
+    }
+
+    #[test]
+    #[ignore]
+    /// Quantifies what the feed gate saves. Run with
+    /// `cargo test --release -- --include-ignored bench_feed_upload`.
+    fn bench_feed_upload() {
+        let frame = opencv::core::Mat::new_rows_cols_with_default(
+            480,
+            640,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::new(128.0, 128.0, 128.0, 0.0),
+        )
+        .unwrap();
+        let start = Instant::now();
+        for _ in 0..200 {
+            let pixels = frame_to_rgba(&frame);
+            assert_eq!(pixels.len(), 640 * 480 * 4);
+        }
+        println!(
+            "frame_to_rgba 640x480: {:.3} ms/frame",
+            start.elapsed().as_secs_f64() * 1000.0 / 200.0
+        );
+    }
+
+    #[test]
+    fn the_feed_is_only_converted_when_the_stage_shows_it() {
+        let want = AtomicBool::new(false);
+        assert!(!should_upload_feed(true, &want), "feed off means no upload");
+        want.store(true, Ordering::Relaxed);
+        assert!(should_upload_feed(true, &want));
+        assert!(!should_upload_feed(false, &want), "headless never uploads");
     }
 
     #[test]

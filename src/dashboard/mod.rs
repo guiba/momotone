@@ -67,6 +67,9 @@ pub struct Dashboard {
     shared: Arc<Mutex<FrameMetrics>>,
     /// Cleared by the Stop button; the pipeline loop checks it every frame.
     active: Arc<AtomicBool>,
+    /// Mirrors `show_feed` so the pipeline knows whether to build the RGBA
+    /// upload at all.
+    feed: Arc<AtomicBool>,
     tab: Tab,
     metrics: FrameMetrics,
     frame_image: Option<Handle>,
@@ -89,11 +92,13 @@ impl Dashboard {
     fn new(
         shared: Arc<Mutex<FrameMetrics>>,
         active: Arc<AtomicBool>,
+        feed: Arc<AtomicBool>,
         fade_ms: f32,
     ) -> Self {
         Dashboard {
             shared,
             active,
+            feed,
             tab: Tab::Basic,
             metrics: FrameMetrics::default(),
             frame_image: None,
@@ -148,7 +153,10 @@ impl Dashboard {
             Message::ShowAdvanced => self.tab = Tab::Advanced,
             Message::ToggleBox => self.show_box = !self.show_box,
             Message::ToggleLabels => self.show_labels = !self.show_labels,
-            Message::ToggleFeed => self.show_feed = !self.show_feed,
+            Message::ToggleFeed => {
+                self.show_feed = !self.show_feed;
+                self.feed.store(self.show_feed, Ordering::Relaxed);
+            }
             Message::ClearHistory => {
                 self.volume_history.clear();
                 self.confidence_history.clear();
@@ -336,13 +344,16 @@ fn tab_button<'a>(label: &'a str, selected: bool, message: Message) -> Element<'
         .into()
 }
 
+/// `feed` mirrors the stage's feed button so the pipeline can skip the per-frame
+/// RGBA conversion when the camera is not shown.
 pub fn run(
     shared: Arc<Mutex<FrameMetrics>>,
     active: Arc<AtomicBool>,
+    feed: Arc<AtomicBool>,
     fade_ms: f32,
 ) -> iced::Result {
     iced::application(
-        move || Dashboard::new(shared.clone(), active.clone(), fade_ms),
+        move || Dashboard::new(shared.clone(), active.clone(), feed.clone(), fade_ms),
         Dashboard::update,
         Dashboard::view,
     )
