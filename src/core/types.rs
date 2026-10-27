@@ -26,8 +26,6 @@ pub struct GestureEvent {
 }
 
 impl GestureEvent {
-    /// Helper to create a note event
-
     /// Helper to create a discrete note event
     pub fn new_note(note: u8, velocity: f32, text: &str) -> Self {
         Self {

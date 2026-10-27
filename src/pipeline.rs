@@ -294,7 +294,7 @@ impl Pipeline {
             *shared = self.metrics.clone();
         }
 
-        if self.debug && self.metrics.frames % 10 == 0 {
+        if self.debug && self.metrics.frames.is_multiple_of(10) {
             println!(
                 "[Pipeline] fps {:.1} frame {:.2} ms (detector {:.0} us, landmarker {:.0} us) conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
                 self.metrics.fps,

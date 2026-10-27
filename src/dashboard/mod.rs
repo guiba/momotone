@@ -2,10 +2,10 @@
 //!
 //! Layout is two columns:
 //!   * left  - the hand skeleton on a dark stage (the webcam feed is off by
-//!             default; the `feed` button puts it back)
+//!     default; the `feed` button puts it back)
 //!   * right - a telemetry rail with a **basic** view (note, volume, confidence,
-//!             status) and an **advanced** view (performance, hand geometry,
-//!             rolling history, event log)
+//!     status) and an **advanced** view (performance, hand geometry, rolling
+//!     history, event log)
 //!
 //! The header carries a Start/Stop button that pauses the pipeline thread: no
 //! capture, no inference, and the sinks are released so the note goes silent.
@@ -297,7 +297,7 @@ fn big_button<'a>(label: &'a str, message: Message, color: Color) -> Element<'a,
             background: Some(Background::Color(color)),
             text_color: Color::from_rgb8(255, 255, 255),
             border: Border {
-                color: color,
+                color,
                 width: 1.0,
                 radius: 10.0.into(),
             },

@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
-use crate::core::scale::playable_notes;
 use crate::core::Sink;
 use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
 use crate::midi::MidiOutputEngine;
@@ -247,12 +246,15 @@ fn main() -> Result<()> {
         }
     }
 
+    let strategy = FingerPositionStrategy::new(root, &scale);
+    let playable = strategy.scale_notes().to_vec();
+
     let shared = Arc::new(Mutex::new(FrameMetrics {
         mode: format!("{:?}", args.mode),
         sink: sink_label.to_string(),
         scale: scale.name.to_string(),
         root: args.root.clone(),
-        playable: playable_notes(root, &scale),
+        playable,
         ..FrameMetrics::default()
     }));
 
@@ -265,7 +267,7 @@ fn main() -> Result<()> {
     let mut pipeline = Pipeline::new(
         camera,
         tracker,
-        Box::new(FingerPositionStrategy::new(root, &scale)),
+        Box::new(strategy),
         sinks,
         event_bus,
         event_rx,

@@ -209,7 +209,7 @@ fn keyboard(
         let x = band_x + key * i as f32;
         let major = i == 0
             || i == NOTE_COUNT
-            || (NOTE_LOW + i.min(NOTE_COUNT - 1) as u8) % 12 == 0;
+            || (NOTE_LOW + i.min(NOTE_COUNT - 1) as u8).is_multiple_of(12);
         frame.stroke(
             &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
             Stroke::default()
@@ -225,7 +225,7 @@ fn keyboard(
         }
         let x = band_x + key * i as f32;
         let color = PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12];
-        let is_current = current.map_or(false, |note| note_index(note) == i);
+        let is_current = current.is_some_and(|note| note_index(note) == i);
 
         frame.fill(
             &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
@@ -276,7 +276,7 @@ fn keyboard(
     for i in 0..NOTE_COUNT {
         let note = NOTE_LOW + i as u8;
         if !label_every_key {
-            if note % 12 != 0 {
+            if !note.is_multiple_of(12) {
                 continue;
             }
         } else if !playable.contains(&note) {
