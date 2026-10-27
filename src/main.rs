@@ -3,7 +3,6 @@ mod core;
 mod dashboard;
 mod midi;
 mod pipeline;
-mod sources;
 mod strategies;
 mod vision;
 mod visualizer;

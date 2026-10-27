@@ -2,56 +2,6 @@ use crate::core::types::GestureEvent;
 use crate::core::{HandDetectionResult, Strategy, NOTE_HIGH, NOTE_LOW, NOTE_MARGIN};
 use std::sync::Mutex;
 
-pub struct SimplePinchStrategy {
-    pub threshold: f32,
-}
-
-impl Default for SimplePinchStrategy {
-    fn default() -> Self {
-        Self { threshold: 0.05 }
-    }
-}
-
-impl Strategy for SimplePinchStrategy {
-    fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
-        let landmarks = detection.hand_landmarks.as_ref()?;
-        if landmarks.len() < 8 {
-            return None;
-        }
-
-        let thumb = &landmarks[4];
-        let index = &landmarks[8];
-
-        let dx = thumb.x - index.x;
-        let dy = thumb.y - index.y;
-        let distance = (dx * dx + dy * dy).sqrt();
-
-        if distance < self.threshold {
-            return Some(GestureEvent::new_note(60, 1.0, "Pinch Detected"));
-        }
-
-        None
-    }
-}
-
-pub struct FrequencyStrategy;
-
-impl Strategy for FrequencyStrategy {
-    fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
-        let landmarks = detection.hand_landmarks.as_ref()?;
-        if landmarks.is_empty() {
-            return None;
-        }
-
-        // Map the Y position of the first landmark to frequency (approx 200Hz - 1000Hz)
-        // Note: In OpenCV, y=0 is top, y=1 is bottom.
-        let y = landmarks[0].y;
-        let freq = 200.0 + (1.0 - y as f32) * 800.0;
-
-        Some(GestureEvent::new_signal(freq, 0.5, "Y-Position Signal"))
-    }
-}
-
 /// Thumb-index spread (as a fraction of the hand box height) that drives the
 /// volume to its maximum. Anything at or beyond this is full volume.
 const MAX_SPREAD: f32 = 0.6;

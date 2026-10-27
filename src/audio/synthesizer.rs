@@ -39,7 +39,8 @@ struct SynthesizerState {
 /// Wrapper to allow cpal::Stream (which is !Sync) to be used inside a Sync struct.
 /// This is safe because we only access it through &mut self in Sink methods,
 /// ensuring exclusive access if the caller respects Rust's borrowing rules.
-struct StreamWrapper(cpal::Stream);
+/// The stream is never read - holding it is the point, dropping it stops the audio.
+struct StreamWrapper(#[allow(dead_code)] cpal::Stream);
 
 unsafe impl Send for StreamWrapper {}
 unsafe impl Sync for StreamWrapper {}

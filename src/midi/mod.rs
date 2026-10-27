@@ -113,11 +113,6 @@ impl MidiOutputEngine {
         }
         Ok(())
     }
-
-    pub fn control_change(&mut self, cc: u8, value: f32) -> Result<()> {
-        let vel = (value.clamp(0.0, 1.0) * 127.0) as u8;
-        self.send(&[0xB0, cc, vel])
-    }
 }
 
 // We'll need to implement Sink for it fully properly if we want polymorphic use in Orchestrator
