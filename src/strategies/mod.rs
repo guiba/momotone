@@ -1,5 +1,6 @@
 use crate::core::types::GestureEvent;
 use crate::core::{HandDetectionResult, Strategy, NOTE_HIGH, NOTE_LOW, NOTE_MARGIN};
+use std::sync::Mutex;
 
 pub struct SimplePinchStrategy {
     pub threshold: f32,
@@ -55,12 +56,54 @@ impl Strategy for FrequencyStrategy {
 /// volume to its maximum. Anything at or beyond this is full volume.
 const MAX_SPREAD: f32 = 0.6;
 
-pub struct FingerPositionStrategy;
+/// Weight of the current frame in the exponential moving average of the index
+/// tip position. 0.35 is a ~3 frame time constant: fast enough to follow a
+/// deliberate sweep, slow enough to swallow per-frame landmark jitter.
+const PITCH_EMA_ALPHA: f32 = 0.35;
+
+/// Pitch comes from the *horizontal* position of the index fingertip, smoothed
+/// with an EMA so a shaky hand does not hop between semitones. The state lives
+/// in the strategy, so a hand that leaves the view resets it.
+pub struct FingerPositionStrategy {
+    smoothed_index_x: Mutex<Option<f32>>,
+}
+
+impl Default for FingerPositionStrategy {
+    fn default() -> Self {
+        Self {
+            smoothed_index_x: Mutex::new(None),
+        }
+    }
+}
+
+impl FingerPositionStrategy {
+    /// Feed one sample of the index tip x into the smoother and return the
+    /// averaged position. A gap in tracking restarts the average, so the next
+    /// sighting is not dragged back towards where the hand was before it left.
+    fn smooth_index_x(&self, x: f32) -> f32 {
+        let mut state = self.smoothed_index_x.lock().unwrap();
+        match state.as_mut() {
+            Some(previous) => {
+                *previous += PITCH_EMA_ALPHA * (x - *previous);
+                *previous
+            }
+            None => {
+                *state = Some(x);
+                x
+            }
+        }
+    }
+
+    fn reset(&self) {
+        *self.smoothed_index_x.lock().unwrap() = None;
+    }
+}
 
 impl Strategy for FingerPositionStrategy {
     fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
         let landmarks = detection.hand_landmarks.as_ref()?;
         if landmarks.len() < 9 {
+            self.reset();
             return None;
         }
 
@@ -75,7 +118,7 @@ impl Strategy for FingerPositionStrategy {
         let width = detection.frame_size.0.max(1) as f32;
         let margin = NOTE_MARGIN * width;
         let usable = (width - 2.0 * margin).max(1.0);
-        let x_pos = (index.x - margin) / usable;
+        let x_pos = (self.smooth_index_x(index.x) - margin) / usable;
         let note_f = NOTE_LOW as f32 + x_pos.clamp(0.0, 1.0) * (NOTE_HIGH - NOTE_LOW) as f32;
         let note = note_f.clamp(NOTE_LOW as f32, NOTE_HIGH as f32) as u8;
 
@@ -119,7 +162,7 @@ mod tests {
     }
 
     fn velocity(thumb_x: f32) -> f32 {
-        let event = FingerPositionStrategy
+        let event = FingerPositionStrategy::default()
             .process(&detection_with_spread(thumb_x))
             .unwrap();
         match event.payload {
@@ -156,7 +199,7 @@ mod tests {
             score: 0.1,
             timings: Default::default(),
         };
-        assert!(FingerPositionStrategy.process(&empty).is_none());
+        assert!(FingerPositionStrategy::default().process(&empty).is_none());
     }
 
     /// The note produced when the index tip (landmark 8) sits at `index_x` in a
@@ -171,10 +214,35 @@ mod tests {
                 z: 0.0,
             })
             .collect();
-        let event = FingerPositionStrategy
+        let event = FingerPositionStrategy::default()
             .process(&HandDetectionResult {
                 hand_landmarks: Some(landmarks),
                 r#box: Some(hand_box),
+                frame_size: (640, 480),
+                score: 0.9,
+                timings: Default::default(),
+            })
+            .unwrap();
+        match event.payload {
+            GesturePayload::Note { note, .. } => note,
+            _ => panic!("expected a note payload"),
+        }
+    }
+
+    /// Same as `note_at`, but reusing one strategy instance so the EMA accumulates
+    /// across calls.
+    fn note_at_with(strategy: &FingerPositionStrategy, index_x: f32) -> u8 {
+        let landmarks = (0..21)
+            .map(|i| Landmark {
+                x: if i == 8 { index_x } else { 300.0 },
+                y: 300.0,
+                z: 0.0,
+            })
+            .collect();
+        let event = strategy
+            .process(&HandDetectionResult {
+                hand_landmarks: Some(landmarks),
+                r#box: Some((200.0, 200.0, 200.0, 200.0)),
                 frame_size: (640, 480),
                 score: 0.9,
                 timings: Default::default(),
@@ -198,6 +266,54 @@ mod tests {
         assert_eq!(note_at(640.0, palm), 84);
         // Sweeping right is strictly rising.
         assert!(note_at(100.0, palm) < note_at(250.0, palm) && note_at(250.0, palm) < note_at(500.0, palm));
+    }
+
+    #[test]
+    fn the_smoothing_kills_jitter_but_follows_a_sweep() {
+        // A hand that is genuinely still jitters a few pixels around 314 px.
+        // Quantising each frame on its own crosses the 58/59/60 boundary; the
+        // average of the same samples sits firmly inside one key. (A key is
+        // 640 * 0.8 / 48 ~= 10.7 px wide.)
+        let jitter = [308.0, 320.0, 308.0, 320.0, 308.0, 320.0, 308.0, 320.0];
+        let palm = (200.0, 200.0, 200.0, 200.0);
+        let raw: Vec<u8> = jitter.iter().map(|&x| note_at(x, palm)).collect();
+
+        let strategy = FingerPositionStrategy::default();
+        let smoothed: Vec<u8> = jitter
+            .iter()
+            .map(|&x| note_at_with(&strategy, x))
+            .collect();
+
+        let flaps = |notes: &[u8]| {
+            notes
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .count()
+        };
+        assert!(
+            flaps(&smoothed) < flaps(&raw),
+            "raw {raw:?} flips {} times, smoothed {smoothed:?} flips {}",
+            flaps(&raw),
+            flaps(&smoothed)
+        );
+        assert!(flaps(&smoothed) <= 1, "smoothed trail {smoothed:?}");
+
+        // A deliberate sweep still reaches the far end of the keyboard.
+        let mut x = 320.0;
+        while x <= 600.0 {
+            note_at_with(&strategy, x);
+            x += 20.0;
+        }
+        assert_eq!(note_at_with(&strategy, 640.0), NOTE_HIGH);
+    }
+
+    #[test]
+    fn losing_the_hand_resets_the_smoother() {
+        let strategy = FingerPositionStrategy::default();
+        note_at_with(&strategy, 100.0);
+        strategy.reset();
+        // Without the reset the old position would still be pulling the average.
+        assert_eq!(note_at_with(&strategy, 640.0), NOTE_HIGH);
     }
 
     #[test]

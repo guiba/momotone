@@ -207,7 +207,7 @@ fn main() -> Result<()> {
     let mut pipeline = Pipeline::new(
         camera,
         tracker,
-        Box::new(FingerPositionStrategy),
+        Box::new(FingerPositionStrategy::default()),
         sinks,
         event_bus,
         event_rx,
