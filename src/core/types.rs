@@ -26,18 +26,7 @@ pub struct GestureEvent {
 }
 
 impl GestureEvent {
-    /// Helper to create a continuous signal event
-    pub fn new_signal(frequency: f32, amplitude: f32, text: &str) -> Self {
-        Self {
-            event_type: EventType::Continuous,
-            payload: GesturePayload::Signal {
-                frequency,
-                amplitude,
-            },
-            text: text.to_string(),
-            color: (0, 255, 0), // Green for signal
-        }
-    }
+    /// Helper to create a note event
 
     /// Helper to create a discrete note event
     pub fn new_note(note: u8, velocity: f32, text: &str) -> Self {

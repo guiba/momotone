@@ -52,17 +52,6 @@ pub trait Sink: Send + Sync {
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()>;
 }
 
-/// Interface for the source of movement (Webcam/Mock).
-pub trait Source: Send + Sync {
-    fn update(&mut self) -> Result<Option<Vec<Landmark>>>;
-}
-
-/// Interface for hand tracking.
-pub trait Tracker: Send + Sync {
-    fn update(&mut self, timestamp_ms: u64) -> Result<HandDetectionResult>;
-    fn stop(&mut self);
-}
-
 /// Interface for mapping hand landmarks to gesture events.
 pub trait Strategy: Send + Sync {
     fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent>;
