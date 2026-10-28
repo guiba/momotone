@@ -110,6 +110,11 @@ struct Args {
     #[arg(long, default_value = "C")]
     root: String,
 
+    /// Number of octaves the keyboard spans. With a five-degree scale this is the
+    /// number of rows in the grid.
+    #[arg(long, default_value_t = 3)]
+    octaves: usize,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -246,15 +251,15 @@ fn main() -> Result<()> {
         }
     }
 
-    let strategy = FingerPositionStrategy::new(root, &scale);
-    let playable = strategy.scale_notes().to_vec();
+    let strategy = FingerPositionStrategy::new(root, &scale, args.octaves);
+    let layout = strategy.layout().clone();
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
         mode: format!("{:?}", args.mode),
         sink: sink_label.to_string(),
         scale: scale.name.to_string(),
         root: args.root.clone(),
-        playable,
+        layout,
         ..FrameMetrics::default()
     }));
 

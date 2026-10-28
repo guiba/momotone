@@ -44,8 +44,8 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 ## Features
 
 ### Instruments & layouts
-- ~~Quantise pitch to a scale~~ **done** — `src/core/scale.rs` holds seven presets (major/minor pentatonic, major, minor, dorian, whole tone, chromatic) plus `playable_notes(root, scale)`; `FingerPositionStrategy` maps the smoothed index-tip x onto that set. `--scale` / `--root` choose it, and the keyboard dims the keys the scale does not allow. Every reachable cell is now consonant with every other one.
-- **Degree × octave matrix** — the keyboard becomes a 2D grid: columns = scale degree, rows = octave. Needs the vertical axis mapping (index-tip y with EMA + hysteresis, or palm-centre y) and a `GridLayout` that turns `(x_norm, y_norm)` into a cell. Trail becomes `Vec<f32>` sized `rows × cols`. **M**
+- ~~Quantise pitch to a scale~~ **done** — `src/core/scale.rs` holds seven presets (major/minor pentatonic, major, minor, dorian, whole tone, chromatic) plus root-name parsing; `--scale` / `--root` choose it. Every reachable cell is consonant with every other one.
+- ~~Degree × octave matrix~~ **done** — `src/core/grid.rs` builds a `GridLayout` (columns = scale degree, rows = octave, top row highest) centred inside C2–C6 and shrunk if the requested span cannot fit. `FingerPositionStrategy` EMA-smooths the index tip in **both** axes and maps it to a cell; the canvas draws the same cells with the same `NOTE_MARGIN` inset, labels octave rows, and names each cell when it is big enough. `--octaves` sets the row count (default 3).
 - **Retrigger on cell change** — one attack per cell transition instead of a continuous re-tune, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **S**
 - **Waveform + ADSR in `Voice`** — sine/triangle/square/saw plus attack/decay, so a grid press reads as an instrument instead of a theremin. Detuned pairs give a pad. **M**
 - **Dashboard pickers** — scale, root, octave span and waveform controls in the rail, backed by a shared `Arc<Mutex<PerformanceConfig>>` the pipeline reads each tick (same shape as the Start/Stop and feed flags). **S**

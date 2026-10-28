@@ -1,10 +1,9 @@
-//! The stage: a note keyboard with the hand skeleton drawn on top of it.
+//! The stage: a degree x octave note grid with the hand skeleton drawn over it.
 //!
-//! The grid *is* the instrument: one column per semitone of the range
-//! `FingerPositionStrategy` can reach (36 · C2 .. 84 · C6, left to right),
-//! coloured by pitch class. Every note keeps a brightness that decays
-//! exponentially, so the key you just released fades out while the one you are
-//! holding glows.
+//! The grid *is* the instrument: columns are the scale's degrees, rows are
+//! octaves, and every cell is coloured by its pitch class. Each note keeps a
+//! brightness that decays exponentially, so the cell you just released fades out
+//! while the one you are holding glows.
 //!
 //! Landmarks and the detector box arrive in *frame pixels*; `Mapping` scales
 //! them into the widget bounds while preserving the frame's aspect ratio, and
@@ -15,8 +14,9 @@ use iced::widget::canvas::{Frame, Geometry, Image, Path, Program, Stroke, Text};
 use iced::widget::image::Handle;
 use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
+use crate::core::grid::GridLayout;
 use crate::core::Landmark;
-use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
+use crate::core::{NOTE_COUNT, NOTE_MARGIN};
 use crate::dashboard::metrics::{note_frequency, note_index, note_name};
 
 /// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
@@ -171,98 +171,136 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle) {
     );
 }
 
-/// The playable range as a keyboard: `NOTE_COUNT` semitone columns, low to high
-/// left to right, each tinted with its pitch class. The band is inset by
-/// `NOTE_MARGIN` on both sides so a column lines up with the x position the
-/// strategy reads - the lit key is the one the hand is actually over.
-/// `trail[i]` is the current brightness of key `i` (already faded by the UI tick).
+/// The playable range as a degree x octave grid: columns are scale degrees (low
+/// to high, left to right), rows are octaves (top row is the highest). The band
+/// is inset by `NOTE_MARGIN` on both axes so a cell lines up with the position
+/// the strategy reads - the lit cell is the one the hand is actually over.
+/// `trail[note - NOTE_LOW]` is that note's current brightness (already faded).
 fn keyboard(
     frame: &mut Frame,
     stage: Rectangle,
+    layout: &GridLayout,
     trail: &[f32; NOTE_COUNT],
-    playable: &[u8],
     current: Option<u8>,
     volume: f32,
 ) {
-    let inset = NOTE_MARGIN * stage.width;
-    let band_x = stage.x + inset;
-    let band_w = stage.width - 2.0 * inset;
-    let key = band_w / NOTE_COUNT as f32;
-
-    // 1. Every key, faintly coloured. Keys the current scale allows are brighter,
-    // so the playable pattern is legible even when nothing is held.
-    for i in 0..NOTE_COUNT {
-        let note = NOTE_LOW + i as u8;
-        let alpha = if playable.contains(&note) { 0.11 } else { 0.03 };
-        frame.fill(
-            &Path::rectangle(
-                Point::new(band_x + key * i as f32, stage.y),
-                Size::new(key, stage.height),
-            ),
-            tint(PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12], alpha),
-        );
+    if layout.is_empty() {
+        return;
     }
 
-    // 2. Key separators. Octave starts (every C) and the two frame margins that
-    // no note can reach are drawn brighter.
-    for i in 0..=NOTE_COUNT {
-        let x = band_x + key * i as f32;
-        let major = i == 0
-            || i == NOTE_COUNT
-            || (NOTE_LOW + i.min(NOTE_COUNT - 1) as u8).is_multiple_of(12);
-        frame.stroke(
-            &Path::line(Point::new(x, stage.y), Point::new(x, stage.y + stage.height)),
-            Stroke::default()
-                .with_color(if major { GRID_MAJOR } else { GRID })
-                .with_width(if major { 1.5 } else { 1.0 }),
-        );
-    }
+    let inset_x = NOTE_MARGIN * stage.width;
+    let inset_y = NOTE_MARGIN * stage.height;
+    let band_x = stage.x + inset_x;
+    let band_y = stage.y + inset_y;
+    let band_w = stage.width - 2.0 * inset_x;
+    let band_h = stage.height - 2.0 * inset_y;
+    let cell_w = band_w / layout.cols as f32;
+    let cell_h = band_h / layout.rows as f32;
 
-    // 3. The trail: notes you have just played, glowing and fading out.
-    for (i, level) in trail.iter().enumerate() {
-        if *level < TRAIL_EPS {
-            continue;
-        }
-        let x = band_x + key * i as f32;
-        let color = PITCH_COLORS[(NOTE_LOW + i as u8) as usize % 12];
-        let is_current = current.is_some_and(|note| note_index(note) == i);
-
-        frame.fill(
-            &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
-            tint(color, 0.42 * level),
-        );
-        // Bright cap at the top of every lit key, so the fade reads even when
-        // the column itself is nearly transparent.
-        frame.fill(
-            &Path::rectangle(Point::new(x, stage.y), Size::new(key, 5.0)),
-            tint(color, 0.85 * level),
-        );
-
-        // The held key additionally carries a loudness bar rising from the floor.
-        if is_current {
-            let bar = stage.height * volume.clamp(0.0, 1.0);
+    // 1. Every cell, faintly tinted with its pitch class. Row 0 is the highest
+    // octave, so the keyboard reads upward like a staff.
+    for row in 0..layout.rows {
+        for col in 0..layout.cols {
+            let note = layout.notes[row * layout.cols + col];
             frame.fill(
                 &Path::rectangle(
-                    Point::new(x, stage.y + stage.height - bar),
-                    Size::new(key, bar),
+                    Point::new(band_x + cell_w * col as f32, band_y + cell_h * row as f32),
+                    Size::new(cell_w, cell_h),
                 ),
-                tint(color, 0.55),
+                tint(PITCH_COLORS[(note % 12) as usize], 0.10),
             );
         }
     }
 
-    // 4. Outline the key being played and label it.
+    // 2. Cell separators. Octave rows get the heavier line so the ladder of
+    // octaves is visible at a glance.
+    for col in 0..=layout.cols {
+        frame.stroke(
+            &Path::line(
+                Point::new(band_x + cell_w * col as f32, band_y),
+                Point::new(band_x + cell_w * col as f32, band_y + band_h),
+            ),
+            Stroke::default().with_color(GRID).with_width(1.0),
+        );
+    }
+    for row in 0..=layout.rows {
+        frame.stroke(
+            &Path::line(
+                Point::new(band_x, band_y + cell_h * row as f32),
+                Point::new(band_x + band_w, band_y + cell_h * row as f32),
+            ),
+            Stroke::default().with_color(GRID_MAJOR).with_width(1.5),
+        );
+    }
+
+    // 3. Octave labels down the left of the grid.
+    for row in 0..layout.rows {
+        frame.fill_text(Text {
+            content: note_name(layout.root + layout.octaves[row] * 12),
+            position: Point::new(
+                stage.x + 8.0,
+                band_y + cell_h * row as f32 + cell_h / 2.0 - 6.0,
+            ),
+            max_width: stage.width,
+            color: MUTED,
+            size: 11.0.into(),
+            ..Default::default()
+        });
+    }
+
+    // 3. The trail: cells you have just played, glowing and fading out.
+    for row in 0..layout.rows {
+        for col in 0..layout.cols {
+            let note = layout.notes[row * layout.cols + col];
+            let level = trail[note_index(note)];
+            if level < TRAIL_EPS {
+                continue;
+            }
+            let x = band_x + cell_w * col as f32;
+            let y = band_y + cell_h * row as f32;
+            let color = PITCH_COLORS[(note % 12) as usize];
+
+            frame.fill(
+                &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
+                tint(color, 0.42 * level),
+            );
+            // Bright cap at the top of every lit cell, so the fade reads even when
+            // the cell itself is nearly transparent.
+            frame.fill(
+                &Path::rectangle(Point::new(x, y), Size::new(cell_w, 5.0)),
+                tint(color, 0.85 * level),
+            );
+
+            // The held cell additionally carries a loudness bar rising from its floor.
+            if current == Some(note) {
+                let bar = cell_h * volume.clamp(0.0, 1.0);
+                frame.fill(
+                    &Path::rectangle(Point::new(x, y + cell_h - bar), Size::new(cell_w, bar)),
+                    tint(color, 0.55),
+                );
+            }
+        }
+    }
+
+    // 4. Outline the cell being played and label it.
     if let Some(note) = current {
-        let i = note_index(note);
-        let x = band_x + key * i as f32;
+        let cell = layout
+            .notes
+            .iter()
+            .position(|&n| n == note)
+            .unwrap_or(0);
+        let row = cell / layout.cols;
+        let col = cell % layout.cols;
+        let x = band_x + cell_w * col as f32;
+        let y = band_y + cell_h * row as f32;
         let color = PITCH_COLORS[(note % 12) as usize];
         frame.stroke(
-            &Path::rectangle(Point::new(x, stage.y), Size::new(key, stage.height)),
+            &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
             Stroke::default().with_color(color).with_width(2.0),
         );
         frame.fill_text(Text {
             content: format!("{}  {:.0} Hz", note_name(note), note_frequency(note)),
-            position: Point::new(x, stage.y + 6.0),
+            position: Point::new(x, y - 16.0),
             max_width: stage.width,
             color,
             size: 13.0.into(),
@@ -270,30 +308,26 @@ fn keyboard(
         });
     }
 
-    // 5. Note labels along the floor. With a coarse scale there is room to name
-    // every playable key; with the chromatic set only the octave Cs fit.
-    let label_every_key = playable.len() <= 14;
-    for i in 0..NOTE_COUNT {
-        let note = NOTE_LOW + i as u8;
-        if !label_every_key {
-            if !note.is_multiple_of(12) {
-                continue;
+    // 5. Note names inside the cells, when the cells are big enough to hold them.
+    if cell_w > 34.0 && cell_h > 20.0 {
+        for row in 0..layout.rows {
+            for col in 0..layout.cols {
+                let note = layout.notes[row * layout.cols + col];
+                frame.fill_text(Text {
+                    content: note_name(note),
+                    position: Point::new(
+                        band_x + cell_w * col as f32 + 6.0,
+                        band_y + cell_h * row as f32 + 6.0,
+                    ),
+                    max_width: stage.width,
+                    color: MUTED,
+                    size: 11.0.into(),
+                    ..Default::default()
+                });
             }
-        } else if !playable.contains(&note) {
-            continue;
         }
-        frame.fill_text(Text {
-            content: note_name(note),
-            position: Point::new(band_x + key * (i as f32 + 0.5) - 10.0, stage.y + stage.height - 18.0),
-            max_width: stage.width,
-            color: if playable.contains(&note) { MUTED } else { Color::from_rgb8(70, 78, 86) },
-            size: 11.0.into(),
-            ..Default::default()
-        });
     }
 }
-
-#[derive(Debug, Clone)]
 pub struct Skeleton {
     /// The camera frame as RGBA pixels. Only drawn when `show_feed` is true.
     pub image: Option<Handle>,
@@ -309,8 +343,8 @@ pub struct Skeleton {
     pub lost_ms: u64,
     /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW.
     pub note_trail: [f32; NOTE_COUNT],
-    /// The notes the active scale allows; the rest of the keyboard is dimmed.
-    pub playable: Vec<u8>,
+    /// The degree x octave keyboard the hand plays on.
+    pub layout: GridLayout,
     pub current_note: Option<u8>,
     pub volume: f32,
 }
@@ -340,8 +374,8 @@ impl<Message> Program<Message> for Skeleton {
         keyboard(
             &mut frame,
             stage,
+            &self.layout,
             &self.note_trail,
-            &self.playable,
             self.current_note,
             self.volume,
         );

@@ -6,7 +6,8 @@
 
 use std::collections::VecDeque;
 
-use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
+use crate::core::grid::GridLayout;
+use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
 
 /// Maximum number of events kept in the on-screen log.
 pub const LOG_CAPACITY: usize = 12;
@@ -21,6 +22,11 @@ pub fn note_index(note: u8) -> usize {
     (note.clamp(NOTE_LOW, NOTE_HIGH) - NOTE_LOW) as usize
 }
 
+/// Position of `note` in the grid layout, if the layout contains it.
+pub fn cell_index(layout: &GridLayout, note: u8) -> Option<usize> {
+    layout.notes.iter().position(|&n| n == note)
+}
+
 /// Equal-tempered frequency of a MIDI note, A4 (69) = 440 Hz.
 pub fn note_frequency(note: u8) -> f32 {
     440.0 * 2.0f32.powf((note as f32 - 69.0) / 12.0)
@@ -28,7 +34,7 @@ pub fn note_frequency(note: u8) -> f32 {
 
 /// Exponentially fade the whole keyboard trail by `dt_secs`, using `tau_secs`
 /// as the time constant.
-pub fn fade_trail(trail: &mut [f32; NOTE_COUNT], dt_secs: f32, tau_secs: f32) {
+pub fn fade_trail(trail: &mut [f32], dt_secs: f32, tau_secs: f32) {
     let tau = tau_secs.max(1e-3);
     let decay = (-dt_secs / tau).exp();
     for level in trail.iter_mut() {
@@ -54,10 +60,13 @@ pub struct FrameMetrics {
     pub landmarks: Vec<Landmark>,
     pub hand_box: Option<(f32, f32, f32, f32)>,
     pub frame_size: (usize, usize),
-    /// x of the index fingertip (landmark 8) in frame pixels - the anchor the
-    /// note is read from. Published so the dashboard can show it next to the
-    /// keyboard instead of guessing from the detector box.
-    pub pitch_x: f32,
+    /// Index fingertip position in frame pixels, published so the dashboard can
+    /// show where on the keyboard the hand is sitting.
+    pub tip_x: f32,
+    pub tip_y: f32,
+    /// Grid cell the hand is over: column (degree) and row (octave), row 0 = top.
+    pub grid_col: usize,
+    pub grid_row: usize,
     /// Milliseconds since the last frame in which a hand was found.
     pub lost_ms: u64,
     /// Mean landmark displacement between consecutive frames, in pixels.
@@ -93,8 +102,8 @@ pub struct FrameMetrics {
     pub scale: String,
     /// Root letter of that scale, e.g. "C".
     pub root: String,
-    /// Notes the scale makes playable inside NOTE_LOW..=NOTE_HIGH, ascending.
-    pub playable: Vec<u8>,
+    /// The degree x octave keyboard the hand plays on.
+    pub layout: GridLayout,
     pub log: VecDeque<EventLogEntry>,
 }
 
@@ -110,6 +119,7 @@ pub fn note_name(midi: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NOTE_COUNT;
 
     #[test]
     fn middle_c_is_c4() {

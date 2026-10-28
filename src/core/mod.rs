@@ -1,5 +1,6 @@
 pub mod event_bus;
 pub mod geometry;
+pub mod grid;
 pub mod scale;
 pub mod types;
 

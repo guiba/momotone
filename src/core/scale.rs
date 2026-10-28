@@ -6,8 +6,6 @@
 //! across the stage cannot produce a clash - the reason the chromatic mapping
 //! (the old behaviour) can sound random.
 
-use crate::core::{NOTE_HIGH, NOTE_LOW};
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scale {
     pub name: &'static str,
@@ -77,20 +75,19 @@ pub fn root_class(name: &str) -> Option<u8> {
     Some(((base + offset).rem_euclid(12)) as u8)
 }
 
-/// Every note in the playable range that belongs to `scale` rooted at `root`.
-pub fn playable_notes(root: u8, scale: &Scale) -> Vec<u8> {
-    (NOTE_LOW..=NOTE_HIGH)
-        .filter(|&note| {
-            let interval = (note as i32 - root as i32).rem_euclid(12) as u8;
-            scale.degrees.contains(&interval)
-        })
-        .collect()
+/// Is `note` inside `scale` rooted at `root`? Used by the tests and by any
+/// consumer that wants to check a note against a scale.
+#[allow(dead_code)]
+pub fn is_in_scale(note: u8, root: u8, scale: &Scale) -> bool {
+    let interval = (note as i32 - root as i32).rem_euclid(12) as u8;
+    scale.degrees.contains(&interval)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::NOTE_LOW;
+    use crate::core::grid::GridLayout;
+    use crate::core::{NOTE_HIGH, NOTE_LOW};
 
     #[test]
     fn presets_round_trip_by_name() {
@@ -112,37 +109,30 @@ mod tests {
     }
 
     #[test]
-    fn a_pentatonic_set_is_consonant_and_inside_the_range() {
+    fn a_pentatonic_grid_is_consonant_and_inside_the_range() {
         let scale = preset("major pentatonic").unwrap();
-        let notes = playable_notes(root_class("C").unwrap(), &scale);
-        // C2..C6 inclusive: five notes per octave plus the top C = 21 notes.
-        assert_eq!(notes.len(), 21);
-        assert!(notes.iter().all(|n| *n >= NOTE_LOW && *n <= NOTE_HIGH));
+        let grid = GridLayout::new(root_class("C").unwrap(), &scale, 4);
+        assert!(grid.notes.iter().all(|&n| is_in_scale(n, 0, &scale)));
+        assert!(grid.notes.iter().all(|&n| n >= NOTE_LOW && n <= NOTE_HIGH));
         // C, D, E, G, A per octave - no F, no B, no semitone neighbours.
-        assert_eq!(notes[0], 36);
-        assert_eq!(notes[1], 38);
-        assert_eq!(notes[2], 40);
-        assert_eq!(notes[3], 43);
-        assert_eq!(notes[4], 45);
-        assert_eq!(notes[20], 84);
+        assert!(grid.notes.iter().all(|&n| n % 12 != 5 && n % 12 != 11));
     }
 
     #[test]
     fn chromatic_keeps_every_note() {
         let scale = preset("chromatic").unwrap();
-        let notes = playable_notes(0, &scale);
-        assert_eq!(notes.len(), 49);
+        let grid = GridLayout::new(0, &scale, 4);
+        assert_eq!(grid.len(), 48);
+        assert!(grid.notes.iter().all(|&n| is_in_scale(n, 0, &scale)));
     }
 
     #[test]
-    fn transposing_the_root_shifts_the_set() {
+    fn transposing_the_root_shifts_the_grid() {
         let scale = preset("minor pentatonic").unwrap();
-        let in_c = playable_notes(0, &scale);
-        let in_a = playable_notes(root_class("A").unwrap(), &scale);
-        // A minor pentatonic: A C D E G. C is the minor third of A, so the range
-        // still opens on C2 - but the sets differ further up.
-        assert_eq!(in_a[0], 36);
-        assert!(in_a.contains(&45), "A2 should be playable in A pentatonic");
-        assert!(!in_c.contains(&45), "A is not in C minor pentatonic");
+        let in_c = GridLayout::new(0, &scale, 3).notes;
+        let in_a = GridLayout::new(root_class("A").unwrap(), &scale, 3).notes;
+        assert_ne!(in_c, in_a, "a different root must produce a different keyboard");
+        assert!(in_a.iter().any(|&n| n % 12 == 9), "A should appear in A pentatonic");
+        assert!(!in_c.iter().any(|&n| n % 12 == 9), "A is not in C minor pentatonic");
     }
 }

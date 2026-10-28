@@ -178,12 +178,13 @@ impl Dashboard {
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
-                "{} · {} · {} · {} {} · trail {:.0} ms",
+                "{} · {} · {} {} · {}x{} grid · trail {:.0} ms",
                 self.metrics.mode,
                 self.metrics.sink,
                 self.metrics.scale,
                 self.metrics.root,
-                self.metrics.playable.len(),
+                self.metrics.layout.rows,
+                self.metrics.layout.cols,
                 self.fade_tau * 1000.0
             ))
                 .size(12)
@@ -220,7 +221,7 @@ impl Dashboard {
                 detected: self.metrics.detected,
                 lost_ms: self.metrics.lost_ms,
                 note_trail: self.note_trail,
-                playable: self.metrics.playable.clone(),
+                layout: self.metrics.layout.clone(),
                 current_note: self.metrics.note,
                 volume: self.metrics.volume,
             })
@@ -482,7 +483,21 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
             kv("state", status),
             kv(
                 "pitch anchor",
-                format!("tip x {:.0} / {:.0} px", metrics.pitch_x, metrics.frame_size.0),
+                format!(
+                    "tip {:.0}, {:.0} / {:.0} x {:.0} px",
+                    metrics.tip_x,
+                    metrics.tip_y,
+                    metrics.frame_size.0,
+                    metrics.frame_size.1
+                ),
+            ),
+            kv(
+                "cell",
+                format!(
+                    "deg {} · octave {}",
+                    metrics.grid_col,
+                    metrics.layout.octaves.get(metrics.grid_row).map_or(0, |o| o - 1)
+                ),
             ),
             kv("landmarks", format!("{}", metrics.landmark_count)),
         ]

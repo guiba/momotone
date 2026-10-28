@@ -16,7 +16,7 @@ use crate::core::event_bus::EventBus;
 use crate::core::geometry::hand_geometry;
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
-use crate::dashboard::metrics::{EventLogEntry, FrameMetrics, LOG_CAPACITY};
+use crate::dashboard::metrics::{cell_index, EventLogEntry, FrameMetrics, LOG_CAPACITY};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTrackerImpl;
 
@@ -77,7 +77,7 @@ impl Pipeline {
                 sink: snapshot.sink.clone(),
                 scale: snapshot.scale.clone(),
                 root: snapshot.root.clone(),
-                playable: snapshot.playable.clone(),
+                layout: snapshot.layout.clone(),
                 ..FrameMetrics::default()
             })
             .unwrap_or_default();
@@ -156,7 +156,8 @@ impl Pipeline {
         self.metrics.landmarks.clear();
         self.metrics.landmark_count = 0;
         self.metrics.hand_box = None;
-        self.metrics.pitch_x = 0.0;
+        self.metrics.tip_x = 0.0;
+        self.metrics.tip_y = 0.0;
         if let Ok(mut shared) = self.shared.lock() {
             *shared = self.metrics.clone();
         }
@@ -225,7 +226,18 @@ impl Pipeline {
         }
         self.metrics.landmark_count = self.metrics.landmarks.len();
         // The note anchor: landmark 8 is the index fingertip.
-        self.metrics.pitch_x = self.metrics.landmarks.get(8).map_or(0.0, |l| l.x);
+        if let Some(tip) = self.metrics.landmarks.get(8) {
+            self.metrics.tip_x = tip.x;
+            self.metrics.tip_y = tip.y;
+        }
+        // Which cell the sounding note belongs to, for the crosshair and the
+        // cell highlight. Notes are unique in the grid, so this is exact.
+        if let Some(note) = self.metrics.note {
+            if let Some(cell) = cell_index(&self.metrics.layout, note) {
+                self.metrics.grid_row = cell / self.metrics.layout.cols;
+                self.metrics.grid_col = cell % self.metrics.layout.cols;
+            }
+        }
 
         if self.metrics.detected {
             self.last_detection = Instant::now();
@@ -296,7 +308,7 @@ impl Pipeline {
 
         if self.debug && self.metrics.frames.is_multiple_of(10) {
             println!(
-                "[Pipeline] fps {:.1} frame {:.2} ms (detector {:.0} us, landmarker {:.0} us) conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip x {:.0}",
+                "[Pipeline] fps {:.1} frame {:.2} ms (detector {:.0} us, landmarker {:.0} us) conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
                 self.metrics.fps,
                 self.metrics.frame_ms,
                 self.metrics.detector_us,
@@ -306,7 +318,8 @@ impl Pipeline {
                 self.metrics.volume,
                 self.metrics.spread,
                 self.metrics.jitter_px,
-                self.metrics.pitch_x,
+                self.metrics.tip_x,
+                self.metrics.tip_y,
             );
         }
 
@@ -460,6 +473,7 @@ fn finger_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::grid::GridLayout;
 
     #[test]
     fn synthetic_hand_has_21_landmarks() {
@@ -602,7 +616,7 @@ mod tests {
             sink: "audio".to_string(),
             scale: "major pentatonic".to_string(),
             root: "C".to_string(),
-            playable: vec![36, 38, 40, 43, 45],
+            layout: GridLayout::new(0, &crate::core::scale::preset("major pentatonic").unwrap(), 3),
             ..FrameMetrics::default()
         }));
         let mut pipeline = Pipeline::new(
@@ -624,7 +638,7 @@ mod tests {
         let snapshot = shared.lock().unwrap();
         assert_eq!(snapshot.scale, "major pentatonic");
         assert_eq!(snapshot.root, "C");
-        assert_eq!(snapshot.playable.len(), 5);
+        assert_eq!(snapshot.layout.len(), 15);
         assert_eq!(snapshot.mode, "Signal");
         assert!(snapshot.detected, "the mock hand should register");
     }
