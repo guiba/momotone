@@ -1,9 +1,12 @@
 pub mod event_bus;
 pub mod geometry;
 pub mod grid;
+pub mod instrument;
 pub mod scale;
 pub mod types;
 
+use crate::core::grid::GridLayout;
+use crate::core::instrument::Waveform;
 use crate::core::types::GestureEvent;
 use anyhow::Result;
 
@@ -52,9 +55,15 @@ pub trait Sink: Send + Sync {
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()>;
+    /// Timbral change, where the sink has something to change. Sinks that cannot
+    /// express it (MIDI, which hands the timbre to the receiving device) ignore
+    /// it, so a default no-op keeps every sink trivially conformant.
+    fn set_waveform(&mut self, _waveform: Waveform) {}
 }
 
 /// Interface for mapping hand landmarks to gesture events.
 pub trait Strategy: Send + Sync {
     fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent>;
+    /// Swap the keyboard out from under the strategy without rebuilding it.
+    fn apply_layout(&mut self, _layout: GridLayout) {}
 }

@@ -22,11 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::image::Handle;
-use iced::widget::{button, canvas, column, container, row, rule, space, text, Column, Scrollable};
+use iced::widget::{button, canvas, column, container, row, rule, space, text, pick_list, Column, Scrollable};
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
 use crate::core::geometry::FINGER_NAMES;
+use crate::core::instrument::{InstrumentConfig, Waveform};
 use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
 use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
@@ -51,7 +52,7 @@ enum Tab {
     Advanced,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Message {
     Tick,
     ToggleRun,
@@ -61,6 +62,10 @@ enum Message {
     ToggleLabels,
     ToggleFeed,
     ClearHistory,
+    PickScale(String),
+    PickRoot(String),
+    PickOctaves(usize),
+    PickWaveform(Waveform),
 }
 
 pub struct Dashboard {
@@ -70,6 +75,12 @@ pub struct Dashboard {
     /// Mirrors `show_feed` so the pipeline knows whether to build the RGBA
     /// upload at all.
     feed: Arc<AtomicBool>,
+    /// The instrument the player is on. The pickers write to this and the
+    /// pipeline picks the change up on the next frame.
+    instrument: Arc<Mutex<InstrumentConfig>>,
+    /// Local mirror of the config, so the pick lists show the current choice
+    /// without locking on every `view`.
+    instrument_view: InstrumentConfig,
     tab: Tab,
     metrics: FrameMetrics,
     frame_image: Option<Handle>,
@@ -93,12 +104,19 @@ impl Dashboard {
         shared: Arc<Mutex<FrameMetrics>>,
         active: Arc<AtomicBool>,
         feed: Arc<AtomicBool>,
+        instrument: Arc<Mutex<InstrumentConfig>>,
         fade_ms: f32,
     ) -> Self {
+        let instrument_view = instrument
+            .lock()
+            .map(|config| config.clone())
+            .unwrap_or_default();
         Dashboard {
             shared,
             active,
             feed,
+            instrument,
+            instrument_view,
             tab: Tab::Basic,
             metrics: FrameMetrics::default(),
             frame_image: None,
@@ -161,6 +179,20 @@ impl Dashboard {
                 self.volume_history.clear();
                 self.confidence_history.clear();
             }
+            Message::PickScale(name) => self.apply(|config| config.set_scale(&name)),
+            Message::PickRoot(name) => self.apply(|config| config.set_root(&name)),
+            Message::PickOctaves(n) => self.apply(|config| config.set_octaves(n)),
+            Message::PickWaveform(waveform) => self.apply(|config| config.set_waveform(waveform)),
+        }
+    }
+
+    /// Write a picker change into the shared config and refresh the local mirror
+    /// so the pick lists show the new value immediately. The pipeline applies it
+    /// to the strategy and the sinks on its next frame.
+    fn apply(&mut self, change: impl Fn(&mut InstrumentConfig) -> bool) {
+        if let Ok(mut config) = self.instrument.lock() {
+            change(&mut config);
+            self.instrument_view = config.clone();
         }
     }
 
@@ -178,13 +210,14 @@ impl Dashboard {
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
-                "{} · {} · {} {} · {}x{} grid · trail {:.0} ms",
+                "{} · {} · {} {} · {}x{} · {} · trail {:.0} ms",
                 self.metrics.mode,
                 self.metrics.sink,
                 self.metrics.scale,
                 self.metrics.root,
                 self.metrics.layout.rows,
                 self.metrics.layout.cols,
+                self.metrics.waveform,
                 self.fade_tau * 1000.0
             ))
                 .size(12)
@@ -251,6 +284,7 @@ impl Dashboard {
 
         let cards: Column<'_, Message> = match self.tab {
             Tab::Basic => column![
+                instrument_card(&self.instrument_view),
                 note_card(&self.metrics),
                 meter_card("Volume", self.metrics.volume, VOLUME),
                 meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
@@ -355,10 +389,11 @@ pub fn run(
     shared: Arc<Mutex<FrameMetrics>>,
     active: Arc<AtomicBool>,
     feed: Arc<AtomicBool>,
+    instrument: Arc<Mutex<InstrumentConfig>>,
     fade_ms: f32,
 ) -> iced::Result {
     iced::application(
-        move || Dashboard::new(shared.clone(), active.clone(), feed.clone(), fade_ms),
+        move || Dashboard::new(shared.clone(), active.clone(), feed.clone(), instrument.clone(), fade_ms),
         Dashboard::update,
         Dashboard::view,
     )
@@ -402,6 +437,48 @@ fn kv<'a>(key: &'a str, value: String) -> Element<'a, Message> {
     ]
     .spacing(8)
     .into()
+}
+
+/// The instrument controls: scale, root, octave span and timbre. Each pick writes
+/// straight into the shared config and the pipeline re-keys on its next frame, so
+/// nothing here needs a restart.
+fn instrument_card<'a>(config: &InstrumentConfig) -> Element<'a, Message> {
+    let scales: Vec<String> = crate::core::scale::PRESETS
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let roots: Vec<String> = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        .iter()
+        .map(|&name| name.to_string())
+        .collect();
+    let octaves: Vec<usize> = (1..=6).collect();
+    let waveforms: Vec<Waveform> = Waveform::all().to_vec();
+
+    card(
+        "INSTRUMENT",
+        column![
+            row![
+                pick_list(scales, Some(config.scale.name.to_string()), Message::PickScale).width(Length::Fill),
+                pick_list(roots, Some(config.root_name.clone()), Message::PickRoot).width(Length::Fill),
+            ]
+            .spacing(6),
+            row![
+                pick_list(octaves, Some(config.octaves), Message::PickOctaves).width(Length::Fill),
+                pick_list(waveforms, Some(config.waveform), Message::PickWaveform).width(Length::Fill),
+            ]
+            .spacing(6),
+            kv(
+                "keyboard",
+                format!(
+                    "{} x {} - {} cells",
+                    config.layout.rows,
+                    config.layout.cols,
+                    config.layout.len()
+                ),
+            ),
+        ]
+        .spacing(8),
+    )
 }
 
 fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {

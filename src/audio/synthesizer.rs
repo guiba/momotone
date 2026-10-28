@@ -1,28 +1,32 @@
+use crate::core::instrument::Waveform;
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::Sink;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 
-/// A single sine wave oscillator.
+/// A single oscillator. The waveform is the timbre: sine is the pure theremin,
+/// the others add harmonics and read more like a real instrument.
 #[derive(Clone)]
 struct Voice {
     frequency: f32,
     amplitude: f32,
     phase: f32,
+    waveform: Waveform,
 }
 
 impl Voice {
-    fn new(frequency: f32, amplitude: f32) -> Self {
+    fn new(frequency: f32, amplitude: f32, waveform: Waveform) -> Self {
         Self {
             frequency,
             amplitude,
             phase: 0.0,
+            waveform,
         }
     }
 
     fn next_sample(&mut self, sample_rate: f32) -> f32 {
-        let val = self.amplitude * (self.phase * 2.0 * std::f32::consts::PI).sin();
+        let val = self.amplitude * self.waveform.sample(self.phase);
         self.phase += self.frequency / sample_rate;
         if self.phase >= 1.0 {
             self.phase -= 1.0;
@@ -34,6 +38,8 @@ impl Voice {
 /// Shared state between the main thread and the audio callback.
 struct SynthesizerState {
     voices: Vec<Voice>,
+    /// Timbre applied to the next voice that starts.
+    waveform: Waveform,
 }
 
 /// Wrapper to allow cpal::Stream (which is !Sync) to be used inside a Sync struct.
@@ -60,7 +66,10 @@ impl Synthesizer {
             sample_rate,
             channels,
             gain: gain.clamp(0.0, 1.0),
-            state: Arc::new(Mutex::new(SynthesizerState { voices: Vec::new() })),
+            state: Arc::new(Mutex::new(SynthesizerState {
+                voices: Vec::new(),
+                waveform: Waveform::Sine,
+            })),
             stream: None,
         }
     }
@@ -73,8 +82,9 @@ impl Synthesizer {
                 amplitude,
             } => {
                 let amplitude = (amplitude * self.gain).clamp(0.0, 1.0);
+                let waveform = state.waveform;
                 if state.voices.is_empty() {
-                    state.voices.push(Voice::new(*frequency, amplitude));
+                    state.voices.push(Voice::new(*frequency, amplitude, waveform));
                 } else {
                     for voice in state.voices.iter_mut() {
                         voice.frequency = *frequency;
@@ -91,8 +101,9 @@ impl Synthesizer {
                 } else {
                     let amplitude = (velocity * self.gain).clamp(0.0, 1.0);
                     let freq = 440.0 * 2.0f32.powf((*note as i32 - 69) as f32 / 12.0);
+                    let waveform = state.waveform;
                     if state.voices.is_empty() {
-                        state.voices.push(Voice::new(freq, amplitude));
+                        state.voices.push(Voice::new(freq, amplitude, waveform));
                     } else {
                         state.voices[0].frequency = freq;
                         state.voices[0].amplitude = amplitude;
@@ -149,6 +160,17 @@ impl Sink for Synthesizer {
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
         self.update_from_event(event)
     }
+
+    /// Change the timbre. Applied to every voice already sounding as well, so a
+    /// picker click is audible on the note being held, not only on the next one.
+    fn set_waveform(&mut self, waveform: Waveform) {
+        if let Ok(mut state) = self.state.lock() {
+            state.waveform = waveform;
+            for voice in state.voices.iter_mut() {
+                voice.waveform = waveform;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -188,5 +210,43 @@ mod tests {
         let voice = &synth.state.lock().unwrap().voices[0];
         assert!((voice.amplitude - 0.25).abs() < 1e-6);
         assert!((voice.frequency - 261.6).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_waveform_change_reaches_the_voice_already_sounding() {
+        let mut synth = Synthesizer::new(44100.0, 1, 1.0);
+        synth
+            .update_from_event(&GestureEvent::new_note(60, 0.5, "Finger Position"))
+            .unwrap();
+        assert_eq!(synth.state.lock().unwrap().voices[0].waveform, Waveform::Sine);
+
+        synth.set_waveform(Waveform::Saw);
+        {
+            let state = synth.state.lock().unwrap();
+            assert_eq!(state.waveform, Waveform::Saw);
+            assert_eq!(state.voices[0].waveform, Waveform::Saw);
+        }
+
+        // A voice started after the change inherits it.
+        synth.update_from_event(&GestureEvent::no_gesture()).unwrap();
+        synth
+            .update_from_event(&GestureEvent::new_note(69, 1.0, "Finger Position"))
+            .unwrap();
+        assert_eq!(synth.state.lock().unwrap().voices[0].waveform, Waveform::Saw);
+    }
+
+    #[test]
+    fn the_waveform_shape_is_what_the_oscillator_emits() {
+        let mut synth = Synthesizer::new(100.0, 1, 1.0);
+        synth.set_waveform(Waveform::Square);
+        synth
+            .update_from_event(&GestureEvent::new_note(69, 1.0, "Finger Position"))
+            .unwrap();
+        let mut voice = synth.state.lock().unwrap().voices[0].clone();
+        // A square wave only ever sits at +/- amplitude, never partway between.
+        for _ in 0..8 {
+            let sample = voice.next_sample(100.0);
+            assert!((sample - 1.0).abs() < 1e-6 || (sample + 1.0).abs() < 1e-6);
+        }
     }
 }

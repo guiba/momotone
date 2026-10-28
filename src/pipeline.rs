@@ -14,6 +14,7 @@ use opencv::prelude::*;
 
 use crate::core::event_bus::EventBus;
 use crate::core::geometry::hand_geometry;
+use crate::core::instrument::InstrumentConfig;
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
 use crate::dashboard::metrics::{cell_index, EventLogEntry, FrameMetrics, LOG_CAPACITY};
@@ -33,6 +34,15 @@ pub struct Pipeline {
     event_bus: EventBus,
     event_rx: Receiver<GestureEvent>,
     shared: Arc<Mutex<FrameMetrics>>,
+    /// The instrument the player is currently on. The dashboard pickers write
+    /// to it; the pipeline notices the version change and re-keys the strategy
+    /// and the sinks on the next frame.
+    instrument: Arc<Mutex<InstrumentConfig>>,
+    /// Version of `instrument` last applied to the strategy and the sinks. Starts
+    /// above any real version so the first frame always re-keys, which also keeps
+    /// the published layout in sync with the config even when the snapshot was
+    /// never seeded.
+    applied_version: u64,
     metrics: FrameMetrics,
     previous_landmarks: Vec<Landmark>,
     /// True while a gesture is actively driving the sinks. Used to send exactly
@@ -52,21 +62,42 @@ pub struct Pipeline {
     feed_wanted: Arc<AtomicBool>,
 }
 
+/// Everything the loop needs to run, grouped so `Pipeline::new` is not a
+/// thirteen-argument call.
+pub struct PipelineConfig {
+    pub camera: Option<WebcamSource>,
+    pub tracker: Option<HandTrackerImpl>,
+    pub strategy: Box<dyn Strategy>,
+    pub sinks: Vec<Box<dyn Sink>>,
+    pub event_bus: EventBus,
+    pub event_rx: Receiver<GestureEvent>,
+    pub shared: Arc<Mutex<FrameMetrics>>,
+    pub instrument: Arc<Mutex<InstrumentConfig>>,
+    pub active: Arc<AtomicBool>,
+    pub feed_wanted: Arc<AtomicBool>,
+    pub max_frames: Option<u32>,
+    pub debug: bool,
+    pub emit_frames: bool,
+}
+
 impl Pipeline {
-    pub fn new(
-        camera: Option<WebcamSource>,
-        tracker: Option<HandTrackerImpl>,
-        strategy: Box<dyn Strategy>,
-        sinks: Vec<Box<dyn Sink>>,
-        event_bus: EventBus,
-        event_rx: Receiver<GestureEvent>,
-        shared: Arc<Mutex<FrameMetrics>>,
-        max_frames: Option<u32>,
-        debug: bool,
-        emit_frames: bool,
-        active: Arc<AtomicBool>,
-        feed_wanted: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(config: PipelineConfig) -> Self {
+        let PipelineConfig {
+            camera,
+            tracker,
+            strategy,
+            sinks,
+            event_bus,
+            event_rx,
+            shared,
+            instrument,
+            active,
+            feed_wanted,
+            max_frames,
+            debug,
+            emit_frames,
+        } = config;
+
         // `main` seeds the snapshot with the run's context (mode, sink, scale).
         // The pipeline keeps its own copy so publishing a frame does not wipe
         // those fields back to their defaults.
@@ -90,6 +121,8 @@ impl Pipeline {
             event_bus,
             event_rx,
             shared,
+            instrument,
+            applied_version: u64::MAX,
             metrics: context,
             previous_landmarks: Vec::new(),
             gesture_active: false,
@@ -103,12 +136,48 @@ impl Pipeline {
         }
     }
 
+    /// Pick up any change the dashboard made to the instrument. One mutex lock
+    /// and an integer compare per frame; the expensive part (rebuilding the grid
+    /// and re-keying the strategy) only runs when the version actually moved.
+    fn sync_instrument(&mut self) {
+        let Ok(config) = self.instrument.lock() else {
+            return;
+        };
+        if config.version == self.applied_version {
+            return;
+        }
+        self.applied_version = config.version;
+
+        self.strategy.apply_layout(config.layout.clone());
+        for sink in &mut self.sinks {
+            sink.set_waveform(config.waveform);
+        }
+        self.metrics.scale = config.scale.name.to_string();
+        self.metrics.root = config.root_name.clone();
+        self.metrics.waveform = config.waveform.name().to_string();
+        self.metrics.layout = config.layout.clone();
+
+        if self.debug {
+            println!(
+                "[Instrument] {} {} - {}x{} grid, {} waveform",
+                config.scale.name,
+                config.root_name,
+                config.layout.rows,
+                config.layout.cols,
+                config.waveform,
+            );
+        }
+    }
+
     /// Runs until the UI asks for shutdown or `--max-frames` is reached. The
     /// `active` flag (the dashboard's Stop button) pauses the loop without
     /// tearing down the camera or the sinks.
     pub fn run(&mut self, running: &AtomicBool) -> Result<()> {
         while running.load(Ordering::Relaxed) {
             if !self.active.load(Ordering::Relaxed) {
+                // Still honour picker changes while stopped, so the header and the
+                // sinks match what the dashboard shows before the player starts again.
+                self.sync_instrument();
                 self.pause();
                 std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
                 continue;
@@ -165,6 +234,7 @@ impl Pipeline {
 
     /// One camera frame end to end. Returns `false` when the camera is gone.
     pub fn tick(&mut self) -> Result<bool> {
+        self.sync_instrument();
         // Mock mode has no camera, so pace it like one to keep the telemetry
         // (fps, jitter, history) realistic.
         if self.camera.is_none() {
@@ -474,6 +544,8 @@ fn finger_chain(
 mod tests {
     use super::*;
     use crate::core::grid::GridLayout;
+    use crate::core::instrument::Waveform;
+    use crate::strategies::FingerPositionStrategy;
 
     #[test]
     fn synthetic_hand_has_21_landmarks() {
@@ -554,26 +626,30 @@ mod tests {
         }
     }
 
-    fn test_pipeline(strategy: Box<dyn Strategy>) -> (Pipeline, Arc<Mutex<Vec<GestureEvent>>>) {
+    fn test_pipeline(
+        strategy: Box<dyn Strategy>,
+    ) -> (Pipeline, Arc<Mutex<Vec<GestureEvent>>>, Arc<Mutex<InstrumentConfig>>) {
         let (bus, rx) = EventBus::new();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let pipeline = Pipeline::new(
-            None,
-            None,
+        let instrument = Arc::new(Mutex::new(InstrumentConfig::default()));
+        let pipeline = Pipeline::new(PipelineConfig {
+            camera: None,
+            tracker: None,
             strategy,
-            vec![Box::new(RecordingSink {
+            sinks: vec![Box::new(RecordingSink {
                 events: events.clone(),
             })],
-            bus,
-            rx,
-            Arc::new(Mutex::new(FrameMetrics::default())),
-            None,
-            false,
-            false,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        (pipeline, events)
+            event_bus: bus,
+            event_rx: rx,
+            shared: Arc::new(Mutex::new(FrameMetrics::default())),
+            instrument: instrument.clone(),
+            active: Arc::new(AtomicBool::new(true)),
+            feed_wanted: Arc::new(AtomicBool::new(false)),
+            max_frames: None,
+            debug: false,
+            emit_frames: false,
+        });
+        (pipeline, events, instrument)
     }
 
     #[test]
@@ -600,6 +676,46 @@ mod tests {
     }
 
     #[test]
+    fn a_picker_change_rekeys_the_keyboard_on_the_next_frame() {
+        let (mut pipeline, events, instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()));
+        pipeline.tick().unwrap();
+        assert_eq!(pipeline.metrics.layout.len(), 15, "the default grid is 3 x 5");
+        assert_eq!(pipeline.metrics.scale, "major pentatonic");
+
+        {
+            let mut config = instrument.lock().unwrap();
+            config.set_scale("chromatic");
+            config.set_octaves(4);
+            config.set_waveform(Waveform::Saw);
+        }
+
+        pipeline.tick().unwrap();
+        assert_eq!(pipeline.metrics.layout.rows, 4);
+        assert_eq!(pipeline.metrics.layout.cols, 12);
+        assert_eq!(pipeline.metrics.scale, "chromatic");
+
+        // The note the strategy just produced must belong to the new grid, not
+        // the old one: the layout was pushed into the strategy, not merely into
+        // the dashboard's copy of it.
+        let recorded = events.lock().unwrap();
+        let note = match recorded.last().unwrap().payload {
+            GesturePayload::Note { note, .. } => note,
+            _ => panic!("expected a note event"),
+        };
+        assert!(pipeline.metrics.layout.notes.contains(&note), "{note} is not in the new grid");
+    }
+
+    #[test]
+    fn an_unchanged_config_does_not_rebuild_every_frame() {
+        let (mut pipeline, _events, _instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()));
+        pipeline.sync_instrument();
+        let version = pipeline.applied_version;
+        pipeline.sync_instrument();
+        pipeline.sync_instrument();
+        assert_eq!(pipeline.applied_version, version, "a lock alone must not re-key the keyboard");
+    }
+
+    #[test]
     fn the_feed_is_only_converted_when_the_stage_shows_it() {
         let want = AtomicBool::new(false);
         assert!(!should_upload_feed(true, &want), "feed off means no upload");
@@ -619,20 +735,21 @@ mod tests {
             layout: GridLayout::new(0, &crate::core::scale::preset("major pentatonic").unwrap(), 3),
             ..FrameMetrics::default()
         }));
-        let mut pipeline = Pipeline::new(
-            None,
-            None,
-            Box::new(AlwaysOn),
-            Vec::new(),
-            bus,
-            rx,
-            shared.clone(),
-            None,
-            false,
-            false,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let mut pipeline = Pipeline::new(PipelineConfig {
+            camera: None,
+            tracker: None,
+            strategy: Box::new(AlwaysOn),
+            sinks: Vec::new(),
+            event_bus: bus,
+            event_rx: rx,
+            shared: shared.clone(),
+            instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
+            active: Arc::new(AtomicBool::new(true)),
+            feed_wanted: Arc::new(AtomicBool::new(false)),
+            max_frames: None,
+            debug: false,
+            emit_frames: false,
+        });
         pipeline.tick().unwrap();
 
         let snapshot = shared.lock().unwrap();
@@ -645,7 +762,7 @@ mod tests {
 
     #[test]
     fn pausing_releases_the_note_and_marks_the_snapshot() {
-        let (mut pipeline, events) = test_pipeline(Box::new(AlwaysOn));
+        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(AlwaysOn));
 
         // With no camera the pipeline synthesises a hand, so the strategy fires.
         pipeline.tick().unwrap();
@@ -665,7 +782,7 @@ mod tests {
 
     #[test]
     fn a_release_event_is_sent_when_the_gesture_ends() {
-        let (mut pipeline, events) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(true),
         }));
 
@@ -693,7 +810,7 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_while_no_gesture_has_started() {
-        let (mut pipeline, events) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(false),
         }));
         pipeline.tick().unwrap();

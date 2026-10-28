@@ -115,6 +115,10 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     octaves: usize,
 
+    /// Oscillator timbre: sine, triangle, square or saw.
+    #[arg(long, default_value = "sine")]
+    waveform: String,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -135,19 +139,23 @@ fn main() -> Result<()> {
         args.mode
     );
 
-    let scale = core::scale::preset(&args.scale).ok_or_else(|| {
+    let waveform = core::instrument::Waveform::parse(&args.waveform).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown scale '{}'; available: {}",
-            args.scale,
-            core::scale::PRESETS
+            "unknown waveform '{}'; available: {}",
+            args.waveform,
+            core::instrument::Waveform::all()
                 .iter()
-                .map(|(name, _)| *name)
+                .map(|w| w.name())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     })?;
-    let root = core::scale::root_class(&args.root)
-        .ok_or_else(|| anyhow::anyhow!("unknown root note '{}'", args.root))?;
+    let instrument = core::instrument::InstrumentConfig::new(
+        &args.scale,
+        &args.root,
+        args.octaves,
+        waveform,
+    )?;
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
@@ -251,14 +259,17 @@ fn main() -> Result<()> {
         }
     }
 
-    let strategy = FingerPositionStrategy::new(root, &scale, args.octaves);
+    let strategy = FingerPositionStrategy::new(instrument.root, &instrument.scale, instrument.octaves);
     let layout = strategy.layout().clone();
+    let scale_name = instrument.scale.name.to_string();
+    let root_name = instrument.root_name.clone();
+    let instrument = Arc::new(Mutex::new(instrument));
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
         mode: format!("{:?}", args.mode),
         sink: sink_label.to_string(),
-        scale: scale.name.to_string(),
-        root: args.root.clone(),
+        scale: scale_name,
+        root: root_name,
         layout,
         ..FrameMetrics::default()
     }));
@@ -269,20 +280,21 @@ fn main() -> Result<()> {
     // The stage hides the camera by default, so the pipeline skips the per-frame
     // RGBA conversion until the feed button is pressed.
     let feed = Arc::new(AtomicBool::new(false));
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
         camera,
         tracker,
-        Box::new(strategy),
+        strategy: Box::new(strategy),
         sinks,
         event_bus,
         event_rx,
-        shared.clone(),
-        args.max_frames,
-        args.debug,
-        !args.no_ui,
-        active.clone(),
-        feed.clone(),
-    );
+        shared: shared.clone(),
+        instrument: instrument.clone(),
+        active: active.clone(),
+        feed_wanted: feed.clone(),
+        max_frames: args.max_frames,
+        debug: args.debug,
+        emit_frames: !args.no_ui,
+    });
 
     // 4. Either run the loop in the foreground, or hand it to a thread and
     //    give the main thread to the iced dashboard.
@@ -299,7 +311,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(shared, active, feed, args.fade_ms);
+    let ui_result = dashboard::run(shared, active, feed, instrument, args.fade_ms);
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();

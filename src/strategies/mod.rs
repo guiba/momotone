@@ -43,6 +43,14 @@ impl FingerPositionStrategy {
         &self.grid
     }
 
+    /// Live re-keying: the dashboard pickers change the scale/root/octave span
+    /// and the pipeline pushes the new grid in here. The tip smoother is left
+    /// alone - it tracks a position, not a note, so re-keying mid-sweep does not
+    /// throw away the averaging state.
+    fn set_grid(&mut self, layout: GridLayout) {
+        self.grid = layout;
+    }
+
     /// Feed one sample of the index tip position into the smoother and return the
     /// averaged position. A gap in tracking restarts the average, so the next
     /// sighting is not dragged back towards where the hand was before it left.
@@ -84,6 +92,10 @@ impl FingerPositionStrategy {
 }
 
 impl Strategy for FingerPositionStrategy {
+    fn apply_layout(&mut self, layout: GridLayout) {
+        self.set_grid(layout);
+    }
+
     fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
         let landmarks = detection.hand_landmarks.as_ref()?;
         if landmarks.len() < 9 {

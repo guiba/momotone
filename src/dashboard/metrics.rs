@@ -102,6 +102,8 @@ pub struct FrameMetrics {
     pub scale: String,
     /// Root letter of that scale, e.g. "C".
     pub root: String,
+    /// Timbre of the oscillator, e.g. "saw".
+    pub waveform: String,
     /// The degree x octave keyboard the hand plays on.
     pub layout: GridLayout,
     pub log: VecDeque<EventLogEntry>,
