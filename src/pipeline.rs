@@ -19,7 +19,7 @@ use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
 use crate::dashboard::metrics::{cell_index, EventLogEntry, FrameMetrics, LOG_CAPACITY};
 use crate::vision::camera::WebcamSource;
-use crate::vision::tracker::HandTrackerImpl;
+use crate::vision::tracker::HandTracker;
 
 /// Mock mode emulates a 30 fps camera so the telemetry looks real.
 const MOCK_CADENCE_MS: u64 = 33;
@@ -28,7 +28,7 @@ const PAUSE_POLL_MS: u64 = 50;
 
 pub struct Pipeline {
     camera: Option<WebcamSource>,
-    tracker: Option<HandTrackerImpl>,
+    tracker: Option<HandTracker>,
     strategy: Box<dyn Strategy>,
     sinks: Vec<Box<dyn Sink>>,
     event_bus: EventBus,
@@ -66,7 +66,7 @@ pub struct Pipeline {
 /// thirteen-argument call.
 pub struct PipelineConfig {
     pub camera: Option<WebcamSource>,
-    pub tracker: Option<HandTrackerImpl>,
+    pub tracker: Option<HandTracker>,
     pub strategy: Box<dyn Strategy>,
     pub sinks: Vec<Box<dyn Sink>>,
     pub event_bus: EventBus,
