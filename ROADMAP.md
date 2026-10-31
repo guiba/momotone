@@ -15,7 +15,7 @@ Status: measured on `master` after the mirror/ROI/UI work (see "Recently done" a
 | Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
 | Frame snapshot copy | 0.44 µs | not worth optimising |
 | RGBA upload when the feed is off | 0.16 ms/frame built then discarded (now gated) | `cargo test --release -- --include-ignored bench_feed_upload --nocapture` |
-| Mirroring | one extra `Mat` allocation per frame (~920 KB) | `WebcamSource::get_frame` |
+| Mirroring | **0.018 ms/frame**, no allocation after the first frame | `cargo test --release -- --include-ignored bench_mirror_flip` |
 | Dead-code warnings | 13 | `cargo build` |
 
 Inference is the bottleneck: the detector alone is ~10 ms and the landmarker runs every
@@ -49,7 +49,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 ## Performance
 
 - ~~Skip the landmarker when the hand is static~~ **done** — `LandmarkCache` reuses the previous keypoints while the palm is within 3 px and 3 % of its last size, capped at 3 consecutive frames so a hand that reshapes without moving its palm is never served stale landmarks for long, and cleared whenever the detector loses the hand. The landmarker stage costs ~4-5.4 ms when it runs, so a still hand saves most of it. Verify with `cargo run -- --debug` (`palm steady, reusing landmarks`) and compare against `--landmarker-always`. **Note:** fps is camera-paced at ~30, so the win is latency and CPU headroom, not frame rate.
-- **Mirror flip in place** — `core::flip(&frame, &mut frame, 1)` avoids the second `Mat`; alternatively flip the landmarks' x in the tracker and skip the pixel copy altogether. **S**
+- ~~Mirror flip in place~~ **done, but it was never a bottleneck** — the bindings take two separate borrows, so `flip(frame, frame, 1)` is not expressible; `WebcamSource` now carries a scratch `Mat` and swaps it with the captured frame, so the destination allocation happens once instead of every frame. Measured 0.0176 ms/frame (fresh Mat) vs 0.0174 ms/frame (reused scratch): the allocator recycles the 920 KB block, so the saving is ~0.0002 ms/frame. Flipping the landmarks' x instead of the pixels would skip the memcpy too, but that is at most 0.018 ms of a 31 ms frame — inference and the camera read are where the time is. Verified by `mirroring_reverses_the_columns` and `a_second_flip_reuses_the_scratch_buffer_instead_of_allocating`.
 - **Audio callback lock** — the cpal callback takes a `Mutex<SynthesizerState>` per audio block. Move to atomics / a double-buffered state so the hot path is lock-free. **M**
 - **Split capture, inference and sinks onto their own threads** — one thread still does camera read → detector → landmarker → strategy → sinks. **M**
 - **Trim `tokio`** — declared with `features = ["full"]` and only used as iced's async executor; a slimmer feature set removes an unnecessary dependency weight. **S**
