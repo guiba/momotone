@@ -535,10 +535,16 @@ fn perf_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         "PERFORMANCE",
         column![
             kv("fps", format!("{:.1}", metrics.fps)),
-            kv("frame", format!("{:.2} ms", metrics.frame_ms)),
+            kv("inference", format!("{:.2} ms", metrics.frame_ms)),
+            kv("capture", format!("{:.2} ms", metrics.capture_ms)),
+            kv("latency", format!("{:.2} ms", metrics.latency_ms)),
             kv("detector", format!("{:.0} µs", metrics.detector_us)),
             kv("landmarker", format!("{:.0} µs", metrics.landmarker_us)),
             kv("frames", format!("{}", metrics.frames)),
+            kv(
+                "dropped",
+                format!("{} of {} frames", metrics.dropped, metrics.captured),
+            ),
             kv("uptime", format!("{} s", metrics.uptime_ms / 1000)),
         ]
         .spacing(4),

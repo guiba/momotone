@@ -1,15 +1,24 @@
 //! The capture -> inference -> gesture -> sink loop, decoupled from the UI.
 //!
-//! `Pipeline::tick` advances exactly one frame and publishes a `FrameMetrics`
-//! snapshot. `main` either runs it inline (`--no-ui`) or on a dedicated thread
-//! so the iced dashboard never blocks the camera.
+//! `Pipeline::run` splits the frame loop into three stages on three threads:
+//!
+//! * **capture** reads the webcam and pushes the frame into a capacity-1 channel.
+//!   When inference is behind, the queued frame is dropped rather than making the
+//!   pipeline work on stale pixels.
+//! * **inference** is the pipeline thread: tracker -> strategy -> event bus, plus
+//!   the `FrameMetrics` publish the dashboard reads.
+//! * **sinks** drain the event bus and talk to the audio/MIDI outputs, so a
+//!   blocking MIDI write cannot stall a frame.
+//!
+//! `Pipeline::tick` is the same frame driven single-threaded, which is what the
+//! tests and any headless one-shot use.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use opencv::prelude::*;
 
 use crate::core::event_bus::EventBus;
@@ -25,14 +34,52 @@ use crate::vision::tracker::HandTracker;
 const MOCK_CADENCE_MS: u64 = 33;
 /// How often the paused loop checks the Start/Stop flag and refreshes the UI.
 const PAUSE_POLL_MS: u64 = 50;
+/// How long inference waits for the capture stage before re-checking the flags.
+const FRAME_POLL_MS: u64 = 20;
+/// How often the sink thread wakes up to look for an event or a shutdown.
+const SINK_POLL_MS: u64 = 20;
+
+/// A frame handed from the capture stage to inference.
+struct CapturedFrame {
+    frame: Mat,
+    /// Wall clock the pixels came off the camera, so end-to-end latency is known.
+    captured_at: Instant,
+    /// Time the capture stage spent reading them.
+    capture_ms: f64,
+}
+
+/// One frame's worth of work, split by stage so the dashboard can show camera
+/// time and inference time separately instead of one conflated number.
+struct FrameOutcome {
+    detection: HandDetectionResult,
+    frame: Option<Mat>,
+    capture_ms: f64,
+    inference_ms: f64,
+    latency_ms: f64,
+}
+
+#[derive(Default)]
+struct CaptureCounters {
+    captured: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// The output sinks, shared between the pipeline thread (which only pushes an
+/// instrument change) and the sink thread (which drives them).
+type SinkList = Arc<Mutex<Vec<Box<dyn Sink>>>>;
 
 pub struct Pipeline {
     camera: Option<WebcamSource>,
     tracker: Option<HandTracker>,
     strategy: Box<dyn Strategy>,
-    sinks: Vec<Box<dyn Sink>>,
+    /// Shared with the sink thread, which is the only thing that writes to the
+    /// outputs; the pipeline thread touches them only when the instrument changes.
+    sinks: SinkList,
     event_bus: EventBus,
-    event_rx: Receiver<GestureEvent>,
+    /// Drained by whoever owns it: the pipeline thread while running inline, the
+    /// sink thread once `run` has spawned it. Exactly one consumer, so events reach
+    /// the sinks in the order they were dispatched.
+    event_rx: Option<Receiver<GestureEvent>>,
     shared: Arc<Mutex<FrameMetrics>>,
     /// The instrument the player is currently on. The dashboard pickers write
     /// to it; the pipeline notices the version change and re-keys the strategy
@@ -45,11 +92,19 @@ pub struct Pipeline {
     applied_version: u64,
     metrics: FrameMetrics,
     previous_landmarks: Vec<Landmark>,
+    /// Frames the capture stage read and dropped, so a bottleneck is visible
+    /// instead of invisible.
+    capture: Arc<CaptureCounters>,
     /// True while a gesture is actively driving the sinks. Used to send exactly
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
     gesture_active: bool,
     last_detection: Instant,
+    /// Wall clock of the last published frame; the fps is derived from the gap
+    /// between publishes, which stays honest once the stages overlap.
+    last_publish: Instant,
+    /// Exponentially smoothed publish interval, in milliseconds.
+    avg_gap_ms: f64,
     started: Instant,
     max_frames: Option<u32>,
     debug: bool,
@@ -68,9 +123,9 @@ pub struct PipelineConfig {
     pub camera: Option<WebcamSource>,
     pub tracker: Option<HandTracker>,
     pub strategy: Box<dyn Strategy>,
-    pub sinks: Vec<Box<dyn Sink>>,
+    pub sinks: Arc<Mutex<Vec<Box<dyn Sink>>>>,
     pub event_bus: EventBus,
-    pub event_rx: Receiver<GestureEvent>,
+    pub event_rx: Option<Receiver<GestureEvent>>,
     pub shared: Arc<Mutex<FrameMetrics>>,
     pub instrument: Arc<Mutex<InstrumentConfig>>,
     pub active: Arc<AtomicBool>,
@@ -125,8 +180,11 @@ impl Pipeline {
             applied_version: u64::MAX,
             metrics: context,
             previous_landmarks: Vec::new(),
+            capture: Arc::new(CaptureCounters::default()),
             gesture_active: false,
             last_detection: Instant::now(),
+            last_publish: Instant::now(),
+            avg_gap_ms: 0.0,
             started: Instant::now(),
             max_frames,
             debug,
@@ -149,8 +207,10 @@ impl Pipeline {
         self.applied_version = config.version;
 
         self.strategy.apply_layout(config.layout.clone());
-        for sink in &mut self.sinks {
-            sink.set_waveform(config.waveform);
+        if let Ok(mut sinks) = self.sinks.lock() {
+            for sink in sinks.iter_mut() {
+                sink.set_waveform(config.waveform);
+            }
         }
         self.metrics.scale = config.scale.name.to_string();
         self.metrics.root = config.root_name.clone();
@@ -172,7 +232,62 @@ impl Pipeline {
     /// Runs until the UI asks for shutdown or `--max-frames` is reached. The
     /// `active` flag (the dashboard's Stop button) pauses the loop without
     /// tearing down the camera or the sinks.
-    pub fn run(&mut self, running: &AtomicBool) -> Result<()> {
+    pub fn run(&mut self, running: &Arc<AtomicBool>) -> Result<()> {
+        // Stage 1: the camera, on its own thread. The channel holds a single frame,
+        // so inference always takes the newest one instead of queueing up behind
+        // its own latency and drifting away from the live view.
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded(1);
+        let capture_handle = self.camera.take().map(|mut camera| {
+            let tx = frame_tx.clone();
+            let running = running.clone();
+            let active = self.active.clone();
+            let counters = self.capture.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = capture_frames(
+                    &mut || camera.get_frame(),
+                    &tx,
+                    &active,
+                    &running,
+                    &counters,
+                ) {
+                    eprintln!("[Capture] {e}");
+                }
+            })
+        });
+        drop(frame_tx); // closing the sender ends inference when capture exits
+
+        // Stage 3: the sinks. A blocking MIDI write, or any sink that hiccups, no
+        // longer holds the frame loop hostage.
+        let sink_handle = {
+            let sinks = self.sinks.clone();
+            let running = running.clone();
+            let debug = self.debug;
+            let rx = self.event_rx.take();
+            std::thread::spawn(move || {
+                let Some(rx) = rx else {
+                    return;
+                };
+                while running.load(Ordering::Relaxed) {
+                    match rx.recv_timeout(Duration::from_millis(SINK_POLL_MS)) {
+                        Ok(event) => apply_to_sinks(&sinks, &event, debug),
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                // Flush whatever was dispatched on the way out, then close the outputs.
+                while let Ok(event) = rx.try_recv() {
+                    apply_to_sinks(&sinks, &event, debug);
+                }
+                if let Ok(mut sinks) = sinks.lock() {
+                    for sink in sinks.iter_mut() {
+                        let _ = sink.stop();
+                    }
+                }
+            })
+        };
+
+        // Stage 2: this thread.
+        let mock = self.tracker.is_none();
         while running.load(Ordering::Relaxed) {
             if !self.active.load(Ordering::Relaxed) {
                 // Still honour picker changes while stopped, so the header and the
@@ -183,8 +298,36 @@ impl Pipeline {
                 continue;
             }
 
-            if !self.tick()? {
-                break;
+            if mock {
+                // Mock mode has no camera, so `tick` drives the frame itself and
+                // paces it like a 30 fps one to keep the telemetry realistic.
+                if !self.tick()? {
+                    break;
+                }
+            } else {
+                let outcome = match frame_rx.recv_timeout(Duration::from_millis(FRAME_POLL_MS)) {
+                    Ok(captured) => {
+                        let inference_start = Instant::now();
+                        let latency_ms =
+                            inference_start.duration_since(captured.captured_at).as_secs_f64() * 1000.0;
+                        let Some(tracker) = self.tracker.as_mut() else {
+                            break;
+                        };
+                        let detection = tracker.process_frame(&captured.frame)?;
+                        FrameOutcome {
+                            detection,
+                            frame: Some(captured.frame),
+                            capture_ms: captured.capture_ms,
+                            inference_ms: inference_start.elapsed().as_secs_f64() * 1000.0,
+                            latency_ms,
+                        }
+                    }
+                    // Capture is behind; re-check the Start/Stop flag and try again.
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    // The capture stage stopped: the camera is gone.
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                self.advance(outcome)?;
             }
             if self
                 .max_frames
@@ -194,9 +337,25 @@ impl Pipeline {
             }
         }
 
-        for sink in &mut self.sinks {
-            let _ = sink.stop();
+        if self.debug {
+            let frames = self.metrics.frames.max(1);
+            println!(
+                "[Pipeline] {} frames in {:.2} s: {:.1} fps, {:.2} ms/frame end to end (capture {:.2} ms, inference {:.2} ms, {} frames dropped)",
+                self.metrics.frames,
+                self.metrics.uptime_ms as f64 / 1000.0,
+                self.metrics.fps,
+                self.metrics.uptime_ms as f64 / frames as f64,
+                self.metrics.capture_ms,
+                self.metrics.frame_ms,
+                self.metrics.dropped,
+            );
         }
+
+        running.store(false, Ordering::Relaxed);
+        if let Some(handle) = capture_handle {
+            let _ = handle.join();
+        }
+        let _ = sink_handle.join();
         Ok(())
     }
 
@@ -208,11 +367,11 @@ impl Pipeline {
             self.gesture_active = false;
             self.event_bus.dispatch(GestureEvent::no_gesture());
         }
-        while let Ok(event) = self.event_rx.try_recv() {
-            for sink in &mut self.sinks {
-                let _ = sink.handle_event(&event);
-            }
+        if let Some(rx) = &self.event_rx {
+            drain_events(rx, &self.sinks, self.debug);
         }
+        // Otherwise the stopped interval shows up as a huge fps dip on resume.
+        self.last_publish = Instant::now();
 
         if self.metrics.paused {
             return;
@@ -233,55 +392,110 @@ impl Pipeline {
     }
 
     /// One camera frame end to end. Returns `false` when the camera is gone.
+    ///
+    /// This is the single-threaded path: it captures, infers and publishes. The
+    /// staged `run` loop does the same thing with the camera and the sinks on their
+    /// own threads.
     pub fn tick(&mut self) -> Result<bool> {
-        self.sync_instrument();
-        // Mock mode has no camera, so pace it like one to keep the telemetry
-        // (fps, jitter, history) realistic.
         if self.camera.is_none() {
+            // Mock mode has no camera, so pace it like one to keep the telemetry
+            // (fps, jitter, history) realistic.
             std::thread::sleep(Duration::from_millis(MOCK_CADENCE_MS));
+            self.advance(FrameOutcome {
+                detection: synthetic_detection(self.started.elapsed().as_secs_f64()),
+                frame: None,
+                capture_ms: 0.0,
+                inference_ms: 0.0,
+                latency_ms: 0.0,
+            })?;
+            return Ok(true);
         }
+
+        let outcome = {
+            let Some(camera) = self.camera.as_mut() else {
+                return Ok(false);
+            };
+            let capture_start = Instant::now();
+            let frame = match camera.get_frame() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("[Pipeline] camera frame failed: {e}");
+                    }
+                    return Ok(false);
+                }
+            };
+            let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
+            let Some(tracker) = self.tracker.as_mut() else {
+                return Ok(false);
+            };
+            let inference_start = Instant::now();
+            let detection = tracker.process_frame(&frame)?;
+            FrameOutcome {
+                detection,
+                frame: Some(frame),
+                capture_ms,
+                inference_ms: inference_start.elapsed().as_secs_f64() * 1000.0,
+                latency_ms: 0.0,
+            }
+        };
+
+        self.advance(outcome)?;
+        Ok(true)
+    }
+
+    /// Everything that happens to a frame once the tracker has returned: the
+    /// instrument sync, metrics, the gesture dispatch, and the publish.
+    ///
+    /// The instrument check lives here rather than in `tick` so it happens on
+    /// every frame whichever stage produced it - the staged `run` loop never goes
+    /// through `tick`, and a picker change that never reaches the strategy or the
+    /// sinks is invisible except by ear.
+    fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
+        self.sync_instrument();
+        let FrameOutcome {
+            detection,
+            frame,
+            capture_ms,
+            inference_ms,
+            latency_ms,
+        } = outcome;
+
+        let now = Instant::now();
+        let gap_ms = now.duration_since(self.last_publish).as_secs_f64() * 1000.0;
+        self.last_publish = now;
+
+        // Smooth the *interval*, not the reciprocal rate. With the stages
+        // overlapping, individual gaps alternate between a queued frame (a
+        // millisecond) and a full inference, and an EMA of fps turns that jitter
+        // into a number that bears no relation to the frame rate.
+        self.avg_gap_ms = if self.avg_gap_ms == 0.0 {
+            gap_ms
+        } else {
+            0.9 * self.avg_gap_ms + 0.1 * gap_ms
+        };
+        self.metrics.fps = (1000.0 / self.avg_gap_ms.max(1.0)) as f32;
 
         self.metrics.frames += 1;
         self.metrics.uptime_ms = self.started.elapsed().as_millis() as u64;
         self.metrics.frame_id = self.metrics.frames;
         self.metrics.paused = false;
+        self.metrics.frame_size = detection.frame_size;
+        self.metrics.frame_ms = inference_ms;
+        self.metrics.capture_ms = capture_ms;
+        self.metrics.latency_ms = latency_ms;
+        self.metrics.captured = self.capture.captured.load(Ordering::Relaxed);
+        self.metrics.dropped = self.capture.dropped.load(Ordering::Relaxed);
 
-        let frame_start = Instant::now();
-
-        let detection = match (&mut self.camera, &mut self.tracker) {
-            (Some(camera), Some(tracker)) => {
-                let frame = match camera.get_frame() {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        if self.debug {
-                            eprintln!("[Pipeline] camera frame failed: {e}");
-                        }
-                        return Ok(false);
-                    }
-                };
-                self.metrics.frame_size = (frame.cols() as usize, frame.rows() as usize);
-                if should_upload_feed(self.emit_frames, &self.feed_wanted) {
-                    self.metrics.frame_pixels = frame_to_rgba(&frame);
-                } else {
-                    // Keep the shared snapshot free of pixels the UI will discard.
-                    self.metrics.frame_pixels.clear();
-                }
-                tracker.process_frame(&frame)?
+        if let Some(frame) = frame.as_ref() {
+            if should_upload_feed(self.emit_frames, &self.feed_wanted) {
+                self.metrics.frame_pixels = frame_to_rgba(frame);
+            } else {
+                // Keep the shared snapshot free of pixels the UI will discard.
+                self.metrics.frame_pixels.clear();
             }
-            _ => {
-                self.metrics.frame_size = (640, 480);
-                synthetic_detection(self.started.elapsed().as_secs_f64())
-            }
-        };
+        }
 
-        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        let instantaneous_fps = (1000.0 / frame_ms.max(1e-6)) as f32;
-        self.metrics.frame_ms = frame_ms;
-        self.metrics.fps = if self.metrics.fps == 0.0 {
-            instantaneous_fps
-        } else {
-            0.9 * self.metrics.fps + 0.1 * instantaneous_fps
-        };
         self.metrics.detector_us = detection.timings.detector_us;
         self.metrics.landmarker_us = detection.timings.landmarker_us;
 
@@ -348,6 +562,7 @@ impl Pipeline {
                 }
             }
             self.gesture_active = true;
+            self.push_log(&event);
             self.event_bus.dispatch(event);
         } else {
             self.metrics.note = None;
@@ -357,19 +572,15 @@ impl Pipeline {
             if self.gesture_active {
                 let release = GestureEvent::no_gesture();
                 self.gesture_active = false;
+                self.push_log(&release);
                 self.event_bus.dispatch(release);
             }
         }
 
-        while let Ok(event) = self.event_rx.try_recv() {
-            for sink in &mut self.sinks {
-                if let Err(e) = sink.handle_event(&event) {
-                    if self.debug {
-                        eprintln!("[Pipeline] sink error: {e}");
-                    }
-                }
-            }
-            self.push_log(&event);
+        // Inline mode: this thread still owns the receiver. Once `run` has spawned
+        // the sink thread it is gone, and that stage is the only consumer.
+        if let Some(rx) = &self.event_rx {
+            drain_events(rx, &self.sinks, self.debug);
         }
 
         if let Ok(mut shared) = self.shared.lock() {
@@ -378,9 +589,12 @@ impl Pipeline {
 
         if self.debug && self.metrics.frames.is_multiple_of(10) {
             println!(
-                "[Pipeline] fps {:.1} frame {:.2} ms (detector {:.0} us, landmarker {:.0} us) conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
+                "[Pipeline] fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} note {:?} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
                 self.metrics.fps,
                 self.metrics.frame_ms,
+                self.metrics.capture_ms,
+                self.metrics.latency_ms,
+                self.metrics.dropped,
                 self.metrics.detector_us,
                 self.metrics.landmarker_us,
                 self.metrics.confidence,
@@ -393,7 +607,7 @@ impl Pipeline {
             );
         }
 
-        Ok(true)
+        Ok(())
     }
 
     fn push_log(&mut self, event: &GestureEvent) {
@@ -423,6 +637,57 @@ impl Pipeline {
             text: event.text.clone(),
             detail,
         });
+    }
+}
+
+/// Read frames from the camera and queue them for inference.
+///
+/// The channel holds one frame. If inference is still busy with the previous one,
+/// the new frame is dropped and counted rather than letting the pipeline drift
+/// behind the camera, working on pixels that are already stale.
+fn capture_frames(
+    mut read: impl FnMut() -> Result<Mat>,
+    tx: &Sender<CapturedFrame>,
+    active: &AtomicBool,
+    running: &AtomicBool,
+    counters: &CaptureCounters,
+) -> Result<()> {
+    while running.load(Ordering::Relaxed) {
+        if !active.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
+            continue;
+        }
+        let start = Instant::now();
+        let frame = read()?;
+        counters.captured.fetch_add(1, Ordering::Relaxed);
+        let captured = CapturedFrame {
+            frame,
+            captured_at: Instant::now(),
+            capture_ms: start.elapsed().as_secs_f64() * 1000.0,
+        };
+        if tx.try_send(captured).is_err() {
+            counters.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
+fn apply_to_sinks(sinks: &SinkList, event: &GestureEvent, debug: bool) {
+    let Ok(mut sinks) = sinks.lock() else {
+        return;
+    };
+    for sink in sinks.iter_mut() {
+        if let Err(e) = sink.handle_event(event) {
+            if debug {
+                eprintln!("[Sink] {e}");
+            }
+        }
+    }
+}
+
+fn drain_events(rx: &Receiver<GestureEvent>, sinks: &SinkList, debug: bool) {
+    while let Ok(event) = rx.try_recv() {
+        apply_to_sinks(sinks, &event, debug);
     }
 }
 
@@ -584,6 +849,9 @@ mod tests {
     #[derive(Clone)]
     struct RecordingSink {
         events: Arc<Mutex<Vec<GestureEvent>>>,
+        /// Timbres the pipeline pushed into the sinks, in order. Without this the
+        /// picker wiring is only audible, not testable.
+        waveforms: Arc<Mutex<Vec<String>>>,
     }
 
     impl Sink for RecordingSink {
@@ -596,6 +864,9 @@ mod tests {
         fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
+        }
+        fn set_waveform(&mut self, waveform: Waveform) {
+            self.waveforms.lock().unwrap().push(waveform.name().to_string());
         }
     }
 
@@ -628,28 +899,36 @@ mod tests {
 
     fn test_pipeline(
         strategy: Box<dyn Strategy>,
-    ) -> (Pipeline, Arc<Mutex<Vec<GestureEvent>>>, Arc<Mutex<InstrumentConfig>>) {
+        max_frames: Option<u32>,
+    ) -> (
+        Pipeline,
+        Arc<Mutex<Vec<GestureEvent>>>,
+        Arc<Mutex<InstrumentConfig>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let (bus, rx) = EventBus::new();
         let events = Arc::new(Mutex::new(Vec::new()));
+        let waveforms = Arc::new(Mutex::new(Vec::new()));
         let instrument = Arc::new(Mutex::new(InstrumentConfig::default()));
         let pipeline = Pipeline::new(PipelineConfig {
             camera: None,
             tracker: None,
             strategy,
-            sinks: vec![Box::new(RecordingSink {
+            sinks: Arc::new(Mutex::new(vec![Box::new(RecordingSink {
                 events: events.clone(),
-            })],
+                waveforms: waveforms.clone(),
+            })])),
             event_bus: bus,
-            event_rx: rx,
+            event_rx: Some(rx),
             shared: Arc::new(Mutex::new(FrameMetrics::default())),
             instrument: instrument.clone(),
             active: Arc::new(AtomicBool::new(true)),
             feed_wanted: Arc::new(AtomicBool::new(false)),
-            max_frames: None,
+            max_frames,
             debug: false,
             emit_frames: false,
         });
-        (pipeline, events, instrument)
+        (pipeline, events, instrument, waveforms)
     }
 
     #[test]
@@ -677,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_picker_change_rekeys_the_keyboard_on_the_next_frame() {
-        let (mut pipeline, events, instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()));
+        let (mut pipeline, events, instrument, _waveforms) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.tick().unwrap();
         assert_eq!(pipeline.metrics.layout.len(), 15, "the default grid is 3 x 5");
         assert_eq!(pipeline.metrics.scale, "major pentatonic");
@@ -707,7 +986,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_config_does_not_rebuild_every_frame() {
-        let (mut pipeline, _events, _instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()));
+        let (mut pipeline, _events, _instrument, _waveforms) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.sync_instrument();
         let version = pipeline.applied_version;
         pipeline.sync_instrument();
@@ -739,9 +1018,9 @@ mod tests {
             camera: None,
             tracker: None,
             strategy: Box::new(AlwaysOn),
-            sinks: Vec::new(),
+            sinks: Arc::new(Mutex::new(Vec::new())),
             event_bus: bus,
-            event_rx: rx,
+            event_rx: Some(rx),
             shared: shared.clone(),
             instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
             active: Arc::new(AtomicBool::new(true)),
@@ -762,7 +1041,7 @@ mod tests {
 
     #[test]
     fn pausing_releases_the_note_and_marks_the_snapshot() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(AlwaysOn));
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), None);
 
         // With no camera the pipeline synthesises a hand, so the strategy fires.
         pipeline.tick().unwrap();
@@ -782,9 +1061,9 @@ mod tests {
 
     #[test]
     fn a_release_event_is_sent_when_the_gesture_ends() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(true),
-        }));
+        }), None);
 
         pipeline.tick().unwrap(); // hand present -> note
         pipeline.tick().unwrap(); // hand gone   -> release
@@ -810,13 +1089,133 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_while_no_gesture_has_started() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(false),
-        }));
+        }), None);
         pipeline.tick().unwrap();
         pipeline.tick().unwrap();
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(pipeline.metrics.volume, 0.0);
         assert!(!pipeline.gesture_active);
+    }
+
+    #[test]
+    fn the_capture_stage_keeps_only_the_newest_frame() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let counters = Arc::new(CaptureCounters::default());
+        let running = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(AtomicBool::new(true));
+
+        let mut produced = 0;
+        let mut read = || -> Result<Mat> {
+            produced += 1;
+            if produced >= 5 {
+                running.store(false, Ordering::Relaxed);
+            }
+            Ok(Mat::new_rows_cols_with_default(
+                4,
+                4,
+                opencv::core::CV_8UC3,
+                opencv::core::Scalar::all(7.0),
+            )
+            .unwrap())
+        };
+
+        capture_frames(&mut read, &tx, &active, &running, &counters).unwrap();
+
+        assert_eq!(counters.captured.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            counters.dropped.load(Ordering::Relaxed),
+            4,
+            "a frame inference has not reached yet is dropped, not queued"
+        );
+        assert!(rx.try_recv().is_ok(), "inference always gets the newest frame");
+    }
+
+    #[test]
+    fn a_paused_capture_stage_reads_no_frames() {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let counters = Arc::new(CaptureCounters::default());
+        let running = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(AtomicBool::new(false));
+
+        // The loop would otherwise sleep on the Stop flag forever.
+        let stop = running.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            stop.store(false, Ordering::Relaxed);
+        });
+
+        let mut produced = 0;
+        let mut read = || -> Result<Mat> {
+            produced += 1;
+            Ok(Mat::new_rows_cols_with_default(
+                2,
+                2,
+                opencv::core::CV_8UC3,
+                opencv::core::Scalar::all(0.0),
+            )
+            .unwrap())
+        };
+
+        capture_frames(&mut read, &tx, &active, &running, &counters).unwrap();
+        assert_eq!(produced, 0, "Stop means the camera is not read at all");
+        assert_eq!(counters.captured.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_picker_change_reaches_the_sinks_while_the_loop_is_running() {
+        let (mut pipeline, _events, instrument, waveforms) = test_pipeline(Box::new(AlwaysOn), Some(8));
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Change the timbre mid-run, exactly as clicking the picker does.
+        let late = instrument.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            late.lock().unwrap().set_waveform(Waveform::Square);
+        });
+
+        pipeline.run(&running).unwrap();
+
+        let applied = waveforms.lock().unwrap().clone();
+        assert!(
+            applied.iter().any(|w| w == "square"),
+            "the pipeline must push a picker change into the sinks, got {applied:?}"
+        );
+        assert_eq!(pipeline.metrics.waveform, "square", "the header shows the timbre in use");
+    }
+
+    #[test]
+    fn fps_is_the_publish_cadence_not_the_stage_times() {
+        // Mock mode paces itself at ~30 fps and does no inference at all, so a
+        // frame-rate read off the stage durations would report infinity.
+        let (mut pipeline, _events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), Some(20));
+        let running = Arc::new(AtomicBool::new(true));
+        pipeline.run(&running).unwrap();
+
+        assert!(pipeline.metrics.frames >= 15, "the loop ran to the frame limit");
+        assert!(
+            pipeline.metrics.fps > 20.0 && pipeline.metrics.fps < 45.0,
+            "fps tracks the frames per second, got {}",
+            pipeline.metrics.fps
+        );
+    }
+
+    #[test]
+    fn the_staged_run_terminates_and_the_sink_thread_flushes_every_event() {
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), Some(3));
+        let running = Arc::new(AtomicBool::new(true));
+
+        pipeline.run(&running).unwrap();
+
+        assert_eq!(pipeline.metrics.frames, 3, "--max-frames stops the frame loop");
+        assert!(pipeline.metrics.detector_us == 0.0, "mock mode runs no model");
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            3,
+            "events dispatched by inference reach the sinks on their own thread"
+        );
+        assert!(!running.load(Ordering::Relaxed), "run clears the flag on exit");
     }
 }
