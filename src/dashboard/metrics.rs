@@ -89,10 +89,18 @@ pub struct FrameMetrics {
 
     // --- performance ---
     pub fps: f32,
+    /// Time inference spent on the frame that produced this snapshot.
     pub frame_ms: f64,
+    /// Time the capture stage spent reading that frame from the camera.
+    pub capture_ms: f64,
+    /// Wall-clock gap between the frame leaving the camera and being published.
+    pub latency_ms: f64,
     pub detector_us: f64,
     pub landmarker_us: f64,
     pub frames: u64,
+    /// Frames the camera produced, and the ones inference could not keep up with.
+    pub captured: u64,
+    pub dropped: u64,
     pub uptime_ms: u64,
 
     // --- context ---
