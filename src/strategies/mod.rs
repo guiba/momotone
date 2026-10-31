@@ -131,7 +131,7 @@ impl Strategy for FingerPositionStrategy {
 mod tests {
     use super::*;
     use crate::core::types::GesturePayload;
-    use crate::core::{HandDetectionResult, Landmark, NOTE_HIGH, NOTE_LOW};
+    use crate::core::{HandDetectionResult, Landmark};
 
     /// A detection with a 200x200 hand box and a fixed landmark layout; only the
     /// thumb tip x coordinate changes, i.e. the thumb/index spread.
