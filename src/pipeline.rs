@@ -397,8 +397,6 @@ impl Pipeline {
     /// staged `run` loop does the same thing with the camera and the sinks on their
     /// own threads.
     pub fn tick(&mut self) -> Result<bool> {
-        self.sync_instrument();
-
         if self.camera.is_none() {
             // Mock mode has no camera, so pace it like one to keep the telemetry
             // (fps, jitter, history) realistic.
@@ -446,9 +444,15 @@ impl Pipeline {
         Ok(true)
     }
 
-    /// Everything that happens to a frame once the tracker has returned: metrics,
-    /// the gesture dispatch, and the publish.
+    /// Everything that happens to a frame once the tracker has returned: the
+    /// instrument sync, metrics, the gesture dispatch, and the publish.
+    ///
+    /// The instrument check lives here rather than in `tick` so it happens on
+    /// every frame whichever stage produced it - the staged `run` loop never goes
+    /// through `tick`, and a picker change that never reaches the strategy or the
+    /// sinks is invisible except by ear.
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
+        self.sync_instrument();
         let FrameOutcome {
             detection,
             frame,
@@ -845,6 +849,9 @@ mod tests {
     #[derive(Clone)]
     struct RecordingSink {
         events: Arc<Mutex<Vec<GestureEvent>>>,
+        /// Timbres the pipeline pushed into the sinks, in order. Without this the
+        /// picker wiring is only audible, not testable.
+        waveforms: Arc<Mutex<Vec<String>>>,
     }
 
     impl Sink for RecordingSink {
@@ -857,6 +864,9 @@ mod tests {
         fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
+        }
+        fn set_waveform(&mut self, waveform: Waveform) {
+            self.waveforms.lock().unwrap().push(waveform.name().to_string());
         }
     }
 
@@ -890,9 +900,15 @@ mod tests {
     fn test_pipeline(
         strategy: Box<dyn Strategy>,
         max_frames: Option<u32>,
-    ) -> (Pipeline, Arc<Mutex<Vec<GestureEvent>>>, Arc<Mutex<InstrumentConfig>>) {
+    ) -> (
+        Pipeline,
+        Arc<Mutex<Vec<GestureEvent>>>,
+        Arc<Mutex<InstrumentConfig>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let (bus, rx) = EventBus::new();
         let events = Arc::new(Mutex::new(Vec::new()));
+        let waveforms = Arc::new(Mutex::new(Vec::new()));
         let instrument = Arc::new(Mutex::new(InstrumentConfig::default()));
         let pipeline = Pipeline::new(PipelineConfig {
             camera: None,
@@ -900,6 +916,7 @@ mod tests {
             strategy,
             sinks: Arc::new(Mutex::new(vec![Box::new(RecordingSink {
                 events: events.clone(),
+                waveforms: waveforms.clone(),
             })])),
             event_bus: bus,
             event_rx: Some(rx),
@@ -911,7 +928,7 @@ mod tests {
             debug: false,
             emit_frames: false,
         });
-        (pipeline, events, instrument)
+        (pipeline, events, instrument, waveforms)
     }
 
     #[test]
@@ -939,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_picker_change_rekeys_the_keyboard_on_the_next_frame() {
-        let (mut pipeline, events, instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
+        let (mut pipeline, events, instrument, _waveforms) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.tick().unwrap();
         assert_eq!(pipeline.metrics.layout.len(), 15, "the default grid is 3 x 5");
         assert_eq!(pipeline.metrics.scale, "major pentatonic");
@@ -969,7 +986,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_config_does_not_rebuild_every_frame() {
-        let (mut pipeline, _events, _instrument) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
+        let (mut pipeline, _events, _instrument, _waveforms) = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.sync_instrument();
         let version = pipeline.applied_version;
         pipeline.sync_instrument();
@@ -1024,7 +1041,7 @@ mod tests {
 
     #[test]
     fn pausing_releases_the_note_and_marks_the_snapshot() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(AlwaysOn), None);
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), None);
 
         // With no camera the pipeline synthesises a hand, so the strategy fires.
         pipeline.tick().unwrap();
@@ -1044,7 +1061,7 @@ mod tests {
 
     #[test]
     fn a_release_event_is_sent_when_the_gesture_ends() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(true),
         }), None);
 
@@ -1072,7 +1089,7 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_while_no_gesture_has_started() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(FirstFrameOnly {
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(FirstFrameOnly {
             armed: AtomicBool::new(false),
         }), None);
         pipeline.tick().unwrap();
@@ -1147,10 +1164,32 @@ mod tests {
     }
 
     #[test]
+    fn a_picker_change_reaches_the_sinks_while_the_loop_is_running() {
+        let (mut pipeline, _events, instrument, waveforms) = test_pipeline(Box::new(AlwaysOn), Some(8));
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Change the timbre mid-run, exactly as clicking the picker does.
+        let late = instrument.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            late.lock().unwrap().set_waveform(Waveform::Square);
+        });
+
+        pipeline.run(&running).unwrap();
+
+        let applied = waveforms.lock().unwrap().clone();
+        assert!(
+            applied.iter().any(|w| w == "square"),
+            "the pipeline must push a picker change into the sinks, got {applied:?}"
+        );
+        assert_eq!(pipeline.metrics.waveform, "square", "the header shows the timbre in use");
+    }
+
+    #[test]
     fn fps_is_the_publish_cadence_not_the_stage_times() {
         // Mock mode paces itself at ~30 fps and does no inference at all, so a
         // frame-rate read off the stage durations would report infinity.
-        let (mut pipeline, _events, _instrument) = test_pipeline(Box::new(AlwaysOn), Some(20));
+        let (mut pipeline, _events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), Some(20));
         let running = Arc::new(AtomicBool::new(true));
         pipeline.run(&running).unwrap();
 
@@ -1164,7 +1203,7 @@ mod tests {
 
     #[test]
     fn the_staged_run_terminates_and_the_sink_thread_flushes_every_event() {
-        let (mut pipeline, events, _instrument) = test_pipeline(Box::new(AlwaysOn), Some(3));
+        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(Box::new(AlwaysOn), Some(3));
         let running = Arc::new(AtomicBool::new(true));
 
         pipeline.run(&running).unwrap();
