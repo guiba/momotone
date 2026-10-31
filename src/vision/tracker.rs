@@ -1,19 +1,27 @@
-//! Two-stage hand tracking: BlazeHand detector (192x192) + landmarker (224x224).
+//! Hand tracking, in two backends.
 //!
-//! The detector returns an axis-aligned hand box which is turned into a
-//! rectangle in frame pixel coordinates; the landmarker stage only runs once a
-//! confident box is found. The tracker only computes geometry - all drawing is
-//! handled by `crate::visualizer`.
+//! `HandTracker` is what the pipeline holds; it dispatches to either
+//! `MediaPipeTracker` - the two-stage BlazeHand palm detector (192x192) plus
+//! landmarker (224x224) - or `YoloPoseTracker`, one Ultralytics pose graph that
+//! returns the hand box and the 21 keypoints in a single pass.
+//!
+//! Both produce the same `HandDetectionResult`, so the strategies, the dashboard and
+//! the sinks do not care which one is running. Trackers only compute geometry; all
+//! drawing lives in `crate::visualizer`.
 
 use anyhow::{anyhow, Context, Result};
 use opencv::prelude::*;
-use opencv::{core, imgproc};
 use std::time::Instant;
 
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::core::{HandDetectionResult, Landmark, StageTimings};
+use crate::core::HandDetectionResult;
+use crate::core::Landmark;
+use crate::core::StageTimings;
+use crate::vision::reuse::ReuseCache;
+use crate::vision::sampling::{Affine, StageInput, TensorLayout, sample_affine_to_tensor};
+use crate::vision::yolo_pose::YoloPoseTracker;
 
 const NUM_KEYPOINTS: usize = 21;
 const DETECTOR_INPUT: usize = 192;
@@ -30,201 +38,55 @@ const ROI_STALE_FRAMES: u32 = 10;
 /// keeps the window steady against landmark jitter.
 const ROI_ANCHOR_WEIGHT: f64 = 0.3;
 
-/// Landmark reuse: a palm that has not moved produces the same 224x224 crop, so
-/// the landmarker can be skipped and its previous keypoints reused. A palm may
-/// drift by this many pixels (and this much of its size) and still count as
-/// stationary.
-const LANDMARKER_REUSE_MOVE_PX: f64 = 3.0;
-const LANDMARKER_REUSE_SIZE_TOL: f64 = 0.03;
-/// Never reuse for more than this many consecutive frames: hand *shape* can
-/// change while the palm stays put, and volume is read from the fingertips.
-const LANDMARKER_REUSE_MAX_FRAMES: u32 = 3;
-
-const INV_255: f32 = 1.0 / 255.0;
-
-/// Affine mapping from output (model) pixels to frame pixels:
-/// `frame_x = m00 * out_x + m01 * out_y + tx`, and the same for y.
-#[derive(Clone, Copy, Debug)]
-struct Affine {
-    m00: f64,
-    m01: f64,
-    tx: f64,
-    m10: f64,
-    m11: f64,
-    ty: f64,
+/// The tracker the pipeline talks to, whichever backend the run asked for.
+pub enum HandTracker {
+    MediaPipe(Box<MediaPipeTracker>),
+    YoloPose(Box<YoloPoseTracker>),
 }
 
-impl Affine {
-    /// Axis-aligned mapping: one output pixel covers `scale` frame pixels, starting
-    /// at (tx, ty). Both stages use this.
-    fn scale_translate(scale: f64, tx: f64, ty: f64) -> Self {
-        Affine {
-            m00: scale,
-            m01: 0.0,
-            tx,
-            m10: 0.0,
-            m11: scale,
-            ty,
-        }
+impl HandTracker {
+    pub fn mediapipe(
+        detector_path: &str,
+        landmarker_path: &str,
+        anchors_path: &str,
+        score_threshold: f32,
+        debug: bool,
+        reuse_landmarks: bool,
+    ) -> Result<Self> {
+        Ok(Self::MediaPipe(Box::new(MediaPipeTracker::new(
+            detector_path,
+            landmarker_path,
+            anchors_path,
+            score_threshold,
+            debug,
+            reuse_landmarks,
+        )?)))
     }
 
-    fn frame_x(&self, out_x: f64, out_y: f64) -> f64 {
-        self.tx + self.m00 * out_x + self.m01 * out_y
+    pub fn yolo_pose(
+        pose_path: &str,
+        input_size: usize,
+        score_threshold: f32,
+        debug: bool,
+        reuse_landmarks: bool,
+    ) -> Result<Self> {
+        Ok(Self::YoloPose(Box::new(YoloPoseTracker::new(
+            pose_path,
+            input_size,
+            score_threshold,
+            debug,
+            reuse_landmarks,
+        )?)))
     }
 
-    fn frame_y(&self, out_x: f64, out_y: f64) -> f64 {
-        self.ty + self.m10 * out_x + self.m11 * out_y
-    }
-}
-
-/// Scratch buffers for one inference stage, allocated once when the tracker is
-/// built and reused every frame: `warped` is the OpenCV crop output (8UC3), `data`
-/// the model input, (1, out_h, out_w, 3) RGB f32 in [0, 1].
-struct StageInput {
-    warped: Mat,
-    data: Vec<f32>,
-}
-
-impl StageInput {
-    fn new(out_w: usize, out_h: usize) -> Self {
-        StageInput {
-            warped: Mat::default(),
-            data: vec![0.0f32; out_w * out_h * 3],
+    pub fn process_frame(&mut self, frame: &Mat) -> Result<HandDetectionResult> {
+        match self {
+            Self::MediaPipe(tracker) => tracker.process_frame(frame),
+            Self::YoloPose(tracker) => tracker.process_frame(frame),
         }
     }
 }
 
-/// Resample `frame` through `map` (output pixel -> frame pixel) into `stage.data`
-/// as a (1, out_h, out_w, 3) RGB float tensor in [0, 1].
-///
-/// Returns the *effective* mapping that was applied: the `resize` fast path snaps
-/// the crop to whole pixels, so callers must use the returned map (not the one they
-/// passed in) when converting model coordinates back to frame pixels.
-///
-/// OpenCV does all of the sampling: `resize` for the axis-aligned crop both stages
-/// actually need (the common case), `warpAffine` otherwise - which expects the
-/// *forward* frame -> output matrix, i.e. the inverse of the mapping handed in here,
-/// and pads with black outside the frame exactly like the old sampler did. The only
-/// Rust-side work is one bulk BGR -> RGB / u8 -> f32 pass over the reused buffers,
-/// instead of the previous loop that made two `frame.ptr(y)` FFI calls and four
-/// corner loads for every one of the 192x192 / 224x224 pixels.
-fn sample_affine_to_tensor(
-    frame: &Mat,
-    map: Affine,
-    out_w: usize,
-    out_h: usize,
-    stage: &mut StageInput,
-) -> Result<Affine> {
-    if frame.channels() != 3 {
-        return Err(anyhow!(
-            "expected a 3-channel frame, got {}",
-            frame.channels()
-        ));
-    }
-
-    let fw = frame.cols();
-    let fh = frame.rows();
-    let out_size = core::Size::new(out_w as i32, out_h as i32);
-    let applied;
-
-    if map.m01.abs() < 1e-9 && map.m10.abs() < 1e-9 && map.m00 > 0.0 && map.m11 > 0.0 {
-        // Pure scale + translation: crop to whole pixels, then let resize interpolate.
-        // OpenCV reuses `stage.warped`'s buffer as long as the size/type match.
-        let x0 = map.tx.floor() as i32;
-        let y0 = map.ty.floor() as i32;
-        let w = (map.m00 * out_w as f64).round() as i32;
-        let h = (map.m11 * out_h as f64).round() as i32;
-
-        if x0 >= 0 && y0 >= 0 && w > 0 && h > 0 && x0 + w <= fw && y0 + h <= fh {
-            let roi = frame.roi(core::Rect::new(x0, y0, w, h))?;
-            imgproc::resize(
-                &roi,
-                &mut stage.warped,
-                out_size,
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
-            applied = Affine {
-                m00: w as f64 / out_w as f64,
-                m01: 0.0,
-                tx: x0 as f64,
-                m10: 0.0,
-                m11: h as f64 / out_h as f64,
-                ty: y0 as f64,
-            };
-        } else {
-            // Crop runs off the edge of the frame; warpAffine clamps and pads with black.
-            applied = warp_affine(frame, map, out_size, &mut stage.warped)?;
-        }
-    } else {
-        applied = warp_affine(frame, map, out_size, &mut stage.warped)?;
-    }
-
-    let n = out_h * out_w * 3;
-    if stage.data.len() != n {
-        stage.data.resize(n, 0.0);
-    }
-    // Safety: `stage.warped` was just written by resize/warpAffine as a contiguous
-    // out_h x out_w 3-channel u8 matrix (no ROI), and `stage.data` has exactly `n`
-    // f32 elements.
-    unsafe {
-        let src = std::slice::from_raw_parts(stage.warped.data(), n);
-        let dst = stage.data.as_mut_ptr();
-        for i in (0..n).step_by(3) {
-            // BGR -> RGB while normalising, in the same pass.
-            *dst.add(i) = src[i + 2] as f32 * INV_255;
-            *dst.add(i + 1) = src[i + 1] as f32 * INV_255;
-            *dst.add(i + 2) = src[i] as f32 * INV_255;
-        }
-    }
-
-    Ok(applied)
-}
-
-/// Sample `frame` through the inverse of `map` using `warpAffine`, which takes the
-/// forward frame -> output matrix. Returns the mapping that was applied.
-fn warp_affine(frame: &Mat, map: Affine, out_size: core::Size, dst: &mut Mat) -> Result<Affine> {
-    let Affine {
-        m00,
-        m01,
-        tx,
-        m10,
-        m11,
-        ty,
-    } = map;
-    let det = m00 * m11 - m01 * m10;
-    if det.abs() < 1e-12 {
-        return Err(anyhow!("degenerate affine mapping (det = {det})"));
-    }
-    let a11 = m11 / det;
-    let a12 = -m01 / det;
-    let a21 = -m10 / det;
-    let a22 = m00 / det;
-    let fwd = [
-        a11,
-        a12,
-        -(a11 * tx + a12 * ty),
-        a21,
-        a22,
-        -(a21 * tx + a22 * ty),
-    ];
-    // warpAffine insists on a 2x3 matrix.
-    let fwd_mat = Mat::from_slice(&fwd)?;
-    let forward = fwd_mat.reshape(1, 2)?;
-
-    imgproc::warp_affine(
-        frame,
-        dst,
-        &forward,
-        out_size,
-        imgproc::INTER_LINEAR,
-        core::BORDER_CONSTANT,
-        core::Scalar::all(0.0),
-    )?;
-
-    Ok(map)
-}
 
 /// The largest axis-aligned square the detector can take from the frame, slid so
 /// that it contains `palm` (where the hand was last frame). Without history this
@@ -264,7 +126,7 @@ struct PalmBox {
     score: f32,
 }
 
-pub struct HandTrackerImpl {
+pub struct MediaPipeTracker {
     pub detector_session: Session,
     pub landmarker_session: Session,
     /// Anchor centres in normalised detector space (0..1).
@@ -281,75 +143,12 @@ pub struct HandTrackerImpl {
     /// input (see `detector_crop`).
     roi_palm: Option<(f64, f64)>,
     roi_stale: u32,
-    /// Keypoints reused while the palm is stationary (see `LandmarkCache`).
-    landmark_cache: LandmarkCache,
+    /// Keypoints reused while the palm is stationary (see `ReuseCache`).
+    cache: ReuseCache,
 }
 
-/// A palm that has not moved and not changed size produces the same crop, so the
-/// landmarker's output is still valid. The reference palm is deliberately *not*
-/// updated while reuse is active, which bounds the drift to `LANDMARKER_REUSE_MAX_FRAMES`
-/// frames.
-fn palm_is_steady(palm: (f64, f64, f64), previous: Option<(f64, f64, f64)>) -> bool {
-    let Some((previous_x, previous_y, previous_half)) = previous else {
-        return false;
-    };
-    if previous_half <= 0.0 {
-        return false;
-    }
-    (palm.0 - previous_x).abs() < LANDMARKER_REUSE_MOVE_PX
-        && (palm.1 - previous_y).abs() < LANDMARKER_REUSE_MOVE_PX
-        && (palm.2 - previous_half).abs() / previous_half < LANDMARKER_REUSE_SIZE_TOL
-}
 
-/// The state behind that decision: the keypoints of the last landmarker run and
-/// the palm they belong to. Keeping it separate from the ONNX sessions makes it
-/// testable without the models.
-struct LandmarkCache {
-    landmarks: Vec<Landmark>,
-    palm: Option<(f64, f64, f64)>,
-    streak: u32,
-    enabled: bool,
-}
-
-impl LandmarkCache {
-    fn new(enabled: bool) -> Self {
-        LandmarkCache {
-            landmarks: Vec::new(),
-            palm: None,
-            streak: 0,
-            enabled,
-        }
-    }
-
-    /// Keypoints to use for this frame, or `None` when the model has to run.
-    fn reuse(&mut self, palm: (f64, f64, f64)) -> Option<Vec<Landmark>> {
-        if !self.enabled
-            || self.landmarks.is_empty()
-            || self.streak >= LANDMARKER_REUSE_MAX_FRAMES
-            || !palm_is_steady(palm, self.palm)
-        {
-            return None;
-        }
-        self.streak += 1;
-        Some(self.landmarks.clone())
-    }
-
-    fn refresh(&mut self, palm: (f64, f64, f64), landmarks: &[Landmark]) {
-        // clear + extend_from_slice keeps the existing allocation.
-        self.landmarks.clear();
-        self.landmarks.extend_from_slice(landmarks);
-        self.palm = Some(palm);
-        self.streak = 0;
-    }
-
-    fn clear(&mut self) {
-        self.landmarks.clear();
-        self.palm = None;
-        self.streak = 0;
-    }
-}
-
-impl HandTrackerImpl {
+impl MediaPipeTracker {
     pub fn new(
         detector_path: &str,
         landmarker_path: &str,
@@ -387,7 +186,7 @@ impl HandTrackerImpl {
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
             roi_palm: None,
             roi_stale: 0,
-            landmark_cache: LandmarkCache::new(reuse_landmarks),
+            cache: ReuseCache::new(reuse_landmarks),
         })
     }
 
@@ -414,6 +213,8 @@ impl HandTrackerImpl {
             DETECTOR_INPUT,
             DETECTOR_INPUT,
             &mut self.detector_input,
+            TensorLayout::Nhwc,
+            0.0,
         )?;
 
         // `TensorRef` wraps the reused buffer in place - ort does not copy it.
@@ -525,6 +326,8 @@ impl HandTrackerImpl {
             LANDMARKER_INPUT,
             LANDMARKER_INPUT,
             &mut self.landmarker_input,
+            TensorLayout::Nhwc,
+            0.0,
         )?;
 
         let input = TensorRef::from_array_view((
@@ -590,15 +393,15 @@ impl HandTrackerImpl {
             result.score = detection.score;
 
             let palm = (detection.cx, detection.cy, detection.half);
-            if let Some(landmarks) = self.landmark_cache.reuse(palm) {
+            if let Some(landmarks) = self.cache.reuse(palm) {
                 // Same palm, same crop: the keypoints from the previous run are
                 // still valid, so the 224x224 model is not executed this frame.
                 result.hand_landmarks = Some(landmarks);
                 result.timings.landmarker_us = 0.0;
                 if self.debug {
                     eprintln!("[Tracker] palm steady, reusing landmarks ({} frame{} in a row)",
-                        self.landmark_cache.streak,
-                        if self.landmark_cache.streak > 1 { "s" } else { "" });
+                        self.cache.streak(),
+                        if self.cache.streak() > 1 { "s" } else { "" });
                 }
             } else {
                 let landmarker_start = Instant::now();
@@ -624,21 +427,21 @@ impl HandTrackerImpl {
                                 );
                             }
                         }
-                        self.landmark_cache.refresh(palm, &landmarks);
+                        self.cache.refresh(palm, &landmarks);
                         result.hand_landmarks = Some(landmarks);
                     }
                     Err(e) => {
                         if self.debug {
                             eprintln!("[Tracker] landmarker stage skipped: {e}");
                         }
-                        self.landmark_cache.clear();
+                        self.cache.clear();
                     }
                 }
             }
         } else {
             // No hand: the cache is worthless and must not be reused on the next
             // sighting.
-            self.landmark_cache.clear();
+            self.cache.clear();
         }
 
         Ok(result)
@@ -674,6 +477,7 @@ fn load_anchors(path: &str) -> Result<Vec<(f32, f32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencv::core;
 
     /// 2x2 BGR frame: (10,20,30) (40,50,60) / (70,80,90) (100,110,120)
     const TEST_PIXELS: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
@@ -702,7 +506,16 @@ mod tests {
 
     fn resample(frame: &Mat, map: Affine, out_w: usize, out_h: usize) -> (Affine, Vec<f32>) {
         let mut stage = StageInput::new(out_w, out_h);
-        let map = sample_affine_to_tensor(frame, map, out_w, out_h, &mut stage).unwrap();
+        let map = sample_affine_to_tensor(
+            frame,
+            map,
+            out_w,
+            out_h,
+            &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
+        )
+        .unwrap();
         (map, stage.data)
     }
 
@@ -770,56 +583,6 @@ mod tests {
         assert_eq!((mid.0, mid.1), (80.0, 0.0));
     }
 
-    #[test]
-    fn a_still_palm_reuses_its_landmarks() {
-        let reference = Some((320.0, 240.0, 100.0));
-        // Sub-pixel tracking jitter is below the tolerance.
-        assert!(palm_is_steady((321.5, 241.0, 101.0), reference));
-        // A hand that actually moved is not steady.
-        assert!(!palm_is_steady((340.0, 240.0, 100.0), reference));
-        // ...and neither is one that changed size appreciably (3 % of 100 px = 3 px).
-        assert!(!palm_is_steady((320.0, 240.0, 110.0), reference));
-        // No previous run means nothing to reuse.
-        assert!(!palm_is_steady((320.0, 240.0, 100.0), None));
-    }
-
-    #[test]
-    fn the_cache_reuses_only_while_the_palm_is_still_and_never_forever() {
-        let palm = (320.0, 240.0, 100.0);
-        let keypoints: Vec<Landmark> = (0..21)
-            .map(|i| Landmark { x: i as f32, y: 0.0, z: 0.0 })
-            .collect();
-        let mut cache = LandmarkCache::new(true);
-
-        // Nothing cached yet: the landmarker has to run.
-        assert!(cache.reuse(palm).is_none());
-        cache.refresh(palm, &keypoints);
-
-        // Steady palm: reuse is allowed for exactly MAX_FRAMES consecutive frames,
-        // then the streak cap forces a fresh model run.
-        let mut consecutive = 0;
-        for _ in 0..10 {
-            if cache.reuse(palm).is_some() {
-                consecutive += 1;
-            } else {
-                break;
-            }
-        }
-        assert_eq!(consecutive, LANDMARKER_REUSE_MAX_FRAMES);
-
-        // A moved palm breaks the streak immediately.
-        cache.refresh(palm, &keypoints);
-        assert!(cache.reuse((400.0, 240.0, 100.0)).is_none());
-
-        // Losing the hand empties the cache.
-        cache.clear();
-        assert!(cache.reuse(palm).is_none());
-
-        // Disabled with --landmarker-always.
-        let mut strict = LandmarkCache::new(false);
-        strict.refresh(palm, &keypoints);
-        assert!(strict.reuse(palm).is_none());
-    }
 
     #[test]
     fn the_anchor_is_smoothed_and_never_overshoots() {
@@ -846,6 +609,8 @@ mod tests {
             2,
             2,
             &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
         )
         .unwrap();
         let ptr = stage.data.as_ptr();
@@ -856,6 +621,8 @@ mod tests {
             2,
             2,
             &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
         )
         .unwrap();
 
@@ -941,6 +708,8 @@ mod tests {
                 192,
                 192,
                 &mut stage,
+                TensorLayout::Nhwc,
+                0.0,
             )
             .unwrap();
             std::hint::black_box(map);
@@ -956,6 +725,8 @@ mod tests {
                 192,
                 192,
                 &mut fresh,
+                TensorLayout::Nhwc,
+                0.0,
             )
             .unwrap();
             std::hint::black_box(map);
@@ -980,6 +751,8 @@ mod tests {
                 224,
                 224,
                 &mut stage,
+                TensorLayout::Nhwc,
+                0.0,
             )
             .unwrap();
             std::hint::black_box(map);
@@ -995,6 +768,8 @@ mod tests {
                 224,
                 224,
                 &mut fresh,
+                TensorLayout::Nhwc,
+                0.0,
             )
             .unwrap();
             std::hint::black_box(map);

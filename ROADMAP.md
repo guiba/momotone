@@ -29,6 +29,23 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 4. ~~Release profile + per-stage latency printout~~ **done** — `[profile.release] lto = "fat"`, `codegen-units = 1`, and `--debug` now prints `frame 31.07 ms (detector 9548 us, landmarker 0 us)`.
 5. ~~Clear the 13 dead-code warnings~~ **done** — deleted `sources/mock.rs` (`MockSource`, `MockSourceImpl`, `SourceTrait`), `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, the core `Source`/`Tracker` traits, `GestureEvent::new_signal` and `MidiOutputEngine::control_change`; `StreamWrapper`'s unread field is now `#[allow(dead_code)]` with a comment (holding the stream *is* the point). `cargo build` is warning-free except the third-party `block v0.1.6` future-incompat notice.
 
+## Model backends (`feat/yolo-pose`)
+
+The tracker is now an enum, `HandTracker::MediaPipe` / `HandTracker::YoloPose`, selected with `--model`. Both return the same 21 MediaPipe-ordered landmarks plus a square hand box, so the strategy, dashboard and visualizer are unchanged.
+
+Measured on this machine (release build, one frame of a 640 px hand photo, `--image`):
+
+| Backend | Models | Input | Score | Inference |
+| :--- | :--- | :--- | :--- | :--- |
+| `mediapipe` (default) | 4.6 MB + 10.9 MB | 192×192 + 224×224 | 0.965 | **11.6 ms** (7.3 + 4.3) |
+| `yolo` | 41 MB FP32 (21 MB FP16) | 640×640, static | 0.481 | **64 ms** |
+
+So: the Ultralytics pose model is a single pass and gets the whole hand in one shot (no palm-box guessing), but at 640 it is ~5× slower than the BlazeHand pair on a CPU and its confidences are much lower — start at `--score-threshold 0.3`. `scripts/get_pose_model.sh` fetches the graph. Open items:
+
+1. **Make the pose model cheap** — the HF export is frozen at 640×640. Re-export with `yolo export --imgsz 320 --dynamic` (needs torch/ultralytics, not installed here) or find a nano export; at 320 the FLOPs drop ~4×. **M**
+2. **Try RTMPose** — RTMDet-nano (76 AP, 0.31 GFLOPs, 320×320) + RTMPose-m hand5 (256×256) is the accuracy/latency sweet spot and already downloads to `/tmp/handbench`. Its SimCC heatmap head needs a different decoder than `decode_pose`. **M**
+3. **Multi-hand** — the pose decoder keeps only the highest-scoring detection; the strategy and dashboard assume one hand. **M**
+
 ## Performance
 
 - ~~Skip the landmarker when the hand is static~~ **done** — `LandmarkCache` reuses the previous keypoints while the palm is within 3 px and 3 % of its last size, capped at 3 consecutive frames so a hand that reshapes without moving its palm is never served stale landmarks for long, and cleared whenever the detector loses the hand. The landmarker stage costs ~4-5.4 ms when it runs, so a still hand saves most of it. Verify with `cargo run -- --debug` (`palm steady, reusing landmarks`) and compare against `--landmarker-always`. **Note:** fps is camera-paced at ~30, so the win is latency and CPU headroom, not frame rate.
@@ -37,8 +54,7 @@ frame a hand is present. Sampling is ~0.25 ms out of a ~31 ms frame budget.
 - **Split capture, inference and sinks onto their own threads** — one thread still does camera read → detector → landmarker → strategy → sinks. **M**
 - **Trim `tokio`** — declared with `features = ["full"]` and only used as iced's async executor; a slimmer feature set removes an unnecessary dependency weight. **S**
 - **Cache the keyboard backdrop** — `keyboard()` re-fills all 49 base cells plus separators every UI tick; the static part (cells, separators, octave labels) could be drawn once or only when the panel size changes. **S**
-- **GPU / alternative ONNX Runtime execution provider** for `ort`. **L**
-- **Single-shot hand model** instead of detector + landmarker, or a retrained lighter BlazeHand variant. **L**
+- **GPU / alternative ONNX Runtime execution provider** for `ort`. **L**- **Single-shot hand model** instead of detector + landmarker, or a retrained lighter BlazeHand variant. **L**
 - ~~Pin capture FPS~~ **done** — `WebcamSource::new` sets `CAP_PROP_FPS` (`--camera-fps`, default 30) and `--debug` prints what was requested versus what the driver reports, so a camera defaulting to 60 fps no longer doubles the inference load unnoticed.
 
 ## Features

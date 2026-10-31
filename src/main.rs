@@ -21,7 +21,7 @@ use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
 use crate::strategies::FingerPositionStrategy;
 use crate::vision::camera::WebcamSource;
-use crate::vision::tracker::HandTrackerImpl;
+use crate::vision::tracker::{DEFAULT_SCORE_THRESHOLD, HandTracker};
 use crate::visualizer::Visualizer;
 
 #[derive(Parser, Debug)]
@@ -42,12 +42,28 @@ struct Args {
     #[arg(long, default_value = "assets/anchors.csv")]
     anchors_path: String,
 
+    /// Which hand model to run. `mediapipe` is the two-stage BlazeHand pair (palm
+    /// detector then landmarker); `yolo` runs a single Ultralytics pose graph that
+    /// returns the hand box and all 21 keypoints in one pass.
+    #[arg(long, value_enum, default_value = "mediapipe")]
+    model: Model,
+
+    /// ONNX file for `--model yolo`. Get one with `scripts/get_pose_model.sh`.
+    #[arg(long, default_value = "assets/yolo_hand_pose.onnx")]
+    pose_path: String,
+
+    /// Square model input for `--model yolo`. 640 matches the Ultralytics training
+    /// size; 416 or 320 is several times cheaper on a CPU and usually still good
+    /// enough for a single hand in front of the camera.
+    #[arg(long, default_value_t = 640)]
+    pose_input: usize,
+
     #[arg(short, long, default_value_t = 0.5)]
     amplitude: f32,
 
     /// Detector confidence gate (0-1). Raise it if the tracker fires on things
     /// that are not hands; lower it if hands at an angle are missed.
-    #[arg(long, default_value_t = crate::vision::tracker::DEFAULT_SCORE_THRESHOLD)]
+    #[arg(long, default_value_t = DEFAULT_SCORE_THRESHOLD)]
     score_threshold: f32,
 
     /// Write every annotated frame to this PNG path (image mode only).
@@ -125,10 +141,38 @@ struct Args {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
+enum Model {
+    #[value(name = "mediapipe")]
+    MediaPipe,
+    Yolo,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum Mode {
     Signal,
     Midi,
     Mock,
+}
+
+/// Build the tracker for the model this run asked for.
+fn build_tracker(args: &Args) -> Result<HandTracker> {
+    match args.model {
+        Model::MediaPipe => HandTracker::mediapipe(
+            &args.detector_path,
+            &args.landmarker_path,
+            &args.anchors_path,
+            args.score_threshold,
+            args.debug,
+            !args.landmarker_always,
+        ),
+        Model::Yolo => HandTracker::yolo_pose(
+            &args.pose_path,
+            args.pose_input,
+            args.score_threshold,
+            args.debug,
+            !args.landmarker_always,
+        ),
+    }
 }
 
 fn main() -> Result<()> {
@@ -159,15 +203,8 @@ fn main() -> Result<()> {
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
-        let mut tracker = HandTrackerImpl::new(
-            &args.detector_path,
-            &args.landmarker_path,
-            &args.anchors_path,
-            args.score_threshold,
-            args.debug,
-            !args.landmarker_always,
-        )
-        .context("Failed to initialize hand tracker")?;
+        let mut tracker =
+            build_tracker(&args).context("Failed to initialize hand tracker")?;
 
         let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
             .with_context(|| format!("Failed to read image {path}"))?;
@@ -220,17 +257,7 @@ fn main() -> Result<()> {
     let tracker = if args.mode == Mode::Mock {
         None
     } else {
-        Some(
-            HandTrackerImpl::new(
-                &args.detector_path,
-                &args.landmarker_path,
-                &args.anchors_path,
-                args.score_threshold,
-                args.debug,
-                !args.landmarker_always,
-            )
-            .context("Failed to initialize hand tracker")?,
-        )
+        Some(build_tracker(&args).context("Failed to initialize hand tracker")?)
     };
     let camera = if args.mode == Mode::Mock {
         None
