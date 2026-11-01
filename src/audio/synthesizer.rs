@@ -84,7 +84,9 @@ impl Synthesizer {
                 let amplitude = (amplitude * self.gain).clamp(0.0, 1.0);
                 let waveform = state.waveform;
                 if state.voices.is_empty() {
-                    state.voices.push(Voice::new(*frequency, amplitude, waveform));
+                    state
+                        .voices
+                        .push(Voice::new(*frequency, amplitude, waveform));
                 } else {
                     for voice in state.voices.iter_mut() {
                         voice.frequency = *frequency;
@@ -188,8 +190,26 @@ mod tests {
 
         // The pipeline sends this the frame after the hand leaves: without it the
         // oscillator would latch and keep sounding forever.
-        synth.update_from_event(&GestureEvent::no_gesture()).unwrap();
+        synth
+            .update_from_event(&GestureEvent::no_gesture())
+            .unwrap();
         assert!(synth.state.lock().unwrap().voices.is_empty());
+    }
+
+    #[test]
+    fn a_signal_glides_one_voice_instead_of_restarting_it() {
+        let synth = Synthesizer::new(44100.0, 1, 1.0);
+        synth
+            .update_from_event(&GestureEvent::new_signal(220.0, 0.5, "Theremin"))
+            .unwrap();
+        synth
+            .update_from_event(&GestureEvent::new_signal(440.0, 0.8, "Theremin"))
+            .unwrap();
+
+        let state = synth.state.lock().unwrap();
+        assert_eq!(state.voices.len(), 1, "a continuous signal rides one voice");
+        assert!((state.voices[0].frequency - 440.0).abs() < 1e-6);
+        assert!((state.voices[0].amplitude - 0.8).abs() < 1e-6);
     }
 
     #[test]
@@ -218,7 +238,10 @@ mod tests {
         synth
             .update_from_event(&GestureEvent::new_note(60, 0.5, "Finger Position"))
             .unwrap();
-        assert_eq!(synth.state.lock().unwrap().voices[0].waveform, Waveform::Sine);
+        assert_eq!(
+            synth.state.lock().unwrap().voices[0].waveform,
+            Waveform::Sine
+        );
 
         synth.set_waveform(Waveform::Saw);
         {
@@ -228,11 +251,16 @@ mod tests {
         }
 
         // A voice started after the change inherits it.
-        synth.update_from_event(&GestureEvent::no_gesture()).unwrap();
+        synth
+            .update_from_event(&GestureEvent::no_gesture())
+            .unwrap();
         synth
             .update_from_event(&GestureEvent::new_note(69, 1.0, "Finger Position"))
             .unwrap();
-        assert_eq!(synth.state.lock().unwrap().voices[0].waveform, Waveform::Saw);
+        assert_eq!(
+            synth.state.lock().unwrap().voices[0].waveform,
+            Waveform::Saw
+        );
     }
 
     #[test]

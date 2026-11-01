@@ -106,7 +106,9 @@ mod tests {
     fn a_still_hand_reuses_its_landmarks() {
         let mut cache = ReuseCache::new(true);
         cache.refresh((100.0, 100.0, 50.0), &[landmark(1.0, 2.0)]);
-        let reused = cache.reuse((101.0, 100.5, 50.0)).expect("steady palm reuses");
+        let reused = cache
+            .reuse((101.0, 100.5, 50.0))
+            .expect("steady palm reuses");
         assert_eq!(reused.len(), 1);
         assert_eq!(cache.streak(), 1);
     }
@@ -116,9 +118,15 @@ mod tests {
         let mut cache = ReuseCache::new(true);
         cache.refresh((100.0, 100.0, 50.0), &[landmark(1.0, 2.0)]);
         for frame in 1..=REUSE_MAX_FRAMES {
-            assert!(cache.reuse((100.0, 100.0, 50.0)).is_some(), "frame {frame} reuses");
+            assert!(
+                cache.reuse((100.0, 100.0, 50.0)).is_some(),
+                "frame {frame} reuses"
+            );
         }
-        assert!(cache.reuse((100.0, 100.0, 50.0)).is_none(), "streak is capped");
+        assert!(
+            cache.reuse((100.0, 100.0, 50.0)).is_none(),
+            "streak is capped"
+        );
 
         let mut off = ReuseCache::new(false);
         let mut fresh = ReuseCache::new(true);
@@ -130,8 +138,14 @@ mod tests {
     fn a_moved_or_resized_palm_is_not_steady() {
         let previous = Some((100.0, 100.0, 50.0));
         assert!(is_steady((102.0, 100.0, 51.0), previous));
-        assert!(!is_steady((104.0, 100.0, 51.0), previous), "moved past 3 px");
+        assert!(
+            !is_steady((104.0, 100.0, 51.0), previous),
+            "moved past 3 px"
+        );
         assert!(!is_steady((100.0, 100.0, 60.0), previous), "grew past 3 %");
-        assert!(!is_steady((100.0, 100.0, 50.0), None), "nothing to compare against");
+        assert!(
+            !is_steady((100.0, 100.0, 50.0), None),
+            "nothing to compare against"
+        );
     }
 }

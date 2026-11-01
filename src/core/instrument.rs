@@ -24,7 +24,12 @@ pub enum Waveform {
 
 impl Waveform {
     pub fn all() -> [Waveform; 4] {
-        [Waveform::Sine, Waveform::Triangle, Waveform::Square, Waveform::Saw]
+        [
+            Waveform::Sine,
+            Waveform::Triangle,
+            Waveform::Square,
+            Waveform::Saw,
+        ]
     }
 
     pub fn name(self) -> &'static str {
@@ -53,7 +58,13 @@ impl Waveform {
         match self {
             Waveform::Sine => (phase * 2.0 * std::f32::consts::PI).sin(),
             Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
-            Waveform::Square => if phase < 0.5 { 1.0 } else { -1.0 },
+            Waveform::Square => {
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
             Waveform::Saw => 2.0 * phase - 1.0,
         }
     }
@@ -88,7 +99,12 @@ impl InstrumentConfig {
             .expect("the default preset is always available")
     }
 
-    pub fn new(scale_name: &str, root_name: &str, octaves: usize, waveform: Waveform) -> Result<Self> {
+    pub fn new(
+        scale_name: &str,
+        root_name: &str,
+        octaves: usize,
+        waveform: Waveform,
+    ) -> Result<Self> {
         let scale = preset(scale_name).ok_or_else(|| {
             anyhow!(
                 "unknown scale '{}'; available: {}",
@@ -96,7 +112,8 @@ impl InstrumentConfig {
                 core_list_scales()
             )
         })?;
-        let root = root_class(root_name).ok_or_else(|| anyhow!("unknown root note '{}'", root_name))?;
+        let root =
+            root_class(root_name).ok_or_else(|| anyhow!("unknown root note '{}'", root_name))?;
 
         let mut config = InstrumentConfig {
             scale,
@@ -207,14 +224,21 @@ mod tests {
         let mut config = InstrumentConfig::new("major pentatonic", "C", 3, Waveform::Sine).unwrap();
         let in_c = config.layout.notes.clone();
         assert!(config.set_root("A"));
-        assert!(config.layout.notes.iter().any(|&n| n % 12 == 9), "A must appear");
+        assert!(
+            config.layout.notes.iter().any(|&n| n % 12 == 9),
+            "A must appear"
+        );
         assert_ne!(config.layout.notes, in_c);
 
         // Four octaves of A pentatonic cannot fit inside C2..C6, so the grid
         // shrinks to the largest span that does rather than running off the top.
         assert!(config.set_octaves(4));
         assert!(config.layout.rows < 4);
-        assert!(config.layout.notes.iter().all(|&n| n <= crate::core::NOTE_HIGH));
+        assert!(config
+            .layout
+            .notes
+            .iter()
+            .all(|&n| n <= crate::core::NOTE_HIGH));
     }
 
     #[test]
@@ -249,7 +273,10 @@ mod tests {
         for waveform in Waveform::all() {
             for i in 0..=100 {
                 let value = waveform.sample(i as f32 / 100.0);
-                assert!((-1.0..=1.0).contains(&value), "{waveform} out of range at {i}");
+                assert!(
+                    (-1.0..=1.0).contains(&value),
+                    "{waveform} out of range at {i}"
+                );
             }
         }
     }

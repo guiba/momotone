@@ -1,7 +1,7 @@
-use crate::core::types::GestureEvent;
-use crate::core::{HandDetectionResult, Strategy, NOTE_MARGIN};
 use crate::core::grid::GridLayout;
 use crate::core::scale::{preset, root_class, Scale};
+use crate::core::types::GestureEvent;
+use crate::core::{HandDetectionResult, Landmark, Strategy, NOTE_MARGIN};
 use std::sync::Mutex;
 
 /// Thumb-index spread (as a fraction of the hand box height) that drives the
@@ -13,49 +13,19 @@ const MAX_SPREAD: f32 = 0.6;
 /// deliberate sweep, slow enough to swallow per-frame landmark jitter.
 const PITCH_EMA_ALPHA: f32 = 0.35;
 
-/// Pitch comes from the position of the index fingertip on the degree x octave
-/// grid, smoothed with an EMA so a shaky hand does not hop between cells.
-#[derive(Debug)]
-pub struct FingerPositionStrategy {
-    smoothed_tip: Mutex<Option<(f32, f32)>>,
-    grid: GridLayout,
+pub mod theremin;
+
+/// Exponential moving average of the index fingertip, shared by every strategy
+/// that reads the tip. A gap in tracking restarts the average, so the next
+/// sighting is not dragged back towards where the hand was before it left.
+#[derive(Debug, Default)]
+pub struct TipSmoother {
+    previous: Mutex<Option<(f32, f32)>>,
 }
 
-impl Default for FingerPositionStrategy {
-    fn default() -> Self {
-        Self::new(
-            root_class("C").unwrap(),
-            &preset("major pentatonic").unwrap(),
-            3,
-        )
-    }
-}
-
-impl FingerPositionStrategy {
-    pub fn new(root: u8, scale: &Scale, octaves: usize) -> Self {
-        Self {
-            smoothed_tip: Mutex::new(None),
-            grid: GridLayout::new(root, scale, octaves),
-        }
-    }
-
-    pub fn layout(&self) -> &GridLayout {
-        &self.grid
-    }
-
-    /// Live re-keying: the dashboard pickers change the scale/root/octave span
-    /// and the pipeline pushes the new grid in here. The tip smoother is left
-    /// alone - it tracks a position, not a note, so re-keying mid-sweep does not
-    /// throw away the averaging state.
-    fn set_grid(&mut self, layout: GridLayout) {
-        self.grid = layout;
-    }
-
-    /// Feed one sample of the index tip position into the smoother and return the
-    /// averaged position. A gap in tracking restarts the average, so the next
-    /// sighting is not dragged back towards where the hand was before it left.
-    fn smooth_tip(&self, x: f32, y: f32) -> (f32, f32) {
-        let mut state = self.smoothed_tip.lock().unwrap();
+impl TipSmoother {
+    fn sample(&self, x: f32, y: f32) -> (f32, f32) {
+        let mut state = self.previous.lock().unwrap();
         match state.as_mut() {
             Some((previous_x, previous_y)) => {
                 *previous_x += PITCH_EMA_ALPHA * (x - *previous_x);
@@ -70,23 +40,73 @@ impl FingerPositionStrategy {
     }
 
     fn reset(&self) {
-        *self.smoothed_tip.lock().unwrap() = None;
+        *self.previous.lock().unwrap() = None;
+    }
+}
+
+/// Normalised position of a point inside the playable band, 0..1 on each axis.
+/// The outer `NOTE_MARGIN` of the frame is excluded on both axes, otherwise the
+/// extreme cells would need the hand pressed against the edge of the image where
+/// the detector loses it.
+pub fn band_position(x: f32, y: f32, frame_size: (usize, usize)) -> (f32, f32) {
+    let width = frame_size.0.max(1) as f32;
+    let height = frame_size.1.max(1) as f32;
+    let margin_x = NOTE_MARGIN * width;
+    let margin_y = NOTE_MARGIN * height;
+    let usable_x = (width - 2.0 * margin_x).max(1.0);
+    let usable_y = (height - 2.0 * margin_y).max(1.0);
+    (
+        ((x - margin_x) / usable_x).clamp(0.0, 1.0),
+        ((y - margin_y) / usable_y).clamp(0.0, 1.0),
+    )
+}
+
+/// Thumb-tip <-> index-tip distance as a fraction of the hand box height,
+/// saturating at `MAX_SPREAD`. Normalised against the hand box so the mapping is
+/// resolution independent. Callers must have at least 9 landmarks.
+pub fn spread_volume(landmarks: &[Landmark], hand_box: Option<(f32, f32, f32, f32)>) -> f32 {
+    let (_, _, _, box_height) = hand_box.unwrap_or((0.0, 0.0, 1.0, 1.0));
+    let dx = landmarks[4].x - landmarks[8].x;
+    let dy = landmarks[4].y - landmarks[8].y;
+    let distance = (dx * dx + dy * dy).sqrt() / box_height.max(1.0);
+    (distance / MAX_SPREAD).clamp(0.0, 1.0)
+}
+
+/// Pitch comes from the position of the index fingertip on the degree x octave
+/// grid, smoothed with an EMA so a shaky hand does not hop between cells.
+#[derive(Debug)]
+pub struct FingerPositionStrategy {
+    tip: TipSmoother,
+    grid: GridLayout,
+}
+
+impl FingerPositionStrategy {
+    pub fn new(root: u8, scale: &Scale, octaves: usize) -> Self {
+        Self {
+            tip: TipSmoother::default(),
+            grid: GridLayout::new(root, scale, octaves),
+        }
     }
 
-    /// Normalised position of the fingertip inside the playable band, 0..1 on
-    /// each axis. The outer `NOTE_MARGIN` of the frame is excluded on both axes,
-    /// otherwise the extreme cells would need the hand pressed against the edge
-    /// of the image where the detector loses it.
-    fn band_position(&self, x: f32, y: f32, frame_size: (usize, usize)) -> (f32, f32) {
-        let width = frame_size.0.max(1) as f32;
-        let height = frame_size.1.max(1) as f32;
-        let margin_x = NOTE_MARGIN * width;
-        let margin_y = NOTE_MARGIN * height;
-        let usable_x = (width - 2.0 * margin_x).max(1.0);
-        let usable_y = (height - 2.0 * margin_y).max(1.0);
-        (
-            ((x - margin_x) / usable_x).clamp(0.0, 1.0),
-            ((y - margin_y) / usable_y).clamp(0.0, 1.0),
+    /// Live re-keying: the dashboard pickers change the scale/root/octave span
+    /// and the pipeline pushes the new grid in here. The tip smoother is left
+    /// alone - it tracks a position, not a note, so re-keying mid-sweep does not
+    /// throw away the averaging state.
+    fn set_grid(&mut self, layout: GridLayout) {
+        self.grid = layout;
+    }
+
+    fn reset(&self) {
+        self.tip.reset();
+    }
+}
+
+impl Default for FingerPositionStrategy {
+    fn default() -> Self {
+        Self::new(
+            root_class("C").unwrap(),
+            &preset("major pentatonic").unwrap(),
+            3,
         )
     }
 }
@@ -104,24 +124,17 @@ impl Strategy for FingerPositionStrategy {
         }
 
         // MediaPipe indices: Thumb tip (4), Index finger tip (8)
-        let thumb = &landmarks[4];
         let index = &landmarks[8];
 
         // 1. Pitch from the fingertip's position on the grid: rightward is a
         // higher scale degree, upward is a higher octave.
-        let (tip_x, tip_y) = self.smooth_tip(index.x, index.y);
-        let (x_pos, y_pos) = self.band_position(tip_x, tip_y, detection.frame_size);
+        let (tip_x, tip_y) = self.tip.sample(index.x, index.y);
+        let (x_pos, y_pos) = band_position(tip_x, tip_y, detection.frame_size);
         let note = self.grid.note_at(x_pos, y_pos);
 
-        // 2. Map Thumb <-> Index distance to Velocity / volume (0.0 to 1.0):
-        // fingers far apart -> loud, pinched together -> silent. Normalised
-        // against the hand box so the mapping is resolution independent.
-        let (_, _, _, bh) = detection.r#box.unwrap_or((0.0, 0.0, 1.0, 1.0));
-        let dx = thumb.x - index.x;
-        let dy = thumb.y - index.y;
-        let distance = (dx * dx + dy * dy).sqrt() / bh.max(1.0);
-
-        let velocity = (distance / MAX_SPREAD).clamp(0.0, 1.0);
+        // 2. Thumb <-> Index distance to velocity / volume (0.0 to 1.0): fingers
+        // far apart -> loud, pinched together -> silent.
+        let velocity = spread_volume(landmarks, detection.r#box);
 
         Some(GestureEvent::new_note(note, velocity, "Finger Position"))
     }
@@ -221,7 +234,11 @@ mod tests {
     /// A fresh strategy per call, so the EMA never carries a previous position
     /// into a mapping assertion.
     fn fresh_note(scale: &str, root: u8, octaves: usize, x: f32, y: f32) -> u8 {
-        note_at(&FingerPositionStrategy::new(root, &preset(scale).unwrap(), octaves), x, y)
+        note_at(
+            &FingerPositionStrategy::new(root, &preset(scale).unwrap(), octaves),
+            x,
+            y,
+        )
     }
 
     #[test]
@@ -235,18 +252,27 @@ mod tests {
 
         // Corners of the playable band land on the corners of the grid.
         assert_eq!(fresh_note("chromatic", 0, 4, 64.0, 48.0), layout.notes[0]);
-        assert_eq!(fresh_note("chromatic", 0, 4, 576.0, 432.0), *layout.notes.last().unwrap());
-        assert!(fresh_note("chromatic", 0, 4, 576.0, 240.0) > fresh_note("chromatic", 0, 4, 64.0, 240.0));
-        assert!(fresh_note("chromatic", 0, 4, 320.0, 48.0) > fresh_note("chromatic", 0, 4, 320.0, 432.0));
+        assert_eq!(
+            fresh_note("chromatic", 0, 4, 576.0, 432.0),
+            *layout.notes.last().unwrap()
+        );
+        assert!(
+            fresh_note("chromatic", 0, 4, 576.0, 240.0)
+                > fresh_note("chromatic", 0, 4, 64.0, 240.0)
+        );
+        assert!(
+            fresh_note("chromatic", 0, 4, 320.0, 48.0)
+                > fresh_note("chromatic", 0, 4, 320.0, 432.0)
+        );
     }
 
     #[test]
     fn every_cell_of_a_quantised_grid_is_in_the_scale() {
         let strategy = FingerPositionStrategy::default(); // C major pentatonic, 3 octaves
-        let allowed = strategy.layout().notes.clone();
+        let allowed = strategy.grid.notes.clone();
         assert_eq!(allowed.len(), 15);
-        assert_eq!(strategy.layout().rows, 3);
-        assert_eq!(strategy.layout().cols, 5);
+        assert_eq!(strategy.grid.rows, 3);
+        assert_eq!(strategy.grid.cols, 5);
 
         for x in (0..=640).step_by(16) {
             for y in (0..=480).step_by(16) {
@@ -274,15 +300,24 @@ mod tests {
     #[test]
     fn a_changed_root_transposes_the_keyboard() {
         let in_c = fresh_note("major pentatonic", 0, 3, 320.0, 240.0);
-        let in_a = fresh_note("major pentatonic", root_class("A").unwrap(), 3, 320.0, 240.0);
-        assert_ne!(in_c, in_a, "transposing must move the note under the same hand position");
+        let in_a = fresh_note(
+            "major pentatonic",
+            root_class("A").unwrap(),
+            3,
+            320.0,
+            240.0,
+        );
+        assert_ne!(
+            in_c, in_a,
+            "transposing must move the note under the same hand position"
+        );
 
         let strategy = FingerPositionStrategy::new(
             root_class("A").unwrap(),
             &preset("minor pentatonic").unwrap(),
             3,
         );
-        let allowed = strategy.layout().notes.clone();
+        let allowed = strategy.grid.notes.clone();
         for x in [100.0, 200.0, 300.0, 400.0, 500.0, 576.0] {
             let note = fresh_note("minor pentatonic", root_class("A").unwrap(), 3, x, 240.0);
             assert!(allowed.contains(&note), "x={x} gave off-scale {note}");
@@ -308,12 +343,7 @@ mod tests {
             .map(|&x| note_at(&strategy, x, 240.0))
             .collect();
 
-        let flaps = |notes: &[u8]| {
-            notes
-                .windows(2)
-                .filter(|pair| pair[0] != pair[1])
-                .count()
-        };
+        let flaps = |notes: &[u8]| notes.windows(2).filter(|pair| pair[0] != pair[1]).count();
         assert!(
             flaps(&smoothed) < flaps(&unsmoothed),
             "unsmoothed {unsmoothed:?} flips {} times, smoothed {smoothed:?} flips {}",
@@ -331,7 +361,7 @@ mod tests {
             y -= 16.0;
         }
         let corner = note_at(&strategy, 640.0, 48.0);
-        assert_eq!(corner, *strategy.layout().notes.iter().max().unwrap());
+        assert_eq!(corner, *strategy.grid.notes.iter().max().unwrap());
     }
 
     #[test]
@@ -341,7 +371,7 @@ mod tests {
         strategy.reset();
         // Without the reset the old position would still be pulling the average.
         let after = note_at(&strategy, 600.0, 60.0);
-        let from_scratch = FingerPositionStrategy::default().layout().note_at(1.0, 0.0);
+        let from_scratch = FingerPositionStrategy::default().grid.note_at(1.0, 0.0);
         assert_eq!(after, from_scratch);
     }
 
@@ -378,7 +408,10 @@ mod tests {
             .unwrap()
             .payload;
         match (note, other) {
-            (GesturePayload::Note { note: first, .. }, GesturePayload::Note { note: second, .. }) => assert_eq!(first, second),
+            (
+                GesturePayload::Note { note: first, .. },
+                GesturePayload::Note { note: second, .. },
+            ) => assert_eq!(first, second),
             _ => panic!("expected note payloads"),
         }
     }

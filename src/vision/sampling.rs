@@ -180,7 +180,11 @@ pub(crate) fn letterbox_map(fw: f64, fh: f64, size: usize) -> Affine {
     let drawn_w = fw * scale;
     let drawn_h = fh * scale;
     // out_x = scale * frame_x + pad  =>  frame_x = (out_x - pad) / scale
-    Affine::scale_translate(1.0 / scale, -((size - drawn_w) * 0.5) / scale, -((size - drawn_h) * 0.5) / scale)
+    Affine::scale_translate(
+        1.0 / scale,
+        -((size - drawn_w) * 0.5) / scale,
+        -((size - drawn_h) * 0.5) / scale,
+    )
 }
 
 /// Sample `frame` through the inverse of `map` using `warpAffine`, which takes the
@@ -239,13 +243,9 @@ mod tests {
 
     fn frame(rows: i32, cols: i32) -> Mat {
         // Gradient frame: R = 50 everywhere, B grows left to right, G top to bottom.
-        let mut mat = Mat::new_rows_cols_with_default(
-            rows,
-            cols,
-            core::CV_8UC3,
-            core::Scalar::all(0.0),
-        )
-        .unwrap();
+        let mut mat =
+            Mat::new_rows_cols_with_default(rows, cols, core::CV_8UC3, core::Scalar::all(0.0))
+                .unwrap();
         for y in 0..rows {
             let row = mat.ptr_mut(y).unwrap();
             unsafe {

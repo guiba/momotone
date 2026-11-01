@@ -75,7 +75,6 @@ pub struct FrameMetrics {
     /// The camera frame as RGBA pixels, handed to the dashboard so it can draw
     /// the video and the skeleton in the same canvas. Only produced when the UI
     /// is running.
-    pub frame_id: u64,
     pub frame_pixels: Vec<u8>,
 
     // --- gesture output ---

@@ -20,9 +20,7 @@ use ort::value::TensorRef;
 
 use crate::core::{HandDetectionResult, Landmark, StageTimings};
 use crate::vision::reuse::{square_box, ReuseCache};
-use crate::vision::sampling::{
-    letterbox_map, sample_affine_to_tensor, StageInput, TensorLayout,
-};
+use crate::vision::sampling::{letterbox_map, sample_affine_to_tensor, StageInput, TensorLayout};
 
 const NUM_KEYPOINTS: usize = 21;
 /// Ultralytics letterboxes the input into a square and fills the border with this
@@ -127,7 +125,11 @@ fn decode_pose(dims: &[usize], data: &[f32]) -> Result<Vec<RawDetection>> {
             Some(i) => at(d, i),
             None => 1.0,
         };
-        let mut keypoints = [Keypoint { x: 0.0, y: 0.0, visibility: 0.0 }; NUM_KEYPOINTS];
+        let mut keypoints = [Keypoint {
+            x: 0.0,
+            y: 0.0,
+            visibility: 0.0,
+        }; NUM_KEYPOINTS];
         for (i, kp) in keypoints.iter_mut().enumerate() {
             let base = keypoint_offset + i * 3;
             kp.x = at(d, base) as f64;
@@ -178,9 +180,12 @@ impl YoloPoseTracker {
             .inputs()
             .first()
             .and_then(|input| match input.dtype() {
-                ort::value::ValueType::Tensor { shape, .. } => {
-                    shape.iter().copied().filter(|&d| d > 0).map(|d| d as usize).next_back()
-                }
+                ort::value::ValueType::Tensor { shape, .. } => shape
+                    .iter()
+                    .copied()
+                    .filter(|&d| d > 0)
+                    .map(|d| d as usize)
+                    .next_back(),
                 _ => None,
             });
         if let Some(side) = declared {
@@ -288,7 +293,11 @@ impl YoloPoseTracker {
         let best = detections
             .into_iter()
             .filter(|d| d.score >= self.score_threshold)
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
         let Some(best) = best else {
             return Ok(None);
@@ -438,7 +447,10 @@ mod tests {
         assert!((detections[0].score - 0.87).abs() < 1e-6);
         assert_eq!((detections[0].x1, detections[0].y2), (10.0, 120.0));
         assert_eq!((detections[1].x1, detections[1].score), (50.0, 0.31));
-        assert_eq!((detections[0].keypoints[8].x, detections[0].keypoints[8].y), (18.0, 28.0));
+        assert_eq!(
+            (detections[0].keypoints[8].x, detections[0].keypoints[8].y),
+            (18.0, 28.0)
+        );
     }
 
     #[test]

@@ -1,24 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum EventType {
-    Continuous,
-    Discrete,
-}
-
-/// Represents the data associated with a gesture.
-/// Instead of Python's dict payload, we use an Enum for type safety and performance.
+/// The data a gesture carries.
+///
+/// `Note` is the quantised keyboard mapping; `Signal` is the continuous
+/// theremin mapping. Both round-trip through every sink: the synthesizer can
+/// oscillate at an arbitrary frequency, and the MIDI sink simply ignores a
+/// signal because MIDI has no continuous pitch to send.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GesturePayload {
-    // For Continuous gestures (e.g., frequency modulation)
+    // For Continuous gestures (e.g. frequency modulation)
     Signal { frequency: f32, amplitude: f32 },
-    // For Discrete gestures (e.g., note on/off)
+    // For Discrete gestures (e.g. note on/off)
     Note { note: u8, velocity: f32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GestureEvent {
-    pub event_type: EventType,
     pub payload: GesturePayload,
     pub text: String,
     // Color as RGB components for visualizer
@@ -29,17 +26,27 @@ impl GestureEvent {
     /// Helper to create a discrete note event
     pub fn new_note(note: u8, velocity: f32, text: &str) -> Self {
         Self {
-            event_type: EventType::Discrete,
             payload: GesturePayload::Note { note, velocity },
             text: text.to_string(),
             color: (0, 255, 255), // Cyan for notes
         }
     }
 
+    /// Helper for a continuous theremin gesture: a frequency and a loudness.
+    pub fn new_signal(frequency: f32, amplitude: f32, text: &str) -> Self {
+        Self {
+            payload: GesturePayload::Signal {
+                frequency,
+                amplitude,
+            },
+            text: text.to_string(),
+            color: (255, 200, 80), // Amber for the theremin
+        }
+    }
+
     /// Helper for "No Hand" state
     pub fn no_gesture() -> Self {
         Self {
-            event_type: EventType::Discrete,
             payload: GesturePayload::Note {
                 note: 0,
                 velocity: 0.0,

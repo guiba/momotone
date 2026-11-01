@@ -162,11 +162,17 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle) {
     let radius = stage.width.min(stage.height) * 0.8;
     for ring in (0..GLOW_RINGS).rev() {
         let t = (ring + 1) as f32 / GLOW_RINGS as f32;
-        frame.fill(&Path::circle(centre, radius * t), mix(GLOW, PANEL_BOTTOM, t));
+        frame.fill(
+            &Path::circle(centre, radius * t),
+            mix(GLOW, PANEL_BOTTOM, t),
+        );
     }
 
     frame.stroke(
-        &Path::rectangle(Point::new(stage.x, stage.y), Size::new(stage.width, stage.height)),
+        &Path::rectangle(
+            Point::new(stage.x, stage.y),
+            Size::new(stage.width, stage.height),
+        ),
         Stroke::default().with_color(STAGE_EDGE).with_width(1.0),
     );
 }
@@ -284,11 +290,7 @@ fn keyboard(
 
     // 4. Outline the cell being played and label it.
     if let Some(note) = current {
-        let cell = layout
-            .notes
-            .iter()
-            .position(|&n| n == note)
-            .unwrap_or(0);
+        let cell = layout.notes.iter().position(|&n| n == note).unwrap_or(0);
         let row = cell / layout.cols;
         let col = cell % layout.cols;
         let x = band_x + cell_w * col as f32;
@@ -464,7 +466,9 @@ impl<Message> Program<Message> for Skeleton {
             let color = GROUP_COLORS[group];
             frame.stroke(
                 &line,
-                Stroke::default().with_color(tint(color, 0.25)).with_width(8.0),
+                Stroke::default()
+                    .with_color(tint(color, 0.25))
+                    .with_width(8.0),
             );
             frame.stroke(&line, Stroke::default().with_color(color).with_width(2.5));
         }

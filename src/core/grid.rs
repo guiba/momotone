@@ -38,7 +38,11 @@ impl GridLayout {
         let octaves_used: Vec<u8> = (0..rows).map(|row| base + row as u8).rev().collect();
         let notes: Vec<u8> = octaves_used
             .iter()
-            .flat_map(|&octave| degrees.iter().map(move |&degree| root + octave * 12 + degree))
+            .flat_map(|&octave| {
+                degrees
+                    .iter()
+                    .map(move |&degree| root + octave * 12 + degree)
+            })
             .collect();
 
         GridLayout {
@@ -114,7 +118,11 @@ mod tests {
 
     #[test]
     fn the_grid_is_centred_and_inside_the_range() {
-        let grid = GridLayout::new(root_class("C").unwrap(), &preset("major pentatonic").unwrap(), 3);
+        let grid = GridLayout::new(
+            root_class("C").unwrap(),
+            &preset("major pentatonic").unwrap(),
+            3,
+        );
         assert_eq!(grid.rows, 3);
         assert_eq!(grid.cols, 5);
         assert_eq!(grid.len(), 15);
@@ -127,7 +135,11 @@ mod tests {
 
     #[test]
     fn cells_map_to_the_expected_notes() {
-        let grid = GridLayout::new(root_class("C").unwrap(), &preset("major pentatonic").unwrap(), 3);
+        let grid = GridLayout::new(
+            root_class("C").unwrap(),
+            &preset("major pentatonic").unwrap(),
+            3,
+        );
         assert_eq!(grid.note_at(0.0, 0.0), 72); // C6, top left
         assert_eq!(grid.note_at(1.0, 0.0), 81); // A6, top right
         assert_eq!(grid.note_at(0.0, 1.0), 48); // C4, bottom left
@@ -145,7 +157,11 @@ mod tests {
 
     #[test]
     fn out_of_range_positions_clamp_to_the_nearest_cell() {
-        let grid = GridLayout::new(root_class("A").unwrap(), &preset("minor pentatonic").unwrap(), 4);
+        let grid = GridLayout::new(
+            root_class("A").unwrap(),
+            &preset("minor pentatonic").unwrap(),
+            4,
+        );
         for x in [-1.0f32, 0.0, 0.3, 0.9, 1.0, 2.0] {
             for y in [-0.5, 0.0, 0.5, 1.0, 1.5] {
                 let cell = grid.cell_at(x, y);

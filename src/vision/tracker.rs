@@ -20,7 +20,7 @@ use crate::core::HandDetectionResult;
 use crate::core::Landmark;
 use crate::core::StageTimings;
 use crate::vision::reuse::ReuseCache;
-use crate::vision::sampling::{Affine, StageInput, TensorLayout, sample_affine_to_tensor};
+use crate::vision::sampling::{sample_affine_to_tensor, Affine, StageInput, TensorLayout};
 use crate::vision::yolo_pose::YoloPoseTracker;
 
 const NUM_KEYPOINTS: usize = 21;
@@ -87,7 +87,6 @@ impl HandTracker {
     }
 }
 
-
 /// The largest axis-aligned square the detector can take from the frame, slid so
 /// that it contains `palm` (where the hand was last frame). Without history this
 /// is exactly the centred square the pipeline used before.
@@ -146,7 +145,6 @@ pub struct MediaPipeTracker {
     /// Keypoints reused while the palm is stationary (see `ReuseCache`).
     cache: ReuseCache,
 }
-
 
 impl MediaPipeTracker {
     pub fn new(
@@ -399,15 +397,18 @@ impl MediaPipeTracker {
                 result.hand_landmarks = Some(landmarks);
                 result.timings.landmarker_us = 0.0;
                 if self.debug {
-                    eprintln!("[Tracker] palm steady, reusing landmarks ({} frame{} in a row)",
+                    eprintln!(
+                        "[Tracker] palm steady, reusing landmarks ({} frame{} in a row)",
                         self.cache.streak(),
-                        if self.cache.streak() > 1 { "s" } else { "" });
+                        if self.cache.streak() > 1 { "s" } else { "" }
+                    );
                 }
             } else {
                 let landmarker_start = Instant::now();
                 match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
                     Ok(landmarks) => {
-                        result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
+                        result.timings.landmarker_us =
+                            landmarker_start.elapsed().as_secs_f64() * 1e6;
                         if self.debug {
                             let (mut minx, mut miny, mut maxx, mut maxy) =
                                 (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -582,7 +583,6 @@ mod tests {
         let mid = detector_crop(Some((320.0, 240.0)), 640.0, 480.0);
         assert_eq!((mid.0, mid.1), (80.0, 0.0));
     }
-
 
     #[test]
     fn the_anchor_is_smoothed_and_never_overshoots() {

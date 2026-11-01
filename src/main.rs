@@ -16,12 +16,14 @@ use std::sync::{Arc, Mutex};
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::Sink;
+use crate::core::Strategy;
 use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
 use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
+use crate::strategies::theremin::ThereminStrategy;
 use crate::strategies::FingerPositionStrategy;
 use crate::vision::camera::WebcamSource;
-use crate::vision::tracker::{DEFAULT_SCORE_THRESHOLD, HandTracker};
+use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
 use crate::visualizer::Visualizer;
 
 #[derive(Parser, Debug)]
@@ -80,6 +82,12 @@ struct Args {
 
     #[arg(long, default_value = "OP-1")]
     port: String,
+    /// Minimum time a MIDI note sounds before the voice may move to the next
+    /// cell. The strategy fires every frame, so without a floor a hand sliding
+    /// across the keyboard re-attacks on every cell it crosses. 0 attacks on
+    /// every change.
+    #[arg(long, default_value_t = midi::DEFAULT_MIN_NOTE_MS)]
+    min_note_ms: u64,
 
     /// Webcam index.
     #[arg(long, default_value_t = 0)]
@@ -98,6 +106,13 @@ struct Args {
     /// gain.
     #[arg(long, default_value_t = 30)]
     camera_fps: u32,
+
+    /// How often the dashboard is handed a new camera image. iced uploads every
+    /// `image::Handle` to the GPU synchronously, so a 640x480 preview costs a
+    /// blocking wgpu round trip per upload while the skeleton and keyboard keep
+    /// updating at full frame rate. 0 sends every frame.
+    #[arg(long, default_value_t = pipeline::DEFAULT_FEED_FPS)]
+    feed_fps: f32,
 
     /// Stop mirroring the webcam. By default the frame is flipped horizontally
     /// so the stage behaves like a mirror: your right hand shows up on the
@@ -135,6 +150,18 @@ struct Args {
     #[arg(long, default_value = "sine")]
     waveform: String,
 
+    /// Which landmark -> output mapping drives the sinks. `position` plays the
+    /// degree x octave keyboard; `theremin` glides continuously through a
+    /// frequency band instead, so nothing is quantised to a scale.
+    #[arg(long, value_enum, default_value = "position")]
+    gesture: Gesture,
+
+    /// Frequency band the theremin sweeps when `--gesture theremin`.
+    #[arg(long, default_value_t = strategies::theremin::DEFAULT_LOW_HZ)]
+    theremin_low_hz: f32,
+    #[arg(long, default_value_t = strategies::theremin::DEFAULT_HIGH_HZ)]
+    theremin_high_hz: f32,
+
     /// Run the pipeline without opening the iced dashboard.
     #[arg(long, default_value_t = false)]
     no_ui: bool,
@@ -145,6 +172,12 @@ enum Model {
     #[value(name = "mediapipe")]
     MediaPipe,
     Yolo,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
+enum Gesture {
+    Position,
+    Theremin,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
@@ -194,17 +227,12 @@ fn main() -> Result<()> {
                 .join(", ")
         )
     })?;
-    let instrument = core::instrument::InstrumentConfig::new(
-        &args.scale,
-        &args.root,
-        args.octaves,
-        waveform,
-    )?;
+    let instrument =
+        core::instrument::InstrumentConfig::new(&args.scale, &args.root, args.octaves, waveform)?;
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
-        let mut tracker =
-            build_tracker(&args).context("Failed to initialize hand tracker")?;
+        let mut tracker = build_tracker(&args).context("Failed to initialize hand tracker")?;
 
         let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
             .with_context(|| format!("Failed to read image {path}"))?;
@@ -242,7 +270,7 @@ fn main() -> Result<()> {
         }
         Mode::Midi => {
             println!("Initializing MIDI Engine (Port: {})...", args.port);
-            let mut midi_engine = MidiOutputEngine::new(&args.port);
+            let mut midi_engine = MidiOutputEngine::new(&args.port, args.min_note_ms);
             midi_engine.start()?;
             sinks.push(Box::new(midi_engine));
             "midi"
@@ -286,14 +314,26 @@ fn main() -> Result<()> {
         }
     }
 
-    let strategy = FingerPositionStrategy::new(instrument.root, &instrument.scale, instrument.octaves);
-    let layout = strategy.layout().clone();
+    let strategy: Box<dyn Strategy> = match args.gesture {
+        Gesture::Position => Box::new(FingerPositionStrategy::new(
+            instrument.root,
+            &instrument.scale,
+            instrument.octaves,
+        )),
+        Gesture::Theremin => Box::new(ThereminStrategy::new(
+            args.theremin_low_hz,
+            args.theremin_high_hz,
+        )),
+    };
+    // The keyboard the dashboard draws is the one the instrument config built;
+    // the strategy only needs it when it quantises to a grid.
+    let layout = instrument.layout.clone();
     let scale_name = instrument.scale.name.to_string();
     let root_name = instrument.root_name.clone();
     let instrument = Arc::new(Mutex::new(instrument));
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
-        mode: format!("{:?}", args.mode),
+        mode: format!("{:?} / {:?}", args.mode, args.gesture),
         sink: sink_label.to_string(),
         scale: scale_name,
         root: root_name,
@@ -310,7 +350,7 @@ fn main() -> Result<()> {
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
         camera,
         tracker,
-        strategy: Box::new(strategy),
+        strategy,
         sinks: Arc::new(Mutex::new(sinks)),
         event_bus,
         event_rx: Some(event_rx),
@@ -318,6 +358,7 @@ fn main() -> Result<()> {
         instrument: instrument.clone(),
         active: active.clone(),
         feed_wanted: feed.clone(),
+        feed_fps: args.feed_fps,
         max_frames: args.max_frames,
         debug: args.debug,
         emit_frames: !args.no_ui,

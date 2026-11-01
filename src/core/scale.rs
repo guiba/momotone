@@ -131,8 +131,17 @@ mod tests {
         let scale = preset("minor pentatonic").unwrap();
         let in_c = GridLayout::new(0, &scale, 3).notes;
         let in_a = GridLayout::new(root_class("A").unwrap(), &scale, 3).notes;
-        assert_ne!(in_c, in_a, "a different root must produce a different keyboard");
-        assert!(in_a.iter().any(|&n| n % 12 == 9), "A should appear in A pentatonic");
-        assert!(!in_c.iter().any(|&n| n % 12 == 9), "A is not in C minor pentatonic");
+        assert_ne!(
+            in_c, in_a,
+            "a different root must produce a different keyboard"
+        );
+        assert!(
+            in_a.iter().any(|&n| n % 12 == 9),
+            "A should appear in A pentatonic"
+        );
+        assert!(
+            !in_c.iter().any(|&n| n % 12 == 9),
+            "A is not in C minor pentatonic"
+        );
     }
 }

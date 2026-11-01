@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::image::Handle;
-use iced::widget::{button, canvas, column, container, row, rule, space, text, pick_list, Column, Scrollable};
+use iced::widget::{
+    button, canvas, column, container, pick_list, row, rule, space, text, Column, Scrollable,
+};
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
@@ -165,7 +167,8 @@ impl Dashboard {
                 }
             }
             Message::ToggleRun => {
-                self.active.store(!self.active.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.active
+                    .store(!self.active.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             Message::ShowBasic => self.tab = Tab::Basic,
             Message::ShowAdvanced => self.tab = Tab::Advanced,
@@ -220,8 +223,8 @@ impl Dashboard {
                 self.metrics.waveform,
                 self.fade_tau * 1000.0
             ))
-                .size(12)
-                .color(MUTED),
+            .size(12)
+            .color(MUTED),
             space::horizontal(),
             big_button(
                 if running { "Stop" } else { "Start" },
@@ -295,7 +298,12 @@ impl Dashboard {
                 perf_card(&self.metrics),
                 geometry_card(&self.metrics),
                 sparkline_card("VOLUME", &self.volume_history, (0.0, 1.0), VOLUME),
-                sparkline_card("CONFIDENCE", &self.confidence_history, (0.0, 1.0), CONFIDENCE),
+                sparkline_card(
+                    "CONFIDENCE",
+                    &self.confidence_history,
+                    (0.0, 1.0),
+                    CONFIDENCE
+                ),
                 log_card(&self.metrics),
             ]
             .spacing(10),
@@ -366,11 +374,7 @@ fn tab_button<'a>(label: &'a str, selected: bool, message: Message) -> Element<'
         .on_press(message)
         .padding(8)
         .style(move |_theme, _status| button::Style {
-            background: Some(Background::Color(if selected {
-                CARD_BORDER
-            } else {
-                CARD
-            })),
+            background: Some(Background::Color(if selected { CARD_BORDER } else { CARD })),
             text_color: if selected { TEXT } else { MUTED },
             border: Border {
                 color: CARD_BORDER,
@@ -393,7 +397,15 @@ pub fn run(
     fade_ms: f32,
 ) -> iced::Result {
     iced::application(
-        move || Dashboard::new(shared.clone(), active.clone(), feed.clone(), instrument.clone(), fade_ms),
+        move || {
+            Dashboard::new(
+                shared.clone(),
+                active.clone(),
+                feed.clone(),
+                instrument.clone(),
+                fade_ms,
+            )
+        },
         Dashboard::update,
         Dashboard::view,
     )
@@ -447,10 +459,12 @@ fn instrument_card<'a>(config: &InstrumentConfig) -> Element<'a, Message> {
         .iter()
         .map(|(name, _)| name.to_string())
         .collect();
-    let roots: Vec<String> = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        .iter()
-        .map(|&name| name.to_string())
-        .collect();
+    let roots: Vec<String> = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ]
+    .iter()
+    .map(|&name| name.to_string())
+    .collect();
     let octaves: Vec<usize> = (1..=6).collect();
     let waveforms: Vec<Waveform> = Waveform::all().to_vec();
 
@@ -458,13 +472,20 @@ fn instrument_card<'a>(config: &InstrumentConfig) -> Element<'a, Message> {
         "INSTRUMENT",
         column![
             row![
-                pick_list(scales, Some(config.scale.name.to_string()), Message::PickScale).width(Length::Fill),
-                pick_list(roots, Some(config.root_name.clone()), Message::PickRoot).width(Length::Fill),
+                pick_list(
+                    scales,
+                    Some(config.scale.name.to_string()),
+                    Message::PickScale
+                )
+                .width(Length::Fill),
+                pick_list(roots, Some(config.root_name.clone()), Message::PickRoot)
+                    .width(Length::Fill),
             ]
             .spacing(6),
             row![
                 pick_list(octaves, Some(config.octaves), Message::PickOctaves).width(Length::Fill),
-                pick_list(waveforms, Some(config.waveform), Message::PickWaveform).width(Length::Fill),
+                pick_list(waveforms, Some(config.waveform), Message::PickWaveform)
+                    .width(Length::Fill),
             ]
             .spacing(6),
             kv(
@@ -568,10 +589,7 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
                 "pitch anchor",
                 format!(
                     "tip {:.0}, {:.0} / {:.0} x {:.0} px",
-                    metrics.tip_x,
-                    metrics.tip_y,
-                    metrics.frame_size.0,
-                    metrics.frame_size.1
+                    metrics.tip_x, metrics.tip_y, metrics.frame_size.0, metrics.frame_size.1
                 ),
             ),
             kv(
@@ -579,7 +597,11 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
                 format!(
                     "deg {} · octave {}",
                     metrics.grid_col,
-                    metrics.layout.octaves.get(metrics.grid_row).map_or(0, |o| o - 1)
+                    metrics
+                        .layout
+                        .octaves
+                        .get(metrics.grid_row)
+                        .map_or(0, |o| o - 1)
                 ),
             ),
             kv("landmarks", format!("{}", metrics.landmark_count)),

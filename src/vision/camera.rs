@@ -40,13 +40,7 @@ impl WebcamSource {
     /// Pinning the rate matters for CPU: a camera defaulting to 60 fps would run
     /// the ONNX stages twice as often for no gain, since the whole loop is paced
     /// by whatever the device delivers.
-    pub fn new(
-        camera_id: i32,
-        width: u32,
-        height: u32,
-        fps: u32,
-        mirror: bool,
-    ) -> Result<Self> {
+    pub fn new(camera_id: i32, width: u32, height: u32, fps: u32, mirror: bool) -> Result<Self> {
         let mut cap = videoio::VideoCapture::new(camera_id, videoio::CAP_ANY)?;
         if !cap.is_opened()? {
             return Err(anyhow!("Could not open webcam index {}", camera_id));
@@ -129,7 +123,11 @@ mod tests {
             original,
             "the scratch Mat keeps its allocation across frames"
         );
-        assert_eq!(pixels(&frame), [1, 2, 3, 4, 5, 6], "flipping twice is the identity");
+        assert_eq!(
+            pixels(&frame),
+            [1, 2, 3, 4, 5, 6],
+            "flipping twice is the identity"
+        );
     }
 
     #[test]
@@ -138,13 +136,9 @@ mod tests {
     /// `cargo test --release -- --include-ignored bench_mirror_flip --nocapture`.
     fn bench_mirror_flip() {
         const N: u32 = 2000;
-        let frame = Mat::new_rows_cols_with_default(
-            480,
-            640,
-            core::CV_8UC3,
-            core::Scalar::all(127.0),
-        )
-        .unwrap();
+        let frame =
+            Mat::new_rows_cols_with_default(480, 640, core::CV_8UC3, core::Scalar::all(127.0))
+                .unwrap();
 
         // Old path: a brand-new destination Mat every frame.
         let start = Instant::now();
