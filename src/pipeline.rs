@@ -13,7 +13,7 @@
 //! `Pipeline::tick` is the same frame driven single-threaded, which is what the
 //! tests and any headless one-shot use.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use crate::core::instrument::InstrumentConfig;
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
+use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
 
@@ -127,6 +128,25 @@ pub struct Pipeline {
     /// Wall clock at which the next camera frame is allowed to go to the UI.
     /// Seeded with "now" so the very first frame is uploaded.
     next_feed: Instant,
+    /// Set by the dashboard's `ascii` toggle. The luminance grid is only built
+    /// when the stage actually draws it - downsampling and quantising costs a
+    /// resize and a pass over every cell.
+    ascii_wanted: Arc<AtomicBool>,
+    ascii_interval: Duration,
+    next_ascii: Instant,
+    /// Columns of the ASCII grid; rows follow from the frame aspect.
+    ascii_cols: usize,
+    /// Glyph ramp index (`Ramp::index`) shared with the dashboard, so picking a
+    /// charset in the UI also changes what the terminal dump and `--ascii-dump`
+    /// write without restarting the run.
+    ascii_ramp: Arc<AtomicU8>,
+    /// Terminal mode: print the art to stdout so the renderer can be checked
+    /// without a window (`--no-ui --ascii`).
+    ascii_stdout: bool,
+    /// Optional path to write each rendered ASCII frame to.
+    ascii_dump: Option<String>,
+    /// Per-cell EMA state so the art settles instead of flickering.
+    ascii_layer: AsciiLayer,
 }
 
 /// Everything the loop needs to run, grouped so `Pipeline::new` is not a
@@ -144,6 +164,13 @@ pub struct PipelineConfig {
     pub feed_wanted: Arc<AtomicBool>,
     /// Preview cadence in frames per second; 0 means every frame.
     pub feed_fps: f32,
+    pub ascii_wanted: Arc<AtomicBool>,
+    /// ASCII art cadence in frames per second; 0 means every frame.
+    pub ascii_fps: f32,
+    pub ascii_cols: usize,
+    pub ascii_ramp: Arc<AtomicU8>,
+    pub ascii_dump: Option<String>,
+    pub ascii_stdout: bool,
     pub max_frames: Option<u32>,
     pub debug: bool,
     pub emit_frames: bool,
@@ -163,6 +190,12 @@ impl Pipeline {
             active,
             feed_wanted,
             feed_fps,
+            ascii_wanted,
+            ascii_fps,
+            ascii_cols,
+            ascii_ramp,
+            ascii_dump,
+            ascii_stdout,
             max_frames,
             debug,
             emit_frames,
@@ -208,6 +241,14 @@ impl Pipeline {
             feed_wanted,
             feed_interval: feed_interval(feed_fps),
             next_feed: Instant::now(),
+            ascii_wanted,
+            ascii_interval: feed_interval(ascii_fps),
+            next_ascii: Instant::now(),
+            ascii_cols,
+            ascii_ramp,
+            ascii_stdout,
+            ascii_dump,
+            ascii_layer: AsciiLayer::new(),
         }
     }
 
@@ -561,6 +602,54 @@ impl Pipeline {
         self.metrics.jitter_px = landmark_jitter(&self.previous_landmarks, &self.metrics.landmarks);
         self.previous_landmarks.clone_from(&self.metrics.landmarks);
 
+        // ASCII backdrop. It has its own cadence and its own toggle: the art is
+        // a deliberately coarse view of the frame, so building it costs a resize
+        // plus one pass per cell instead of a 1.2 MB texture upload, and it can
+        // update slower than the skeleton without looking stale.
+        if ascii_wanted(
+            self.emit_frames,
+            &self.ascii_wanted,
+            &self.ascii_dump,
+            self.ascii_stdout,
+        ) && feed_due(self.next_ascii, now)
+        {
+            self.next_ascii = now + self.ascii_interval;
+            let grid = match &frame {
+                Some(frame) => self
+                    .ascii_layer
+                    .render(frame, self.ascii_cols)
+                    .unwrap_or_else(|error| {
+                        if self.debug {
+                            eprintln!("[Ascii] {error}");
+                        }
+                        AsciiGrid::default()
+                    }),
+                // Mock mode has no camera pixels, so the art comes from the
+                // synthetic skeleton - the toggle still demos without a webcam.
+                None if !self.metrics.landmarks.is_empty() => self.ascii_layer.render_landmarks(
+                    &self.metrics.landmarks,
+                    detection.frame_size,
+                    self.ascii_cols,
+                ),
+                None => AsciiGrid::default(),
+            };
+            self.metrics.ascii = grid;
+
+            if !self.metrics.ascii.is_empty() {
+                let ramp = Ramp::from_index(self.ascii_ramp.load(Ordering::Relaxed));
+                if self.ascii_stdout {
+                    print_ascii(&self.metrics.ascii, ramp);
+                }
+                if let Some(path) = &self.ascii_dump {
+                    if let Err(error) = std::fs::write(path, self.metrics.ascii.text(ramp)) {
+                        if self.debug {
+                            eprintln!("[Ascii] failed to write {path}: {error}");
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(geometry) = hand_geometry(&detection) {
             self.metrics.spread = geometry.spread;
             self.metrics.extension = geometry.extension;
@@ -727,6 +816,19 @@ fn should_upload_feed(emit_frames: bool, want: &AtomicBool) -> bool {
     emit_frames && want.load(Ordering::Relaxed)
 }
 
+/// The ASCII grid is only worth building if something will look at it: the stage
+/// toggle, a terminal run, or a dump file. A dump or terminal run works even
+/// with `--no-ui`, where there is no stage to toggle.
+fn ascii_wanted(emit_frames: bool, want: &AtomicBool, dump: &Option<String>, stdout: bool) -> bool {
+    stdout || dump.is_some() || should_upload_feed(emit_frames, want)
+}
+
+/// Home the cursor rather than clearing the screen, so consecutive frames
+/// overwrite in place and the art animates instead of scrolling.
+fn print_ascii(grid: &AsciiGrid, ramp: Ramp) {
+    print!("\x1B[H{}", grid.text(ramp));
+}
+
 /// `fps <= 0` means "every frame". The interval is clamped to a minute so an
 /// absurd rate cannot overflow `Instant + Duration`.
 fn feed_interval(fps: f32) -> Duration {
@@ -857,6 +959,7 @@ mod tests {
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::strategies::FingerPositionStrategy;
+    use crate::vision::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
 
     #[test]
     fn synthetic_hand_has_21_landmarks() {
@@ -986,6 +1089,12 @@ mod tests {
             instrument: instrument.clone(),
             active: Arc::new(AtomicBool::new(true)),
             feed_wanted: Arc::new(AtomicBool::new(false)),
+            ascii_wanted: Arc::new(AtomicBool::new(false)),
+            ascii_fps: DEFAULT_ASCII_FPS,
+            ascii_cols: DEFAULT_COLS,
+            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
+            ascii_dump: None,
+            ascii_stdout: false,
             max_frames,
             debug: false,
             emit_frames: false,
@@ -1185,6 +1294,14 @@ mod tests {
             instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
             active: Arc::new(AtomicBool::new(true)),
             feed_wanted: Arc::new(AtomicBool::new(true)),
+            // The art has its own cadence: the frame is rendered twice, but only
+            // the first is inside the interval.
+            ascii_wanted: Arc::new(AtomicBool::new(true)),
+            ascii_fps: 1.0,
+            ascii_cols: 32,
+            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
+            ascii_dump: None,
+            ascii_stdout: false,
             // One upload per second, so two frames back to back is one upload.
             feed_fps: 1.0,
             max_frames: None,
@@ -1217,6 +1334,17 @@ mod tests {
                 &[30, 20, 10, 255],
                 "BGR became RGBA"
             );
+            // 640x480 at 32 columns is 24 rows, and the frame is one flat grey,
+            // so every cell has to land in the same bucket.
+            assert_eq!((snapshot.ascii.cols, snapshot.ascii.rows), (32, 24));
+            assert!(
+                snapshot
+                    .ascii
+                    .cells
+                    .iter()
+                    .all(|&level| level == snapshot.ascii.cells[0]),
+                "a flat frame must produce a flat grid"
+            );
         }
         // The buffer was moved into the snapshot rather than cloned, so the
         // pipeline is left holding nothing instead of a second 1.2 MB copy.
@@ -1225,11 +1353,35 @@ mod tests {
             "publishing must not keep a second copy of the frame"
         );
 
-        pipeline.advance(outcome()).unwrap();
+        // A second frame inside the interval must not rebuild the art: the grid
+        // is still the render from the first frame, even though this one is white.
+        let bright = opencv::core::Mat::new_rows_cols_with_default(
+            480,
+            640,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::all(255.0),
+        )
+        .unwrap();
+        let mut detection = synthetic_detection(0.0);
+        detection.frame_size = (640, 480);
+        pipeline
+            .advance(FrameOutcome {
+                detection,
+                frame: Some(bright),
+                capture_ms: 1.0,
+                inference_ms: 1.0,
+                latency_ms: 1.0,
+            })
+            .unwrap();
+
         let snapshot = shared.lock().unwrap();
         assert!(
             snapshot.frame_pixels.is_empty(),
             "a frame inside the feed interval carries no pixels"
+        );
+        assert!(
+            snapshot.ascii.cells.iter().all(|&level| level == 0),
+            "the ASCII grid keeps the previous render until its own cadence is due"
         );
     }
 
@@ -1259,6 +1411,12 @@ mod tests {
             instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
             active: Arc::new(AtomicBool::new(true)),
             feed_wanted: Arc::new(AtomicBool::new(false)),
+            ascii_wanted: Arc::new(AtomicBool::new(false)),
+            ascii_fps: DEFAULT_ASCII_FPS,
+            ascii_cols: DEFAULT_COLS,
+            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
+            ascii_dump: None,
+            ascii_stdout: false,
             max_frames: None,
             debug: false,
             emit_frames: false,
@@ -1272,6 +1430,69 @@ mod tests {
         assert_eq!(snapshot.layout.len(), 15);
         assert_eq!(snapshot.mode, "Signal");
         assert!(snapshot.detected, "the mock hand should register");
+    }
+
+    #[test]
+    fn the_ascii_layer_only_runs_when_something_wants_to_see_it() {
+        let off = AtomicBool::new(false);
+        assert!(
+            !ascii_wanted(true, &off, &None, false),
+            "a cleared toggle and no sink means no work"
+        );
+        let on = AtomicBool::new(true);
+        assert!(
+            ascii_wanted(true, &on, &None, false),
+            "the stage is drawing it"
+        );
+        assert!(
+            ascii_wanted(false, &off, &Some("art.txt".to_string()), false),
+            "a dump file is a reason to build the grid even headless"
+        );
+        assert!(ascii_wanted(false, &off, &None, true), "stdout counts too");
+    }
+
+    #[test]
+    fn mock_mode_draws_ascii_from_the_synthetic_hand() {
+        let (bus, rx) = EventBus::new();
+        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+        let mut pipeline = Pipeline::new(PipelineConfig {
+            camera: None,
+            tracker: None,
+            strategy: Box::new(FingerPositionStrategy::new(
+                0,
+                &crate::core::scale::preset("major pentatonic").unwrap(),
+                3,
+            )),
+            sinks: Arc::new(Mutex::new(Vec::new())),
+            event_bus: bus,
+            event_rx: Some(rx),
+            shared: shared.clone(),
+            instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
+            active: Arc::new(AtomicBool::new(true)),
+            feed_wanted: Arc::new(AtomicBool::new(false)),
+            ascii_wanted: Arc::new(AtomicBool::new(true)),
+            ascii_fps: 0.0,
+            ascii_cols: 40,
+            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
+            ascii_dump: None,
+            ascii_stdout: false,
+            feed_fps: 0.0,
+            max_frames: None,
+            debug: false,
+            emit_frames: true,
+        });
+        pipeline.tick().unwrap();
+
+        let snapshot = shared.lock().unwrap();
+        assert_eq!((snapshot.ascii.cols, snapshot.ascii.rows), (40, 30));
+        assert!(
+            snapshot.ascii.cells.iter().any(|&level| level > 0),
+            "the mock hand lights up cells"
+        );
+        assert!(
+            snapshot.ascii.cells.iter().any(|&level| level == 0),
+            "the empty background stays empty"
+        );
     }
 
     #[test]
