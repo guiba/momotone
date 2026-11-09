@@ -491,7 +491,7 @@ mod tests {
             let row = frame.ptr_mut(y).unwrap();
             unsafe {
                 for x in 0..2 {
-                    let src = &TEST_PIXELS[(y as usize * 2 + x as usize) * 3..];
+                    let src = &TEST_PIXELS[(y as usize * 2 + x) * 3..];
                     *row.add(x * 3) = src[0];
                     *row.add(x * 3 + 1) = src[1];
                     *row.add(x * 3 + 2) = src[2];
@@ -635,25 +635,15 @@ mod tests {
 
     /// The old per-pixel sampler, kept only so the benchmark has something to compare
     /// against. Run with `cargo test --release -- --include-ignored bench_sampling`.
-    fn legacy_sample(
-        frame: &Mat,
-        m00: f64,
-        m01: f64,
-        tx: f64,
-        m10: f64,
-        m11: f64,
-        ty: f64,
-        out_w: usize,
-        out_h: usize,
-    ) -> Vec<f32> {
+    fn legacy_sample(frame: &Mat, map: Affine, out_w: usize, out_h: usize) -> Vec<f32> {
         let fw = frame.cols() as f64;
         let fh = frame.rows() as f64;
         let mut data = vec![0.0f32; out_h * out_w * 3];
         unsafe {
             for oy in 0..out_h {
                 for ox in 0..out_w {
-                    let sx = m00 * ox as f64 + m01 * oy as f64 + tx;
-                    let sy = m10 * ox as f64 + m11 * oy as f64 + ty;
+                    let sx = map.m00 * ox as f64 + map.m01 * oy as f64 + map.tx;
+                    let sy = map.m10 * ox as f64 + map.m11 * oy as f64 + map.ty;
                     if sx < 0.0 || sy < 0.0 || sx >= fw || sy >= fh {
                         continue;
                     }
@@ -736,7 +726,10 @@ mod tests {
         let t = Instant::now();
         for _ in 0..N {
             std::hint::black_box(legacy_sample(
-                &frame, 3.75, 0.0, 280.0, 0.0, 3.75, 0.0, 192, 192,
+                &frame,
+                Affine::scale_translate(3.75, 280.0, 0.0),
+                192,
+                192,
             ));
         }
         let old_192 = t.elapsed() / N;
@@ -779,7 +772,10 @@ mod tests {
         let t = Instant::now();
         for _ in 0..N {
             std::hint::black_box(legacy_sample(
-                &frame, 2.7, 0.0, 200.0, 0.0, 2.7, 100.0, 224, 224,
+                &frame,
+                Affine::scale_translate(2.7, 200.0, 100.0),
+                224,
+                224,
             ));
         }
         let old_224 = t.elapsed() / N;

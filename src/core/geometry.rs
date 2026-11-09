@@ -69,32 +69,33 @@ mod tests {
     /// 21 landmarks of a straight, upright hand: wrist at (100, 300), five
     /// fingers 120 px tall, thumb sticking out by `thumb_x`.
     fn upright_hand(thumb_x: f32) -> HandDetectionResult {
-        let mut landmarks = Vec::new();
-        landmarks.push(Landmark {
-            x: 100.0,
-            y: 300.0,
-            z: 0.0,
-        }); // wrist
-        landmarks.push(Landmark {
-            x: 80.0,
-            y: 280.0,
-            z: 0.0,
-        }); // thumb CMC
-        landmarks.push(Landmark {
-            x: thumb_x,
-            y: 240.0,
-            z: 0.0,
-        }); // thumb MCP
-        landmarks.push(Landmark {
-            x: thumb_x,
-            y: 220.0,
-            z: 0.0,
-        }); // thumb IP
-        landmarks.push(Landmark {
-            x: thumb_x,
-            y: 200.0,
-            z: 0.0,
-        }); // thumb tip
+        let mut landmarks = vec![
+            Landmark {
+                x: 100.0,
+                y: 300.0,
+                z: 0.0,
+            }, // wrist
+            Landmark {
+                x: 80.0,
+                y: 280.0,
+                z: 0.0,
+            }, // thumb CMC
+            Landmark {
+                x: thumb_x,
+                y: 240.0,
+                z: 0.0,
+            }, // thumb MCP
+            Landmark {
+                x: thumb_x,
+                y: 220.0,
+                z: 0.0,
+            }, // thumb IP
+            Landmark {
+                x: thumb_x,
+                y: 200.0,
+                z: 0.0,
+            }, // thumb tip
+        ];
         for finger in 0..4 {
             let base_x = 100.0 + finger as f32 * 30.0;
             for joint in 0..4 {

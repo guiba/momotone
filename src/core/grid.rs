@@ -130,7 +130,10 @@ mod tests {
         assert_eq!(grid.octaves, vec![6, 5, 4]);
         assert_eq!(grid.notes[0], 72); // C6
         assert_eq!(grid.notes[grid.len() - 1], 57); // A3
-        assert!(grid.notes.iter().all(|&n| n >= NOTE_LOW && n <= NOTE_HIGH));
+        assert!(grid
+            .notes
+            .iter()
+            .all(|&n| (NOTE_LOW..=NOTE_HIGH).contains(&n)));
     }
 
     #[test]
@@ -175,7 +178,10 @@ mod tests {
         // Six chromatic octaves cannot fit in a 48 semitone range.
         let grid = GridLayout::new(0, &preset("chromatic").unwrap(), 6);
         assert!(grid.rows < 6);
-        assert!(grid.notes.iter().all(|&n| n >= NOTE_LOW && n <= NOTE_HIGH));
+        assert!(grid
+            .notes
+            .iter()
+            .all(|&n| (NOTE_LOW..=NOTE_HIGH).contains(&n)));
         assert!(!grid.is_empty());
     }
 }

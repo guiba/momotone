@@ -1,0 +1,109 @@
+# Makefile — local CI for gesture_rust
+#
+# There is no GitHub/GitLab here: this is the pre-commit gate. Run
+#
+#     make verify        # fmt check + clippy (errors) + cargo check + tests
+#
+# before every commit. `make help` lists everything.
+#
+# Notes:
+#   * The first build compiles OpenCV; afterwards `cargo check` is ~4 s warm.
+#   * `make verify` treats clippy warnings as errors on purpose. Today it is red:
+#     8 lints are live (run `make lint-count` to see them, 5 are auto-fixable with
+#     `make clippy-fix`). Clear them rather than lowering the bar.
+#   * The `block v0.1.6` future-incompat notice comes from a transitive dep and is
+#     not ours to fix.
+
+SHELL      := /bin/sh
+CARGO      ?= cargo
+FRAMES     ?= 200
+IMG        ?= output_frame.png
+OUT        ?= out.png
+CAMERA     ?= 0
+COLS       ?= 70
+
+.DEFAULT_GOAL := help
+
+.PHONY: help verify lint check clippy clippy-fix fmt fmt-check test bench build run \
+        run-release mock ascii headless yolo image stats clean
+
+## The gate: run this before every commit.
+verify: check test fmt-check clippy
+	@echo "verify: OK"
+
+## --- quality ---------------------------------------------------------------
+
+help:
+	@echo "gesture_rust — make targets"
+	@echo ""
+	@echo "  gate     verify | fmt-check | clippy | clippy-fix | check"
+	@echo "  tests    test | bench"
+	@echo "  builds   build | check"
+	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
+	@echo "  misc     stats | clean"
+
+fmt:
+	$(CARGO) fmt
+
+fmt-check:
+	$(CARGO) fmt --check
+
+clippy:
+	$(CARGO) clippy --all-targets -- -D warnings
+
+clippy-fix:
+	$(CARGO) clippy --all-targets --fix
+	$(CARGO) fmt
+
+## Non-fatal listing of what is currently failing, with file:line.
+lint-count:
+	$(CARGO) clippy --all-targets 2>&1 | grep -E '^warning:|^\s+--> src/'
+
+check:
+	$(CARGO) check --all-targets
+
+test:
+	$(CARGO) test
+
+## The #[ignore]d benches (sampling, feed upload, mirror flip).
+bench:
+	$(CARGO) test --release -- --include-ignored
+
+build:
+	$(CARGO) build --release
+
+## --- running -------------------------------------------------------------
+
+run:
+	$(CARGO) run
+
+run-release:
+	$(CARGO) run --release
+
+## Synthetic hand, no webcam, no ONNX assets — the fastest smoke test.
+mock:
+	$(CARGO) run --release -- --mode mock --no-ui --max-frames $(FRAMES) --debug
+
+## ASCII art in the terminal: quickest way to eyeball the renderer.
+ascii:
+	$(CARGO) run --release -- --mode mock --no-ui --ascii --ascii-cols $(COLS) --max-frames $(FRAMES)
+
+## Headless live run: prints fps / capture / inference / dropped per frame.
+headless:
+	$(CARGO) run --release -- --no-ui --max-frames $(FRAMES) --debug
+
+yolo:
+	$(CARGO) run --release -- --model yolo --score-threshold 0.3 --no-ui --max-frames $(FRAMES) --debug
+
+## Offline detection check on a still photo (no webcam needed).
+image:
+	$(CARGO) run --release -- --image $(IMG) --dump-frame $(OUT) --max-frames 1 --debug
+
+## --- misc ---------------------------------------------------------------
+
+stats:
+	@find src -name '*.rs' | xargs wc -l | tail -1
+	@$(CARGO) test 2>/dev/null | grep 'test result'
+
+clean:
+	$(CARGO) clean
