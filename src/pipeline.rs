@@ -856,7 +856,7 @@ fn frame_to_rgba(frame: &Mat) -> Vec<u8> {
 
 fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(src.len() / 3 * 4);
-    for pixel in src.chunks_exact(3) {
+    for pixel in src.as_chunks::<3>().0 {
         rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
     }
     rgba
@@ -1062,15 +1062,16 @@ mod tests {
         }
     }
 
-    fn test_pipeline(
-        strategy: Box<dyn Strategy>,
-        max_frames: Option<u32>,
-    ) -> (
-        Pipeline,
-        Arc<Mutex<Vec<GestureEvent>>>,
-        Arc<Mutex<InstrumentConfig>>,
-        Arc<Mutex<Vec<String>>>,
-    ) {
+    /// A mock pipeline plus the handles a test wants to inspect. A struct rather
+    /// than a four-tuple: the call sites read as names instead of positional slots.
+    struct TestHarness {
+        pipeline: Pipeline,
+        events: Arc<Mutex<Vec<GestureEvent>>>,
+        instrument: Arc<Mutex<InstrumentConfig>>,
+        waveforms: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn test_pipeline(strategy: Box<dyn Strategy>, max_frames: Option<u32>) -> TestHarness {
         let (bus, rx) = EventBus::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let waveforms = Arc::new(Mutex::new(Vec::new()));
@@ -1100,7 +1101,12 @@ mod tests {
             emit_frames: false,
             feed_fps: DEFAULT_FEED_FPS,
         });
-        (pipeline, events, instrument, waveforms)
+        TestHarness {
+            pipeline,
+            events,
+            instrument,
+            waveforms,
+        }
     }
 
     #[test]
@@ -1166,8 +1172,11 @@ mod tests {
 
     #[test]
     fn a_continuous_signal_replaces_the_note_in_the_snapshot_and_the_log() {
-        let (mut pipeline, events, _instrument, _waveforms) =
-            test_pipeline(Box::new(AlwaysSignal), None);
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(Box::new(AlwaysSignal), None);
         pipeline.tick().unwrap();
 
         // The OUTPUT card reads `frequency` when there is no note, so a theremin
@@ -1188,8 +1197,12 @@ mod tests {
 
     #[test]
     fn a_picker_change_rekeys_the_keyboard_on_the_next_frame() {
-        let (mut pipeline, events, instrument, _waveforms) =
-            test_pipeline(Box::new(FingerPositionStrategy::default()), None);
+        let TestHarness {
+            mut pipeline,
+            events,
+            instrument,
+            ..
+        } = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.tick().unwrap();
         assert_eq!(
             pipeline.metrics.layout.len(),
@@ -1226,7 +1239,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_config_does_not_rebuild_every_frame() {
-        let (mut pipeline, _events, _instrument, _waveforms) =
+        let TestHarness { mut pipeline, .. } =
             test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.sync_instrument();
         let version = pipeline.applied_version;
@@ -1490,15 +1503,18 @@ mod tests {
             "the mock hand lights up cells"
         );
         assert!(
-            snapshot.ascii.cells.iter().any(|&level| level == 0),
+            snapshot.ascii.cells.contains(&0),
             "the empty background stays empty"
         );
     }
 
     #[test]
     fn pausing_releases_the_note_and_marks_the_snapshot() {
-        let (mut pipeline, events, _instrument, _waveforms) =
-            test_pipeline(Box::new(AlwaysOn), None);
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), None);
 
         // With no camera the pipeline synthesises a hand, so the strategy fires.
         pipeline.tick().unwrap();
@@ -1520,7 +1536,11 @@ mod tests {
 
     #[test]
     fn a_release_event_is_sent_when_the_gesture_ends() {
-        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(
             Box::new(FirstFrameOnly {
                 armed: AtomicBool::new(true),
             }),
@@ -1551,7 +1571,11 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_while_no_gesture_has_started() {
-        let (mut pipeline, events, _instrument, _waveforms) = test_pipeline(
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(
             Box::new(FirstFrameOnly {
                 armed: AtomicBool::new(false),
             }),
@@ -1633,8 +1657,12 @@ mod tests {
 
     #[test]
     fn a_picker_change_reaches_the_sinks_while_the_loop_is_running() {
-        let (mut pipeline, _events, instrument, waveforms) =
-            test_pipeline(Box::new(AlwaysOn), Some(8));
+        let TestHarness {
+            mut pipeline,
+            instrument,
+            waveforms,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), Some(8));
         let running = Arc::new(AtomicBool::new(true));
 
         // Change the timbre mid-run, exactly as clicking the picker does.
@@ -1661,8 +1689,7 @@ mod tests {
     fn fps_is_the_publish_cadence_not_the_stage_times() {
         // Mock mode paces itself at ~30 fps and does no inference at all, so a
         // frame-rate read off the stage durations would report infinity.
-        let (mut pipeline, _events, _instrument, _waveforms) =
-            test_pipeline(Box::new(AlwaysOn), Some(20));
+        let TestHarness { mut pipeline, .. } = test_pipeline(Box::new(AlwaysOn), Some(20));
         let running = Arc::new(AtomicBool::new(true));
         pipeline.run(&running).unwrap();
 
@@ -1679,8 +1706,11 @@ mod tests {
 
     #[test]
     fn the_staged_run_terminates_and_the_sink_thread_flushes_every_event() {
-        let (mut pipeline, events, _instrument, _waveforms) =
-            test_pipeline(Box::new(AlwaysOn), Some(3));
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), Some(3));
         let running = Arc::new(AtomicBool::new(true));
 
         pipeline.run(&running).unwrap();

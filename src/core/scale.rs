@@ -113,7 +113,10 @@ mod tests {
         let scale = preset("major pentatonic").unwrap();
         let grid = GridLayout::new(root_class("C").unwrap(), &scale, 4);
         assert!(grid.notes.iter().all(|&n| is_in_scale(n, 0, &scale)));
-        assert!(grid.notes.iter().all(|&n| n >= NOTE_LOW && n <= NOTE_HIGH));
+        assert!(grid
+            .notes
+            .iter()
+            .all(|&n| (NOTE_LOW..=NOTE_HIGH).contains(&n)));
         // C, D, E, G, A per octave - no F, no B, no semitone neighbours.
         assert!(grid.notes.iter().all(|&n| n % 12 != 5 && n % 12 != 11));
     }
