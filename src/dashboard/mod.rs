@@ -17,7 +17,7 @@ pub mod gauges;
 pub mod metrics;
 pub mod skeleton;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
 use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
+use crate::vision::ascii::Ramp;
 
 /// Number of samples kept for the rolling sparklines (~4 s at 30 fps).
 const HISTORY: usize = 120;
@@ -63,6 +64,8 @@ enum Message {
     ToggleBox,
     ToggleLabels,
     ToggleFeed,
+    ToggleAscii,
+    PickRamp(String),
     ClearHistory,
     PickScale(String),
     PickRoot(String),
@@ -77,6 +80,14 @@ pub struct Dashboard {
     /// Mirrors `show_feed` so the pipeline knows whether to build the RGBA
     /// upload at all.
     feed: Arc<AtomicBool>,
+    /// Mirrors `show_ascii` so the pipeline only builds the luminance grid while
+    /// the stage is drawing it.
+    ascii: Arc<AtomicBool>,
+    /// The glyph ramp the ASCII layer renders with (`--ascii-ramp`).
+    ramp: Ramp,
+    /// Shared with the pipeline so the charset the UI picks is also the one the
+    /// terminal print and `--ascii-dump` use.
+    ramp_index: Arc<AtomicU8>,
     /// The instrument the player is on. The pickers write to this and the
     /// pipeline picks the change up on the next frame.
     instrument: Arc<Mutex<InstrumentConfig>>,
@@ -93,6 +104,8 @@ pub struct Dashboard {
     /// The stage is a backdrop + skeleton by default; the camera is only
     /// uploaded when this is on.
     show_feed: bool,
+    /// ASCII art behind the skeleton, off by default.
+    show_ascii: bool,
     /// Per-semitone brightness of the on-screen keyboard. Set to 1.0 when a
     /// note is played, exponentially faded on every UI tick.
     note_trail: [f32; NOTE_COUNT],
@@ -106,8 +119,10 @@ impl Dashboard {
         shared: Arc<Mutex<FrameMetrics>>,
         active: Arc<AtomicBool>,
         feed: Arc<AtomicBool>,
+        ascii: Arc<AtomicBool>,
         instrument: Arc<Mutex<InstrumentConfig>>,
         fade_ms: f32,
+        ramp_index: Arc<AtomicU8>,
     ) -> Self {
         let instrument_view = instrument
             .lock()
@@ -117,6 +132,7 @@ impl Dashboard {
             shared,
             active,
             feed,
+            ascii,
             instrument,
             instrument_view,
             tab: Tab::Basic,
@@ -127,6 +143,9 @@ impl Dashboard {
             show_box: true,
             show_labels: false,
             show_feed: false,
+            show_ascii: false,
+            ramp: Ramp::from_index(ramp_index.load(Ordering::Relaxed)),
+            ramp_index,
             note_trail: [0.0; NOTE_COUNT],
             fade_tau: fade_ms.max(1.0) / 1000.0,
             last_tick: Instant::now(),
@@ -178,6 +197,16 @@ impl Dashboard {
                 self.show_feed = !self.show_feed;
                 self.feed.store(self.show_feed, Ordering::Relaxed);
             }
+            Message::ToggleAscii => {
+                self.show_ascii = !self.show_ascii;
+                self.ascii.store(self.show_ascii, Ordering::Relaxed);
+            }
+            Message::PickRamp(name) => {
+                if let Some(ramp) = Ramp::parse(&name) {
+                    self.ramp = ramp;
+                    self.ramp_index.store(ramp.index(), Ordering::Relaxed);
+                }
+            }
             Message::ClearHistory => {
                 self.volume_history.clear();
                 self.confidence_history.clear();
@@ -213,7 +242,7 @@ impl Dashboard {
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
-                "{} · {} · {} {} · {}x{} · {} · trail {:.0} ms",
+                "{} · {} · {} {} · {}x{} · {} · trail {:.0} ms{}",
                 self.metrics.mode,
                 self.metrics.sink,
                 self.metrics.scale,
@@ -221,7 +250,17 @@ impl Dashboard {
                 self.metrics.layout.rows,
                 self.metrics.layout.cols,
                 self.metrics.waveform,
-                self.fade_tau * 1000.0
+                self.fade_tau * 1000.0,
+                if self.show_ascii {
+                    format!(
+                        " · ascii {} {}x{}",
+                        self.ramp.name(),
+                        self.metrics.ascii.cols,
+                        self.metrics.ascii.rows
+                    )
+                } else {
+                    String::new()
+                }
             ))
             .size(12)
             .color(MUTED),
@@ -234,6 +273,14 @@ impl Dashboard {
             small_button(
                 if self.show_feed { "hide feed" } else { "feed" },
                 Message::ToggleFeed,
+            ),
+            small_button(
+                if self.show_ascii {
+                    "hide ascii"
+                } else {
+                    "ascii"
+                },
+                Message::ToggleAscii,
             ),
             small_button("box", Message::ToggleBox),
             small_button("labels", Message::ToggleLabels),
@@ -249,6 +296,10 @@ impl Dashboard {
             canvas(Skeleton {
                 image: self.frame_image.clone(),
                 show_feed: self.show_feed,
+                ascii: self.metrics.ascii.clone(),
+                show_ascii: self.show_ascii,
+                ramp: self.ramp,
+                frequency: self.metrics.frequency,
                 landmarks: self.metrics.landmarks.clone(),
                 frame_size: self.metrics.frame_size,
                 hand_box: self.metrics.hand_box,
@@ -289,6 +340,7 @@ impl Dashboard {
             Tab::Basic => column![
                 instrument_card(&self.instrument_view),
                 note_card(&self.metrics),
+                render_card(self.ramp, self.show_ascii),
                 meter_card("Volume", self.metrics.volume, VOLUME),
                 meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
                 status_card(&self.metrics),
@@ -393,8 +445,10 @@ pub fn run(
     shared: Arc<Mutex<FrameMetrics>>,
     active: Arc<AtomicBool>,
     feed: Arc<AtomicBool>,
+    ascii: Arc<AtomicBool>,
     instrument: Arc<Mutex<InstrumentConfig>>,
     fade_ms: f32,
+    ramp_index: Arc<AtomicU8>,
 ) -> iced::Result {
     iced::application(
         move || {
@@ -402,8 +456,10 @@ pub fn run(
                 shared.clone(),
                 active.clone(),
                 feed.clone(),
+                ascii.clone(),
                 instrument.clone(),
                 fade_ms,
+                ramp_index.clone(),
             )
         },
         Dashboard::update,
@@ -496,6 +552,32 @@ fn instrument_card<'a>(config: &InstrumentConfig) -> Element<'a, Message> {
                     config.layout.cols,
                     config.layout.len()
                 ),
+            ),
+        ]
+        .spacing(8),
+    )
+}
+
+/// The ASCII charset picker. Every ramp is the same nine brightness buckets, so
+/// the preview line is just the ramp's own glyphs, dark to light.
+fn render_card<'a>(ramp: Ramp, show_ascii: bool) -> Element<'a, Message> {
+    card(
+        "RENDER",
+        column![
+            pick_list(
+                Ramp::names(),
+                Some(ramp.name().to_string()),
+                Message::PickRamp
+            )
+            .width(Length::Fill),
+            text(ramp.preview()).size(16),
+            kv(
+                "backdrop",
+                if show_ascii {
+                    format!("on - {} ramp", ramp.name())
+                } else {
+                    "off - press the ascii button".to_string()
+                },
             ),
         ]
         .spacing(8),

@@ -16,8 +16,9 @@ use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::grid::GridLayout;
 use crate::core::Landmark;
-use crate::core::{NOTE_COUNT, NOTE_MARGIN};
-use crate::dashboard::metrics::{note_frequency, note_index, note_name};
+use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
+use crate::dashboard::metrics::{note_for_frequency, note_frequency, note_index, note_name};
+use crate::vision::ascii::{AsciiGrid, Ramp};
 
 /// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
 /// the palm, 1..5 are thumb..pinky. See `visualizer/mod.rs` for the same list
@@ -90,6 +91,17 @@ const GLOW_RINGS: usize = 12;
 /// Below this the trail is too dim to be worth a fill.
 const TRAIL_EPS: f32 = 0.02;
 
+// --- ascii art -------------------------------------------------------------
+/// A monospaced glyph is roughly 0.6 em wide and 1 em tall. Deriving the cell
+/// grid from that ratio is what makes the art fill the panel instead of either
+/// stretching or leaving a band of empty panel at the bottom.
+const GLYPH_ASPECT: f32 = 0.6;
+/// Smallest glyph that still reads as art rather than noise; the grid is
+/// coarsened until every cell is at least this tall.
+const MIN_GLYPH_SIZE: f32 = 6.0;
+/// A row darker than this is skipped entirely - an empty row costs a text run.
+const ROW_SILENT: f32 = 0.02;
+
 fn tint(color: Color, alpha: f32) -> Color {
     Color {
         r: color.r,
@@ -105,6 +117,106 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
         g: a.g + (b.g - a.g) * t,
         b: a.b + (b.b - a.b) * t,
         a: 1.0,
+    }
+}
+
+/// The colour of a pitch class (0 = C, 11 = B), shared by the keyboard and the
+/// ASCII backdrop so the art always matches the key being played.
+fn pitch_color(note: u8) -> Color {
+    PITCH_COLORS[(note % 12) as usize]
+}
+
+/// The cell grid that tiles the panel: glyph size, then how many columns and
+/// rows fit at that size. A glyph is `GLYPH_ASPECT` em wide and 1 em tall, so
+/// deriving the counts from the size is what stops the art from stretching.
+/// `None` when the panel is too small for the art to read as art.
+fn cell_grid(grid: &AsciiGrid, bounds: Rectangle) -> Option<(usize, usize, f32)> {
+    if grid.is_empty() || bounds.width < 40.0 || bounds.height < 20.0 {
+        return None;
+    }
+    // Use the grid's own column count when the panel can hold it at a legible
+    // size; only a panel too narrow for the glyph forces a coarser grid. Doing
+    // it this way avoids a divide/multiply round trip whose float error would
+    // silently drop the last column.
+    let ideal = bounds.width / (grid.cols as f32 * GLYPH_ASPECT);
+    let (size, cols) = if ideal < MIN_GLYPH_SIZE {
+        (
+            MIN_GLYPH_SIZE,
+            ((bounds.width / (MIN_GLYPH_SIZE * GLYPH_ASPECT)).floor() as usize).max(1),
+        )
+    } else {
+        (ideal, grid.cols)
+    };
+    let rows = ((bounds.height / size + 1e-6).floor() as usize).max(1);
+    Some((cols, rows, size))
+}
+
+/// The colour the backdrop should take: the pitch colours of the keys that are
+/// still lit, blended by how bright each trail cell is. Squaring the level lets
+/// the held key dominate its fading neighbours, so moving from one note to
+/// another cross-fades over the trail's time constant instead of snapping.
+/// With nothing sounding (or in theremin mode, where there is no note) it falls
+/// back to the nearest key the frequency implies, and finally to neutral grey.
+fn backdrop_colour(
+    trail: &[f32; NOTE_COUNT],
+    current: Option<u8>,
+    frequency: Option<f32>,
+) -> Color {
+    let (mut r, mut g, mut b, mut weight) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (index, &level) in trail.iter().enumerate() {
+        if level < TRAIL_EPS {
+            continue;
+        }
+        let w = level * level;
+        let color = pitch_color(NOTE_LOW + index as u8);
+        r += color.r * w;
+        g += color.g * w;
+        b += color.b * w;
+        weight += w;
+    }
+    if weight >= TRAIL_EPS {
+        return Color {
+            r: r / weight,
+            g: g / weight,
+            b: b / weight,
+            a: 1.0,
+        };
+    }
+    match current.or_else(|| frequency.map(note_for_frequency)) {
+        Some(note) => pitch_color(note),
+        None => MUTED,
+    }
+}
+
+/// The ASCII backdrop: one monospaced text run per row, tinted with the colour
+/// of the note being played. Drawing whole rows rather than individual cells
+/// keeps the geometry count at `rows` text runs instead of rows * cols glyph
+/// runs.
+fn ascii_art(frame: &mut Frame, bounds: Rectangle, grid: &AsciiGrid, ramp: Ramp, colour: Color) {
+    let Some((cols, rows, size)) = cell_grid(grid, bounds) else {
+        return;
+    };
+
+    for row in 0..rows {
+        // Nearest-neighbour resample: the grid was built at the frame's aspect,
+        // the panel has whatever aspect the window happens to have.
+        let source_row = row * grid.rows / rows;
+        let mean = grid.row_mean(source_row);
+        if mean < ROW_SILENT {
+            continue;
+        }
+        let mut content = String::with_capacity(cols + 1);
+        for col in 0..cols {
+            content.push(ramp.glyph(grid.level(source_row, col * grid.cols / cols)));
+        }
+        frame.fill_text(Text {
+            content,
+            position: Point::new(0.0, row as f32 * size),
+            max_width: f32::INFINITY,
+            color: tint(colour, 0.12 + 0.68 * mean),
+            size: size.into(),
+            ..Default::default()
+        });
     }
 }
 
@@ -213,7 +325,7 @@ fn keyboard(
                     Point::new(band_x + cell_w * col as f32, band_y + cell_h * row as f32),
                     Size::new(cell_w, cell_h),
                 ),
-                tint(PITCH_COLORS[(note % 12) as usize], 0.10),
+                tint(pitch_color(note), 0.10),
             );
         }
     }
@@ -264,7 +376,7 @@ fn keyboard(
             }
             let x = band_x + cell_w * col as f32;
             let y = band_y + cell_h * row as f32;
-            let color = PITCH_COLORS[(note % 12) as usize];
+            let color = pitch_color(note);
 
             frame.fill(
                 &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
@@ -295,7 +407,7 @@ fn keyboard(
         let col = cell % layout.cols;
         let x = band_x + cell_w * col as f32;
         let y = band_y + cell_h * row as f32;
-        let color = PITCH_COLORS[(note % 12) as usize];
+        let color = pitch_color(note);
         frame.stroke(
             &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
             Stroke::default().with_color(color).with_width(2.0),
@@ -335,6 +447,15 @@ pub struct Skeleton {
     pub image: Option<Handle>,
     /// Header toggle: put the webcam image back behind the skeleton.
     pub show_feed: bool,
+    /// Quantised luminance grid for the ASCII backdrop, and the toggle that
+    /// decides whether it is drawn.
+    pub ascii: AsciiGrid,
+    pub show_ascii: bool,
+    /// Glyph ramp used to render the grid.
+    pub ramp: Ramp,
+    /// The continuous theremin frequency, used to pick a colour when the
+    /// gesture does not quantise to a note.
+    pub frequency: Option<f32>,
     pub landmarks: Vec<Landmark>,
     pub frame_size: (usize, usize),
     pub hand_box: Option<(f32, f32, f32, f32)>,
@@ -373,6 +494,10 @@ impl<Message> Program<Message> for Skeleton {
             height: bounds.height - 2.0 * map.offset_y,
         };
         backdrop(&mut frame, bounds, stage);
+        if self.show_ascii {
+            let colour = backdrop_colour(&self.note_trail, self.current_note, self.frequency);
+            ascii_art(&mut frame, bounds, &self.ascii, self.ramp, colour);
+        }
         keyboard(
             &mut frame,
             stage,
@@ -393,7 +518,7 @@ impl<Message> Program<Message> for Skeleton {
                         Point::new(tip.x, stage.y + stage.height),
                     ),
                     Stroke::default()
-                        .with_color(tint(PITCH_COLORS[(note % 12) as usize], 0.35))
+                        .with_color(tint(pitch_color(note), 0.35))
                         .with_width(1.5),
                 );
             }
@@ -514,5 +639,103 @@ impl<Message> Program<Message> for Skeleton {
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(cols: usize, rows: usize) -> AsciiGrid {
+        AsciiGrid {
+            cols,
+            rows,
+            cells: vec![0u8; cols * rows],
+        }
+    }
+
+    #[test]
+    fn the_cell_grid_tiles_the_panel_without_overflowing_it() {
+        let panel = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 700.0,
+        };
+        let (cols, rows, size) = cell_grid(&grid(140, 105), panel).unwrap();
+        assert_eq!((cols, rows), (140, 58));
+        assert!(cols as f32 * size * GLYPH_ASPECT <= panel.width + 1e-3);
+        assert!(rows as f32 * size <= panel.height + 1e-3);
+    }
+
+    #[test]
+    fn a_coarse_grid_gets_bigger_glyphs_and_fewer_rows() {
+        let panel = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 700.0,
+        };
+        let (cols, rows, size) = cell_grid(&grid(32, 24), panel).unwrap();
+        assert_eq!((cols, rows), (32, 13));
+        assert!(size > 30.0);
+    }
+
+    #[test]
+    fn a_panel_too_small_or_an_empty_grid_draws_nothing() {
+        assert!(cell_grid(
+            &grid(140, 105),
+            Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 30.0,
+                height: 12.0,
+            }
+        )
+        .is_none());
+        assert!(cell_grid(
+            &AsciiGrid::default(),
+            Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 700.0,
+            }
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_backdrop_takes_the_colour_of_the_held_key() {
+        let mut trail = [0.0; NOTE_COUNT];
+        trail[note_index(60)] = 1.0; // C4 -> pitch class C
+        assert_eq!(backdrop_colour(&trail, Some(60), None), PITCH_COLORS[0]);
+    }
+
+    #[test]
+    fn a_fading_trail_cross_fades_towards_the_held_key() {
+        let mut trail = [0.0; NOTE_COUNT];
+        trail[note_index(64)] = 1.0; // E, still held
+        trail[note_index(60)] = 0.1; // C, nearly gone
+        let colour = backdrop_colour(&trail, Some(64), None);
+        let (c, e) = (PITCH_COLORS[0], PITCH_COLORS[4]);
+        // Squared levels: 1.0 and 0.01, so the blend is 99 % E and 1 % C.
+        let weight = 1.0 + 0.01;
+        for (channel, expected) in [
+            (colour.r, (e.r + c.r * 0.01) / weight),
+            (colour.g, (e.g + c.g * 0.01) / weight),
+            (colour.b, (e.b + c.b * 0.01) / weight),
+        ] {
+            assert!((channel - expected).abs() < 1e-3);
+        }
+        assert!(colour.g < e.g); // the fading C drags the green down a little
+    }
+
+    #[test]
+    fn a_silent_backdrop_uses_the_theremin_key_or_neutral_grey() {
+        let trail = [0.0; NOTE_COUNT];
+        // 440 Hz is A4, pitch class A.
+        assert_eq!(backdrop_colour(&trail, None, Some(440.0)), PITCH_COLORS[9]);
+        assert_eq!(backdrop_colour(&trail, None, None), MUTED);
     }
 }
