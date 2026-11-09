@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 
 use crate::core::grid::GridLayout;
 use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
+use crate::vision::ascii::AsciiGrid;
 
 /// Maximum number of events kept in the on-screen log.
 pub const LOG_CAPACITY: usize = 12;
@@ -30,6 +31,17 @@ pub fn cell_index(layout: &GridLayout, note: u8) -> Option<usize> {
 /// Equal-tempered frequency of a MIDI note, A4 (69) = 440 Hz.
 pub fn note_frequency(note: u8) -> f32 {
     440.0 * 2.0f32.powf((note as f32 - 69.0) / 12.0)
+}
+
+/// MIDI note closest to a frequency, clamped to the playable keyboard range.
+/// The theremin has no discrete note, so the ASCII backdrop uses the nearest
+/// key to pick its colour.
+pub fn note_for_frequency(freq: f32) -> u8 {
+    if !freq.is_finite() || freq <= 0.0 {
+        return NOTE_LOW;
+    }
+    let semitones = 69.0 + 12.0 * (freq / 440.0).log2();
+    semitones.round().clamp(NOTE_LOW as f32, NOTE_HIGH as f32) as u8
 }
 
 /// Exponentially fade the whole keyboard trail by `dt_secs`, using `tau_secs`
@@ -76,6 +88,10 @@ pub struct FrameMetrics {
     /// the video and the skeleton in the same canvas. Only produced when the UI
     /// is running.
     pub frame_pixels: Vec<u8>,
+    /// Quantised luminance grid behind the skeleton: the ASCII art backdrop.
+    /// Published only while the `ascii` toggle is on (or a dump/terminal output
+    /// is requested), at `--ascii-fps`.
+    pub ascii: AsciiGrid,
 
     // --- gesture output ---
     pub note: Option<u8>,
@@ -181,5 +197,18 @@ mod tests {
         // A zero/negative tau is clamped rather than freezing the trail.
         fade_trail(&mut fast, 1.0, 0.0);
         assert!(fast[note_index(48)] < 0.02);
+    }
+
+    #[test]
+    fn a_frequency_maps_to_the_nearest_key_clamped_to_the_keyboard() {
+        assert_eq!(note_for_frequency(440.0), 69);
+        // Half a semitone either side of A4 rounds to the closer key.
+        assert_eq!(note_for_frequency(440.0 * 2.0f32.powf(0.04)), 69);
+        assert_eq!(note_for_frequency(440.0 * 2.0f32.powf(0.06)), 70);
+        // Out of range or nonsense input lands on the nearest playable key.
+        assert_eq!(note_for_frequency(10.0), NOTE_LOW);
+        assert_eq!(note_for_frequency(20000.0), NOTE_HIGH);
+        assert_eq!(note_for_frequency(0.0), NOTE_LOW);
+        assert_eq!(note_for_frequency(f32::NAN), NOTE_LOW);
     }
 }

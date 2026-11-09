@@ -10,7 +10,7 @@ mod visualizer;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
@@ -22,6 +22,7 @@ use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
 use crate::strategies::theremin::ThereminStrategy;
 use crate::strategies::FingerPositionStrategy;
+use crate::vision::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
 use crate::visualizer::Visualizer;
@@ -113,6 +114,34 @@ struct Args {
     /// updating at full frame rate. 0 sends every frame.
     #[arg(long, default_value_t = pipeline::DEFAULT_FEED_FPS)]
     feed_fps: f32,
+
+    /// Draw the camera as ASCII art behind the skeleton. The dashboard's `ascii`
+    /// button flips the same flag at runtime; this starts the layer switched on.
+    #[arg(long, default_value_t = false)]
+    ascii: bool,
+
+    /// Columns of the ASCII grid. Rows are derived from the frame aspect, and the
+    /// stage resamples the grid to the cells that actually fit the panel.
+    #[arg(long, default_value_t = DEFAULT_COLS)]
+    ascii_cols: usize,
+
+    /// How often the ASCII grid is rebuilt. It is a backdrop, not a video, so a
+    /// lower rate than the camera is fine. 0 rebuilds every frame.
+    #[arg(long, default_value_t = DEFAULT_ASCII_FPS)]
+    ascii_fps: f32,
+
+    /// Glyph ramp: `blocks` (▏▎▍▌▋▊▉█, safest in the window), `shades` (the
+    /// bottom-up brightness scale ▁▂▃▄▅▆▇█), `ascii` (the classic `.:-=+*#@`),
+    /// `braille` (dot matrix - good in a terminal, the iced canvas falls back to a
+    /// non-monospaced font for those codepoints) or `dots` (sparse halftone).
+    /// The dashboard's RENDER card switches ramp at runtime.
+    #[arg(long, default_value = "blocks")]
+    ascii_ramp: String,
+
+    /// Write each rendered ASCII frame to this file. Handy for checking the art
+    /// headlessly, e.g. with `--mode mock --no-ui --ascii-dump art.txt`.
+    #[arg(long)]
+    ascii_dump: Option<String>,
 
     /// Stop mirroring the webcam. By default the frame is flipped horizontally
     /// so the stage behaves like a mirror: your right hand shows up on the
@@ -229,6 +258,17 @@ fn main() -> Result<()> {
     })?;
     let instrument =
         core::instrument::InstrumentConfig::new(&args.scale, &args.root, args.octaves, waveform)?;
+
+    let ascii_ramp = Ramp::parse(&args.ascii_ramp).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown ascii ramp '{}'; available: {}",
+            args.ascii_ramp,
+            Ramp::names().join(", ")
+        )
+    })?;
+    // The ramp is shared between the dashboard and the pipeline as an index, so a
+    // pick in the UI also changes the terminal print and `--ascii-dump` output.
+    let ascii_ramp = Arc::new(AtomicU8::new(ascii_ramp.index()));
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
@@ -347,6 +387,9 @@ fn main() -> Result<()> {
     // The stage hides the camera by default, so the pipeline skips the per-frame
     // RGBA conversion until the feed button is pressed.
     let feed = Arc::new(AtomicBool::new(false));
+    // Same shape as `feed`: the pipeline only builds the luminance grid while the
+    // stage says it is drawn.
+    let ascii = Arc::new(AtomicBool::new(args.ascii));
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
         camera,
         tracker,
@@ -359,6 +402,14 @@ fn main() -> Result<()> {
         active: active.clone(),
         feed_wanted: feed.clone(),
         feed_fps: args.feed_fps,
+        ascii_wanted: ascii.clone(),
+        ascii_fps: args.ascii_fps,
+        ascii_cols: args.ascii_cols,
+        ascii_ramp: ascii_ramp.clone(),
+        ascii_dump: args.ascii_dump.clone(),
+        // With no window there is no stage to look at, so `--ascii` means the
+        // art goes to stdout instead.
+        ascii_stdout: args.no_ui && args.ascii,
         max_frames: args.max_frames,
         debug: args.debug,
         emit_frames: !args.no_ui,
@@ -379,7 +430,15 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(shared, active, feed, instrument, args.fade_ms);
+    let ui_result = dashboard::run(
+        shared,
+        active,
+        feed,
+        ascii,
+        instrument,
+        args.fade_ms,
+        ascii_ramp,
+    );
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
