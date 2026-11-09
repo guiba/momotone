@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 
 use crate::core::grid::GridLayout;
+use crate::core::telemetry::StageProfile;
 use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
 use crate::vision::ascii::AsciiGrid;
 
@@ -104,6 +105,10 @@ pub struct FrameMetrics {
 
     // --- performance ---
     pub fps: f32,
+    /// Tail behaviour of each stage, refreshed once a second. The instantaneous
+    /// fields below are the last frame; this is what a regression actually looks
+    /// like.
+    pub perf: StageProfile,
     /// Time inference spent on the frame that produced this snapshot.
     pub frame_ms: f64,
     /// Time the capture stage spent reading that frame from the camera.
