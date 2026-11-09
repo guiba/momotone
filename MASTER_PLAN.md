@@ -49,15 +49,10 @@ The rearchitecture is finished when all of these are true and measurable:
 **Goal:** make the current behaviour measurable and protected, so every later change
 can be compared against it.
 
-### T0.1 — Freeze a baseline measurement
-Run and record, into `bench/baseline.md`:
-```bash
-cargo run --release -- --no-ui --max-frames 200 --debug          # MediaPipe
-cargo run --release -- --model yolo --score-threshold 0.3 --no-ui --max-frames 200 --debug
-cargo test; cargo clippy; cargo fmt --check
-```
-Record: fps, frame_ms, capture_ms, latency_ms, detector_us, landmarker_us, dropped,
-test count, clippy count. **Effort S.**
+### T0.1 — Freeze a baseline measurement — **done**, see `bench/baseline.md`
+Headline numbers (release build, live camera, MediaPipe): capture p50 **33.2 ms**,
+inference p50 **8.2 ms**, camera→publish 0.01 ms, dispatch→sink < 1 ms, 29.4 fps,
+0 frames dropped. The camera read is the loop; inference is a quarter of it.
 
 ### T0.2 — Local gate (`Makefile`, already written)
 No GitHub/GitLab here, so the gate is `make verify` = `check` + `test` + `fmt --check` +
@@ -83,15 +78,14 @@ All are one-liners except the last two, which are fixed by the Phase 2 refactor 
 Until they are cleared, `make verify` stops at clippy — the intent is that it stays red
 until the tree is clean.
 
-### T0.4 — Add end-to-end latency instrumentation
-- Stamp each `GestureEvent` with `Instant` at dispatch; the sink records the delta.
-- Print the cpal stream's **actual** sample rate and buffer size at startup.
-- Report p50/p95/p99 for capture, inference, dispatch→sink, and publish, not just
-  last-frame values (a small ring buffer in `telemetry`).
+### T0.4 — End-to-end latency instrumentation — **done**
+`src/core/telemetry.rs`: a 128-sample ring per stage with nearest-rank percentiles,
+published into `FrameMetrics.perf` once a second and printed by `--debug` as
+`p50/p95/p99/max` for capture, inference, camera→publish and dispatch→sink. The
+audio stream's rate is logged at startup; cpal 0.17 exposes no buffer size, so the
+block length still has to be read from the callback (Phase 1).
 
-**Effort S.** This is the prerequisite for judging every performance claim afterwards.
-
-**Phase 0 exit:** a baseline file in the repo, CI green, latency printed.
+**Phase 0 exit:** done. Baseline file in the repo, gate green, percentiles printed.
 
 ---
 
@@ -103,7 +97,7 @@ Each of these is a standalone commit. Do them in this order.
 | :-- | :-- | :-- | :-- | :-- |
 | **1.1** | Use the stream's real sample rate; delete `Synthesizer.sample_rate` | `audio/synthesizer.rs`, `main.rs` | add a test asserting `start()` uses `config.sample_rate`; print it | S |
 | **1.2** | Remove `unsafe impl Sync for StreamWrapper`; relax `Sink: Send + Sync` → `Sink: Send` | `audio/synthesizer.rs`, `core/mod.rs` | compile + existing tests | S |
-| **1.3** | Sink thread stops polling: `rx.recv()` + a `Shutdown` sentinel (or rely on the sender dropping) | `pipeline.rs`, `core/event_bus.rs` | test `run` flushes all events on exit (exists: `the_staged_run_terminates_and_the_sink_thread_flushes_every_event`) | S |
+| **1.3** | Sink thread stops polling: `rx.recv()` + a `Shutdown` sentinel (or rely on the sender dropping) | `pipeline.rs`, `core/event_bus.rs` | measured dispatch→sink is already < 1 ms, so this is a CPU/wakeup win, not a latency win | S |
 | **1.4** | Band-limited waveforms + frequency ramp. Keep phase in radians; ramp `frequency` toward the target over ~15 ms; synthesise the square/saw with a band limit; soft-clip (`tanh`) instead of `clamp(-1,1)` | `audio/synthesizer.rs`, `core/instrument.rs` | unit test: phase continuity across a frequency step; test: no sample exceeds ±1 | M |
 | **1.5** | Mock-mode deadline clock (`next = start + 33 ms`, sleep the remainder) | `pipeline.rs` | assert measured mock fps ≈ 30 | S |
 | **1.6** | ORT `intra_op_thread_count` (CLI `--ort-threads`, default 1–2) and, if available, provider selection | `vision/tracker.rs`, `vision/yolo_pose.rs` | `--debug` stage timings before/after | S |
@@ -347,7 +341,7 @@ everything later is judged against them.
 
 | Phase | Tasks | Effort | Status |
 | :-- | :-- | :-- | :-- |
-| 0 Baseline & CI | T0.1–T0.4 | 1 d | ☐ |
+| 0 Baseline & CI | T0.1–T0.4 | 1 d | ☑ done |
 | 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☐ |
 | 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☐ |
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☐ |

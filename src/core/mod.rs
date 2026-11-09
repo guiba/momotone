@@ -3,6 +3,7 @@ pub mod geometry;
 pub mod grid;
 pub mod instrument;
 pub mod scale;
+pub mod telemetry;
 pub mod types;
 
 use crate::core::grid::GridLayout;

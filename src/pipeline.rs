@@ -21,9 +21,10 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use opencv::prelude::*;
 
-use crate::core::event_bus::EventBus;
+use crate::core::event_bus::{EventBus, QueuedEvent};
 use crate::core::geometry::hand_geometry;
 use crate::core::instrument::InstrumentConfig;
+use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
@@ -87,7 +88,7 @@ pub struct Pipeline {
     /// Drained by whoever owns it: the pipeline thread while running inline, the
     /// sink thread once `run` has spawned it. Exactly one consumer, so events reach
     /// the sinks in the order they were dispatched.
-    event_rx: Option<Receiver<GestureEvent>>,
+    event_rx: Option<Receiver<QueuedEvent>>,
     shared: Arc<Mutex<FrameMetrics>>,
     /// The instrument the player is currently on. The dashboard pickers write
     /// to it; the pipeline notices the version change and re-keys the strategy
@@ -103,6 +104,13 @@ pub struct Pipeline {
     /// Frames the capture stage read and dropped, so a bottleneck is visible
     /// instead of invisible.
     capture: Arc<CaptureCounters>,
+    /// Rolling stage timings. The frame loop is paced by the slowest stage, so a
+    /// regression shows up as a tail here long before the average moves.
+    stage_capture: Samples,
+    stage_inference: Samples,
+    stage_latency: Samples,
+    /// Read by the sink thread, which is a different thread, hence the shared ring.
+    stage_dispatch: Arc<Mutex<Samples>>,
     /// True while a gesture is actively driving the sinks. Used to send exactly
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
@@ -157,7 +165,7 @@ pub struct PipelineConfig {
     pub strategy: Box<dyn Strategy>,
     pub sinks: Arc<Mutex<Vec<Box<dyn Sink>>>>,
     pub event_bus: EventBus,
-    pub event_rx: Option<Receiver<GestureEvent>>,
+    pub event_rx: Option<Receiver<QueuedEvent>>,
     pub shared: Arc<Mutex<FrameMetrics>>,
     pub instrument: Arc<Mutex<InstrumentConfig>>,
     pub active: Arc<AtomicBool>,
@@ -229,6 +237,10 @@ impl Pipeline {
             metrics: context,
             previous_landmarks: Vec::new(),
             capture: Arc::new(CaptureCounters::default()),
+            stage_capture: Samples::default(),
+            stage_inference: Samples::default(),
+            stage_latency: Samples::default(),
+            stage_dispatch: Arc::new(Mutex::new(Samples::default())),
             gesture_active: false,
             last_detection: Instant::now(),
             last_publish: Instant::now(),
@@ -332,6 +344,7 @@ impl Pipeline {
             let sinks = self.sinks.clone();
             let running = running.clone();
             let debug = self.debug;
+            let dispatch = self.stage_dispatch.clone();
             let rx = self.event_rx.take();
             std::thread::spawn(move || {
                 let Some(rx) = rx else {
@@ -339,14 +352,23 @@ impl Pipeline {
                 };
                 while running.load(Ordering::Relaxed) {
                     match rx.recv_timeout(Duration::from_millis(SINK_POLL_MS)) {
-                        Ok(event) => apply_to_sinks(&sinks, &event, debug),
+                        Ok(queued) => {
+                            // How long the gesture waited in the queue before an
+                            // output saw it: part of the hand-to-sound budget that
+                            // neither capture nor inference accounts for.
+                            let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
+                            if let Ok(mut samples) = dispatch.lock() {
+                                samples.push(age_ms);
+                            }
+                            apply_to_sinks(&sinks, &queued.event, debug);
+                        }
                         Err(RecvTimeoutError::Timeout) => continue,
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 // Flush whatever was dispatched on the way out, then close the outputs.
-                while let Ok(event) = rx.try_recv() {
-                    apply_to_sinks(&sinks, &event, debug);
+                while let Ok(queued) = rx.try_recv() {
+                    apply_to_sinks(&sinks, &queued.event, debug);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
                     for sink in sinks.iter_mut() {
@@ -421,6 +443,15 @@ impl Pipeline {
                 self.metrics.frame_ms,
                 self.metrics.dropped,
             );
+            let perf = self.stage_profile();
+            println!(
+                "[Stages] p50/p95/p99/max ms - capture {:.1}/{:.1}/{:.1}/{:.1}  inference {:.1}/{:.1}/{:.1}/{:.1}  camera->publish {:.1}/{:.1}/{:.1}/{:.1}  dispatch->sink {:.1}/{:.1}/{:.1}/{:.1}  ({} samples)",
+                perf.capture.p50, perf.capture.p95, perf.capture.p99, perf.capture.max,
+                perf.inference.p50, perf.inference.p95, perf.inference.p99, perf.inference.max,
+                perf.end_to_end.p50, perf.end_to_end.p95, perf.end_to_end.p99, perf.end_to_end.max,
+                perf.dispatch.p50, perf.dispatch.p95, perf.dispatch.p99, perf.dispatch.max,
+                perf.inference.count,
+            );
         }
 
         running.store(false, Ordering::Relaxed);
@@ -429,6 +460,22 @@ impl Pipeline {
         }
         let _ = sink_handle.join();
         Ok(())
+    }
+
+    /// Percentiles of the four stages. Recomputed once a second rather than every
+    /// frame: the sort is cheap but repeating it 30 times a second is not needed.
+    fn stage_profile(&self) -> StageProfile {
+        let dispatch = self
+            .stage_dispatch
+            .lock()
+            .map(|samples| profile(&samples))
+            .unwrap_or_default();
+        StageProfile {
+            inference: profile(&self.stage_inference),
+            capture: profile(&self.stage_capture),
+            end_to_end: profile(&self.stage_latency),
+            dispatch,
+        }
     }
 
     /// While stopped, release whatever the sinks are holding and publish a
@@ -546,7 +593,16 @@ impl Pipeline {
         };
         self.metrics.fps = (1000.0 / self.avg_gap_ms.max(1.0)) as f32;
 
+        // Stage timings, in milliseconds, into the rolling rings the summary and
+        // the dashboard read as percentiles.
+        self.stage_capture.push(capture_ms);
+        self.stage_inference.push(inference_ms);
+        self.stage_latency.push(latency_ms);
+
         self.metrics.frames += 1;
+        if self.metrics.frames.is_multiple_of(PROFILE_REFRESH_FRAMES) {
+            self.metrics.perf = self.stage_profile();
+        }
         self.metrics.uptime_ms = self.started.elapsed().as_millis() as u64;
         self.metrics.paused = false;
         self.metrics.frame_size = detection.frame_size;
@@ -804,9 +860,9 @@ fn apply_to_sinks(sinks: &SinkList, event: &GestureEvent, debug: bool) {
     }
 }
 
-fn drain_events(rx: &Receiver<GestureEvent>, sinks: &SinkList, debug: bool) {
-    while let Ok(event) = rx.try_recv() {
-        apply_to_sinks(sinks, &event, debug);
+fn drain_events(rx: &Receiver<QueuedEvent>, sinks: &SinkList, debug: bool) {
+    while let Ok(queued) = rx.try_recv() {
+        apply_to_sinks(sinks, &queued.event, debug);
     }
 }
 

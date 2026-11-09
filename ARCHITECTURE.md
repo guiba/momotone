@@ -23,7 +23,7 @@ hot path is polluted with work that a real-time app keeps off the critical path.
 | 4 | `std::fs::write` of the ASCII frame **on the inference thread, every ASCII tick** | Never do file I/O on a frame-critical thread; queue to an IO thread or a writer with backpressure | S |
 | 5 | cpal callback locks a `Mutex<SynthesizerState>` per audio block; `unsafe impl Send + Sync` on the stream | Lock-free, allocation-free, syscall-free audio callback; double-buffered control block | M |
 | 6 | Oscillator sample rate is hard-coded 44100 while the stream config is the device's (`device.default_output_config()`), and frequency is snapped mid-note | Use the stream's actual rate; ramp frequency (portamento), band-limit the waveforms, soft-clip instead of hard clamp | M |
-| 7 | Sink thread polls `recv_timeout(20 ms)` | Event-driven receive with a shutdown sentinel — 20 ms of avoidable attack latency in an instrument whose whole budget is ~50 ms | S |
+| 7 | Sink thread polls `recv_timeout(20 ms)` | Event-driven receive with a shutdown sentinel — measured dispatch→sink is sub-millisecond, so the real cost is 50 idle wakeups per second, not attack latency | S |
 | 8 | `FrameMetrics` is a 39-field god-struct cloned into the shared snapshot every frame and cloned again by the UI every tick | Small snapshots per subsystem, published at the consumer's cadence, double-buffered | M |
 | 9 | Spread/volume is computed twice with two different normalisations (`spread_volume` vs `hand_geometry().spread`), and smoothing happens in 3 places (ROI EMA, tip EMA, reuse cache) | One estimator layer producing one canonical hand state | M |
 | 10 | 36 CLI flags, ~1.5k lines of UI with zero tests, no CI | Layered config + presets; a pure-function presentation layer that can be tested headlessly | M |
@@ -206,10 +206,11 @@ catch-up, and dropped work is *explicit* ("skipped render this frame"), not impl
   `Presenter` trait owned by a dedicated thread that receives frames at its own
   cadence. As written, an ASCII dump write (pipeline.rs:644) can stall inference —
   a disk hiccup becomes an audio dropout.
-- **Kill the polling constants.** `SINK_POLL_MS = 20` (pipeline.rs:41) means a note
-  attack can be delayed up to 20 ms and the sink thread wakes 50×/s even when silent.
-  Use `rx.recv()` plus a `UiCommand::Shutdown` sentinel. Games and audio apps do not
-  poll their event queues; they block on them.
+- **Kill the polling constants.** `SINK_POLL_MS = 20` (pipeline.rs:41) is *not* an
+  attack-latency problem — measured dispatch→sink is under a millisecond, because
+  `recv_timeout` returns as soon as an event arrives. It is a wakeup cost: the sink
+  thread wakes 50 times a second to find nothing. Use `rx.recv()` plus a
+  `UiCommand::Shutdown` sentinel and the idle wakeups disappear.
 - **Group state.** `Pipeline` → `{ source, tracker, strategy, instrument, presenter,
   metrics, control }`. Fewer fields, each field meaningful.
 
@@ -424,13 +425,13 @@ Every `Arc<Mutex<T>>` in the app is a smell worth auditing:
 `set_waveform` push is the leak), `SynthesizerState` (audio callback + control thread
 — acceptable *if* lock-free), `TipSmoother` (unnecessary — see 4.4).
 
-**2. Latency budget is not stated anywhere.** For a gesture instrument, hand→sound
-should be < 50 ms, and users perceive > 80 ms as "laggy". Current plausible worst
-case: camera 31 ms + queue 0-33 ms + inference 8 ms + sink poll ≤ 20 ms + cpal buffer
-(block size, typically 10-20 ms) = **60-90 ms**. The app measures camera→publish
-(`latency_ms`) but never camera→speaker. Fix: measure end-to-end, request a small
-cpal buffer, and remove the 20 ms sink poll. This is the cheapest measurable win in
-the project.
+**2. Latency budget is now measured, not guessed.** For a gesture instrument,
+hand→sound should be < 50 ms, and users perceive > 80 ms as "laggy". The live
+baseline (`bench/baseline.md`) gives camera 33.2 ms (p50) + inference 8.2 ms = **41 ms**
+to the event bus, dispatch→sink < 1 ms. The missing piece is the cpal block size,
+which cpal 0.17 does not expose and which has to be read from the callback's block
+length. With the YOLO backend the same figure is 33.7 + 64.7 (p95) with frames going
+stale by up to 52 ms.
 
 **3. Rate tiers are implicit.** Inference runs at camera rate; UI at 30 Hz; ASCII at
 15 Hz; feed at 15 Hz; audio at 44.1 kHz. Making the tiers explicit (each boundary is a

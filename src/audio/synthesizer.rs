@@ -124,6 +124,14 @@ impl Sink for Synthesizer {
             .default_output_device()
             .ok_or_else(|| anyhow!("No audio output device found"))?;
         let config: cpal::StreamConfig = device.default_output_config()?.into();
+        // cpal 0.17 exposes no buffer size, so the audio block's share of the
+        // latency has to be measured from the callback's block length. The rate
+        // matters too: `Voice::next_sample` currently integrates against the
+        // `sample_rate` passed to `Synthesizer::new`, not this one.
+        println!(
+            "[Audio] device stream: {} Hz, {} channels",
+            config.sample_rate, config.channels
+        );
 
         let state_ref = self.state.clone();
         let sample_rate = self.sample_rate;
