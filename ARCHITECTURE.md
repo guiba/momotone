@@ -241,8 +241,11 @@ provider), never defaulted.
 - Detection hysteresis (ROADMAP finding 8) is not a feature, it is a correctness
   requirement for a gate: with flickering detection, the release event fires and the
   note re-attacks. Debounce at the perception boundary, not in the sinks.
-- Pin ORT: `SessionBuilder::intra_op_thread_count(...)`. Trivial, and the ROADMAP
-  already suspects it matters.
+  *(done in Phase 1: `core/detection_gate.rs`, applied in `Pipeline::advance`)*
+- ORT thread pinning (`--ort-threads`) is available, but measurement killed the
+  assumption: the BlazeHand detector is fastest with the runtime default of one
+  thread per core (9.7 ms p50) and 40 % slower pinned to one (13.7 ms). Keep the knob
+  for A/B testing; do not default to a small number.
 - Move `timings` out of the domain result into a `StageReport` the telemetry layer
   collects. Strategies and presenters should not see µs fields.
 - `r#box` → `bbox`; `frame_size` → keep, but consider making the whole result
@@ -467,7 +470,7 @@ Engines implement quality tiers; the toggle machinery here is 60 % of the way th
 | 8 | Canonical `HandState` from one estimator (hysteresis + smoothing) | Replaces 3 filters and 2 spread normalisations with one tested unit | M |
 | 9 | Presentation as a pure function of a snapshot; move `note_trail` into the snapshot | Makes 1.65k untested UI lines testable | M |
 | 10 | Percentile telemetry + `tracing` | Replaces ad-hoc `println!` with a consistent observability layer | S |
-| 11 | ORT thread pinning; capture at 320×240 experiment | Cost reduction with no structural change | S |
+| 11 | ~~ORT thread pinning~~ (done, a knob not a win); capture at 320×240 experiment | Cost reduction with no structural change | S |
 | 12 | CI + fixture/clip harness | Turns "does it work?" into an automated check | M |
 
 **Explicitly not worth doing now:** rewriting iced, multi-hand support, OSC sink,

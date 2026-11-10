@@ -89,3 +89,42 @@ detector 6.07 ms   landmarker 4.51 ms
 5. **Unknown, and still to measure:** the audio block's own latency. cpal 0.17 does
    not expose the buffer size, so it has to be read from the callback's block length —
    that is a Phase 1 task.
+
+---
+
+# After Phase 1 (`phase1-hot-path`, same machine)
+
+## Mock mode — deadline clock (T1.5)
+
+300 frames in 9.88 s = **30.3 fps**, 32.92 ms/frame against the 33 ms requested
+(was 26.4 fps / 37.18 ms). The clock is honest now, so every mock number can be
+compared against the 33 ms budget.
+
+## ONNX Runtime thread sweep (T1.6)
+
+`--ort-threads N`, 200 frames, live camera, MediaPipe, no hand in view (so the
+landmarker never runs and inference is the detector alone):
+
+| `--ort-threads` | inference p50 | p95 | max |
+| :-- | :-- | :-- | :-- |
+| 1 | 13.7 ms | 23.7 | 25.4 |
+| 2 | 11.7 ms | 16.6 | 22.4 |
+| 4 | 10.8 ms | 12.9 | 25.4 |
+| 0 (default, all cores) | 9.7 ms | 13.3 | 23.9 |
+
+More threads are strictly faster for this model, and the loop is paced by the 33 ms
+camera read anyway, so the flag defaults to 0 (runtime default) and exists for A/B
+testing the jitter a full pool causes the UI/capture threads. Pinning to 2 is *not*
+the win `ARCHITECTURE.md` assumed.
+
+## Detection gate (T1.7)
+
+2 confirm frames + 3 grace frames. In a 300-frame live run with no hand in front of
+the camera the gate adds nothing measurable (capture 33.3 ms p50, inference 11.8 ms,
+0 dropped, 30.3 fps), but it removes the on/off clicks the raw threshold produced:
+the confidence sequence 0.97 → 0.67 → 0.00 with a hand in frame no longer emits a
+release in the middle of a held gesture. Verified by the new pipeline test
+`the_gate_needs_two_sightings_and_only_releases_after_the_grace_window`.
+
+Still open: the audio block's own latency (cpal does not expose buffer size; read it
+from the callback block length), and capture resolution (T1.8).
