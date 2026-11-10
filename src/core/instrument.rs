@@ -1,13 +1,12 @@
 //! The instrument the player is actually playing.
 //!
-//! `InstrumentConfig` is the single source of truth for scale, root, octave
-//! span and waveform. `main` builds it from the command line, the dashboard
-//! mutates it through its pickers, and the pipeline applies it to the strategy
-//! and the sinks whenever its `version` changes.
+//! `InstrumentConfig` is the single source of truth for scale, root, octave span
+//! and waveform. `main` builds it from the command line, the dashboard mutates it
+//! through its pickers and sends the result to the pipeline as a `UiCommand`; the
+//! pipeline applies it to the strategy and the sinks.
 //!
-//! Everything is behind one `Arc<Mutex<_>>`: the UI writes, the pipeline reads.
-//! A tick is a mutex lock and a version compare, so a picker change takes effect
-//! on the very next frame.
+//! The setters return whether anything actually changed, so a click on the option
+//! that is already selected sends no command at all.
 
 use anyhow::{anyhow, Result};
 
@@ -102,8 +101,6 @@ pub struct InstrumentConfig {
     pub waveform: Waveform,
     /// Derived from the fields above; recomputed on every change.
     pub layout: GridLayout,
-    /// Bumped on every change so the pipeline knows when to re-apply.
-    pub version: u64,
 }
 
 impl InstrumentConfig {
@@ -138,7 +135,6 @@ impl InstrumentConfig {
             octaves: octaves.max(1),
             waveform,
             layout: GridLayout::default(),
-            version: 0,
         };
         config.layout = GridLayout::new(config.root, &config.scale, config.octaves);
         Ok(config)
@@ -190,7 +186,6 @@ impl InstrumentConfig {
 
     fn bump(&mut self) {
         self.layout = GridLayout::new(self.root, &self.scale, self.octaves);
-        self.version += 1;
     }
 }
 
@@ -213,20 +208,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_change_rebuilds_the_layout_and_bumps_the_version() {
+    fn a_change_rebuilds_the_layout() {
         let mut config = InstrumentConfig::new("major pentatonic", "C", 3, Waveform::Sine).unwrap();
         let before = config.layout.clone();
-        let version = config.version;
 
         assert!(config.set_scale("chromatic"));
-        assert_eq!(config.version, version + 1);
         assert_ne!(config.layout, before);
         assert_eq!(config.layout.cols, 12);
 
-        // Setting the same value is a no-op: the version must not move, or the
-        // pipeline would rebuild the keyboard every tick.
+        // Re-picking the current value is a no-op: the UI must not send a command
+        // that changes nothing.
         assert!(!config.set_scale("chromatic"));
-        assert_eq!(config.version, version + 1);
+        assert!(!config.set_octaves(3));
     }
 
     #[test]

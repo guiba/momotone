@@ -3,6 +3,7 @@ pub mod event_bus;
 pub mod geometry;
 pub mod grid;
 pub mod instrument;
+pub mod runtime;
 pub mod scale;
 pub mod telemetry;
 pub mod types;

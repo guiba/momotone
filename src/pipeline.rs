@@ -13,7 +13,7 @@
 //! `Pipeline::tick` is the same frame driven single-threaded, which is what the
 //! tests and any headless one-shot use.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,11 +25,12 @@ use crate::core::detection_gate::DetectionGate;
 use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::geometry::hand_geometry;
 use crate::core::instrument::InstrumentConfig;
+use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
 use crate::core::types::{GestureEvent, GesturePayload};
 use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
-use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp};
+use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp, DEFAULT_ASCII_FPS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
 
@@ -95,15 +96,13 @@ pub struct Pipeline {
     /// the sinks in the order they were dispatched.
     event_rx: Option<Receiver<BusMessage>>,
     shared: Arc<Mutex<FrameMetrics>>,
-    /// The instrument the player is currently on. The dashboard pickers write
-    /// to it; the pipeline notices the version change and re-keys the strategy
-    /// and the sinks on the next frame.
-    instrument: Arc<Mutex<InstrumentConfig>>,
-    /// Version of `instrument` last applied to the strategy and the sinks. Starts
-    /// above any real version so the first frame always re-keys, which also keeps
-    /// the published layout in sync with the config even when the snapshot was
-    /// never seeded.
-    applied_version: u64,
+    /// What the dashboard has asked for: start/stop, feed, ASCII, cadences and the
+    /// glyph ramp. The pipeline applies it from commands; the capture thread is the
+    /// only other reader, because it must not read the camera while the player is
+    /// stopped.
+    control: Arc<Mutex<RuntimeConfig>>,
+    /// Commands from the UI, drained at the top of every frame.
+    control_rx: Option<Receiver<UiCommand>>,
     metrics: FrameMetrics,
     previous_landmarks: Vec<Landmark>,
     /// Frames the capture stage read and dropped, so a bottleneck is visible
@@ -135,29 +134,12 @@ pub struct Pipeline {
     max_frames: Option<u32>,
     debug: bool,
     emit_frames: bool,
-    /// Set by the dashboard's Start/Stop button. While it is false the loop
-    /// captures nothing and runs no inference.
-    active: Arc<AtomicBool>,
-    /// Set by the dashboard's `feed` toggle. The camera frame is only converted
-    /// to RGBA (1.2 MB per frame at 640x480) when the stage actually shows it.
-    feed_wanted: Arc<AtomicBool>,
-    /// Minimum gap between two camera uploads to the dashboard.
-    feed_interval: Duration,
     /// Wall clock at which the next camera frame is allowed to go to the UI.
     /// Seeded with "now" so the very first frame is uploaded.
     next_feed: Instant,
-    /// Set by the dashboard's `ascii` toggle. The luminance grid is only built
-    /// when the stage actually draws it - downsampling and quantising costs a
-    /// resize and a pass over every cell.
-    ascii_wanted: Arc<AtomicBool>,
-    ascii_interval: Duration,
     next_ascii: Instant,
     /// Columns of the ASCII grid; rows follow from the frame aspect.
     ascii_cols: usize,
-    /// Glyph ramp index (`Ramp::index`) shared with the dashboard, so picking a
-    /// charset in the UI also changes what the terminal dump and `--ascii-dump`
-    /// write without restarting the run.
-    ascii_ramp: Arc<AtomicU8>,
     /// Terminal mode: print the art to stdout so the renderer can be checked
     /// without a window (`--no-ui --ascii`).
     ascii_stdout: bool,
@@ -177,16 +159,11 @@ pub struct PipelineConfig {
     pub event_bus: EventBus,
     pub event_rx: Option<Receiver<BusMessage>>,
     pub shared: Arc<Mutex<FrameMetrics>>,
-    pub instrument: Arc<Mutex<InstrumentConfig>>,
-    pub active: Arc<AtomicBool>,
-    pub feed_wanted: Arc<AtomicBool>,
-    /// Preview cadence in frames per second; 0 means every frame.
-    pub feed_fps: f32,
-    pub ascii_wanted: Arc<AtomicBool>,
-    /// ASCII art cadence in frames per second; 0 means every frame.
-    pub ascii_fps: f32,
+    pub control: Arc<Mutex<RuntimeConfig>>,
+    pub control_rx: Receiver<UiCommand>,
+    /// The instrument the run starts on; later changes arrive as commands.
+    pub instrument: InstrumentConfig,
     pub ascii_cols: usize,
-    pub ascii_ramp: Arc<AtomicU8>,
     pub ascii_dump: Option<String>,
     pub ascii_stdout: bool,
     pub max_frames: Option<u32>,
@@ -204,14 +181,10 @@ impl Pipeline {
             event_bus,
             event_rx,
             shared,
+            control,
+            control_rx,
             instrument,
-            active,
-            feed_wanted,
-            feed_fps,
-            ascii_wanted,
-            ascii_fps,
             ascii_cols,
-            ascii_ramp,
             ascii_dump,
             ascii_stdout,
             max_frames,
@@ -234,7 +207,7 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
-        Pipeline {
+        let mut pipeline = Pipeline {
             camera,
             tracker,
             strategy,
@@ -242,8 +215,8 @@ impl Pipeline {
             event_bus,
             event_rx,
             shared,
-            instrument,
-            applied_version: u64::MAX,
+            control,
+            control_rx: Some(control_rx),
             metrics: context,
             previous_landmarks: Vec::new(),
             capture: Arc::new(CaptureCounters::default()),
@@ -261,19 +234,17 @@ impl Pipeline {
             max_frames,
             debug,
             emit_frames,
-            active,
-            feed_wanted,
-            feed_interval: feed_interval(feed_fps),
             next_feed: Instant::now(),
-            ascii_wanted,
-            ascii_interval: feed_interval(ascii_fps),
             next_ascii: Instant::now(),
             ascii_cols,
-            ascii_ramp,
             ascii_stdout,
             ascii_dump,
             ascii_layer: AsciiLayer::new(),
-        }
+        };
+        // Seed the instrument so the strategy, the sinks and the published keyboard
+        // agree from the very first frame.
+        pipeline.apply_instrument(&instrument);
+        pipeline
     }
 
     /// Hand the frame snapshot to the dashboard. The pixel buffer is *moved*
@@ -288,18 +259,55 @@ impl Pipeline {
         }
     }
 
-    /// Pick up any change the dashboard made to the instrument. One mutex lock
-    /// and an integer compare per frame; the expensive part (rebuilding the grid
-    /// and re-keying the strategy) only runs when the version actually moved.
-    fn sync_instrument(&mut self) {
-        let Ok(config) = self.instrument.lock() else {
+    /// A snapshot of what the UI has asked for, taken once per frame so the rest of
+    /// the tick reads plain bools instead of four atomics.
+    fn settings(&self) -> RuntimeConfig {
+        match self.control.lock() {
+            Ok(config) => config.clone(),
+            Err(_) => RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+        }
+    }
+
+    /// Is the player running? `Stop` pauses the loop without tearing down the
+    /// camera or the sinks.
+    fn is_active(&self) -> bool {
+        self.control
+            .lock()
+            .map(|config| config.active)
+            .unwrap_or(true)
+    }
+
+    /// Apply everything the dashboard has sent since the last frame. Commands are
+    /// drained in order, so a Stop cannot be overtaken by a toggle sent after it.
+    fn apply_commands(&mut self) {
+        let Some(rx) = &self.control_rx else {
             return;
         };
-        if config.version == self.applied_version {
-            return;
+        // Collect first: `rx` borrows `self` while applying a command needs it
+        // mutably. The queue is a handful of clicks, so the Vec is noise.
+        let commands: Vec<UiCommand> = rx.try_iter().collect();
+        for command in commands {
+            if let UiCommand::SetInstrument(instrument) = &command {
+                self.apply_instrument(instrument);
+                continue;
+            }
+            let Some(mut config) = self.control.lock().ok() else {
+                continue;
+            };
+            match command {
+                UiCommand::Start => config.active = true,
+                UiCommand::Stop => config.active = false,
+                UiCommand::SetFeed(on) => config.feed = on,
+                UiCommand::SetAscii(on) => config.ascii = on,
+                UiCommand::SetRamp(ramp) => config.ramp = ramp,
+                UiCommand::SetInstrument(_) => unreachable!("handled above"),
+            }
         }
-        self.applied_version = config.version;
+    }
 
+    /// Re-key the strategy, retimbre the sinks and repaint the header. Runs only
+    /// when a picker actually changed something.
+    fn apply_instrument(&mut self, config: &InstrumentConfig) {
         self.strategy.apply_layout(config.layout.clone());
         if let Ok(mut sinks) = self.sinks.lock() {
             for sink in sinks.iter_mut() {
@@ -324,8 +332,8 @@ impl Pipeline {
     }
 
     /// Runs until the UI asks for shutdown or `--max-frames` is reached. The
-    /// `active` flag (the dashboard's Stop button) pauses the loop without
-    /// tearing down the camera or the sinks.
+    /// `active` flag in the runtime config (the dashboard's Stop button) pauses the
+    /// loop without tearing down the camera or the sinks.
     pub fn run(&mut self, running: &Arc<AtomicBool>) -> Result<()> {
         // Stage 1: the camera, on its own thread. The channel holds a single frame,
         // so inference always takes the newest one instead of queueing up behind
@@ -334,13 +342,13 @@ impl Pipeline {
         let capture_handle = self.camera.take().map(|mut camera| {
             let tx = frame_tx.clone();
             let running = running.clone();
-            let active = self.active.clone();
+            let control = self.control.clone();
             let counters = self.capture.clone();
             std::thread::spawn(move || {
                 if let Err(e) = capture_frames(
                     &mut || camera.get_frame(),
                     &tx,
-                    &active,
+                    &control,
                     &running,
                     &counters,
                 ) {
@@ -386,10 +394,10 @@ impl Pipeline {
         // Stage 2: this thread.
         let mock = self.tracker.is_none();
         while running.load(Ordering::Relaxed) {
-            if !self.active.load(Ordering::Relaxed) {
-                // Still honour picker changes while stopped, so the header and the
-                // sinks match what the dashboard shows before the player starts again.
-                self.sync_instrument();
+            self.apply_commands();
+            if !self.is_active() {
+                // Still honour commands while stopped, so the header and the sinks
+                // match what the dashboard shows before the player starts again.
                 self.pause();
                 std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
                 continue;
@@ -582,7 +590,8 @@ impl Pipeline {
     /// through `tick`, and a picker change that never reaches the strategy or the
     /// sinks is invisible except by ear.
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
-        self.sync_instrument();
+        self.apply_commands();
+        let settings = self.settings();
         let FrameOutcome {
             mut detection,
             frame,
@@ -643,10 +652,9 @@ impl Pipeline {
         self.metrics.dropped = self.capture.dropped.load(Ordering::Relaxed);
 
         if let Some(frame) = frame.as_ref() {
-            if should_upload_feed(self.emit_frames, &self.feed_wanted)
-                && feed_due(self.next_feed, now)
+            if should_upload_feed(self.emit_frames, settings.feed) && feed_due(self.next_feed, now)
             {
-                self.next_feed = now + self.feed_interval;
+                self.next_feed = now + feed_interval(settings.feed_fps);
                 self.metrics.frame_pixels = frame_to_rgba(frame);
             } else {
                 // Keep the shared snapshot free of pixels the UI will discard.
@@ -694,12 +702,12 @@ impl Pipeline {
         // update slower than the skeleton without looking stale.
         if ascii_wanted(
             self.emit_frames,
-            &self.ascii_wanted,
+            settings.ascii,
             &self.ascii_dump,
             self.ascii_stdout,
         ) && feed_due(self.next_ascii, now)
         {
-            self.next_ascii = now + self.ascii_interval;
+            self.next_ascii = now + feed_interval(settings.ascii_fps);
             let grid = match &frame {
                 Some(frame) => self
                     .ascii_layer
@@ -722,7 +730,7 @@ impl Pipeline {
             self.metrics.ascii = grid;
 
             if !self.metrics.ascii.is_empty() {
-                let ramp = Ramp::from_index(self.ascii_ramp.load(Ordering::Relaxed));
+                let ramp = settings.ramp;
                 if self.ascii_stdout {
                     print_ascii(&self.metrics.ascii, ramp);
                 }
@@ -853,12 +861,12 @@ impl Pipeline {
 fn capture_frames(
     mut read: impl FnMut() -> Result<Mat>,
     tx: &Sender<CapturedFrame>,
-    active: &AtomicBool,
+    control: &Arc<Mutex<RuntimeConfig>>,
     running: &AtomicBool,
     counters: &CaptureCounters,
 ) -> Result<()> {
     while running.load(Ordering::Relaxed) {
-        if !active.load(Ordering::Relaxed) {
+        if !control.lock().map(|config| config.active).unwrap_or(false) {
             std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
             continue;
         }
@@ -901,14 +909,14 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList, debug: bool) {
 
 /// The stage only needs camera pixels while the feed toggle is on; headless runs
 /// never need them.
-fn should_upload_feed(emit_frames: bool, want: &AtomicBool) -> bool {
-    emit_frames && want.load(Ordering::Relaxed)
+fn should_upload_feed(emit_frames: bool, want: bool) -> bool {
+    emit_frames && want
 }
 
 /// The ASCII grid is only worth building if something will look at it: the stage
 /// toggle, a terminal run, or a dump file. A dump or terminal run works even
 /// with `--no-ui`, where there is no stage to toggle.
-fn ascii_wanted(emit_frames: bool, want: &AtomicBool, dump: &Option<String>, stdout: bool) -> bool {
+fn ascii_wanted(emit_frames: bool, want: bool, dump: &Option<String>, stdout: bool) -> bool {
     stdout || dump.is_some() || should_upload_feed(emit_frames, want)
 }
 
@@ -1047,6 +1055,7 @@ mod tests {
     use super::*;
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
+    use crate::core::runtime::control_channel;
     use crate::strategies::FingerPositionStrategy;
     use crate::vision::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
 
@@ -1156,15 +1165,37 @@ mod tests {
     struct TestHarness {
         pipeline: Pipeline,
         events: Arc<Mutex<Vec<GestureEvent>>>,
-        instrument: Arc<Mutex<InstrumentConfig>>,
+        /// The dashboard's half of the control channel: a test "clicks" a button by
+        /// sending the same command the UI sends.
+        control: Sender<UiCommand>,
         waveforms: Arc<Mutex<Vec<String>>>,
     }
 
     fn test_pipeline(strategy: Box<dyn Strategy>, max_frames: Option<u32>) -> TestHarness {
+        test_pipeline_with(
+            strategy,
+            max_frames,
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+            false,
+            DEFAULT_COLS,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        )
+    }
+
+    /// A pipeline with no camera and no model: the synthetic hand drives every
+    /// frame, so the loop can be tested without a webcam or the ONNX assets.
+    fn test_pipeline_with(
+        strategy: Box<dyn Strategy>,
+        max_frames: Option<u32>,
+        config: RuntimeConfig,
+        emit_frames: bool,
+        ascii_cols: usize,
+        shared: Arc<Mutex<FrameMetrics>>,
+    ) -> TestHarness {
         let (bus, rx) = EventBus::new();
+        let (control_tx, control_rx) = control_channel();
         let events = Arc::new(Mutex::new(Vec::new()));
         let waveforms = Arc::new(Mutex::new(Vec::new()));
-        let instrument = Arc::new(Mutex::new(InstrumentConfig::default()));
         let pipeline = Pipeline::new(PipelineConfig {
             camera: None,
             tracker: None,
@@ -1175,25 +1206,21 @@ mod tests {
             })])),
             event_bus: bus,
             event_rx: Some(rx),
-            shared: Arc::new(Mutex::new(FrameMetrics::default())),
-            instrument: instrument.clone(),
-            active: Arc::new(AtomicBool::new(true)),
-            feed_wanted: Arc::new(AtomicBool::new(false)),
-            ascii_wanted: Arc::new(AtomicBool::new(false)),
-            ascii_fps: DEFAULT_ASCII_FPS,
-            ascii_cols: DEFAULT_COLS,
-            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
+            shared,
+            control: Arc::new(Mutex::new(config)),
+            control_rx,
+            instrument: InstrumentConfig::default(),
+            ascii_cols,
             ascii_dump: None,
             ascii_stdout: false,
             max_frames,
             debug: false,
-            emit_frames: false,
-            feed_fps: DEFAULT_FEED_FPS,
+            emit_frames,
         });
         TestHarness {
             pipeline,
             events,
-            instrument,
+            control: control_tx,
             waveforms,
         }
     }
@@ -1290,7 +1317,7 @@ mod tests {
         let TestHarness {
             mut pipeline,
             events,
-            instrument,
+            control,
             ..
         } = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
         pipeline.tick().unwrap();
@@ -1301,12 +1328,8 @@ mod tests {
         );
         assert_eq!(pipeline.metrics.scale, "major pentatonic");
 
-        {
-            let mut config = instrument.lock().unwrap();
-            config.set_scale("chromatic");
-            config.set_octaves(4);
-            config.set_waveform(Waveform::Saw);
-        }
+        let instrument = InstrumentConfig::new("chromatic", "C", 4, Waveform::Saw).unwrap();
+        control.send(UiCommand::SetInstrument(instrument)).unwrap();
 
         pipeline.tick().unwrap();
         assert_eq!(pipeline.metrics.layout.rows, 4);
@@ -1328,26 +1351,47 @@ mod tests {
     }
 
     #[test]
+    fn commands_land_in_the_config_the_pipeline_owns() {
+        let TestHarness {
+            mut pipeline,
+            control,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), None);
+        assert!(pipeline.is_active(), "a run starts running");
+
+        control.send(UiCommand::Stop).unwrap();
+        control.send(UiCommand::SetAscii(true)).unwrap();
+        control.send(UiCommand::SetRamp(Ramp::Shades)).unwrap();
+        pipeline.apply_commands();
+
+        let settings = pipeline.settings();
+        assert!(!settings.active, "Stop cleared the flag");
+        assert!(settings.ascii, "the ASCII toggle reached the config");
+        assert_eq!(settings.ramp, Ramp::Shades, "the ramp reached the config");
+
+        control.send(UiCommand::Start).unwrap();
+        pipeline.apply_commands();
+        assert!(pipeline.is_active(), "Start runs the loop again");
+    }
+
+    #[test]
     fn an_unchanged_config_does_not_rebuild_every_frame() {
         let TestHarness { mut pipeline, .. } =
             test_pipeline(Box::new(FingerPositionStrategy::default()), None);
-        pipeline.sync_instrument();
-        let version = pipeline.applied_version;
-        pipeline.sync_instrument();
-        pipeline.sync_instrument();
+        let before = pipeline.metrics.layout.clone();
+        pipeline.apply_commands();
+        pipeline.apply_commands();
         assert_eq!(
-            pipeline.applied_version, version,
-            "a lock alone must not re-key the keyboard"
+            pipeline.metrics.layout, before,
+            "an idle control channel must not re-key the keyboard"
         );
     }
 
     #[test]
     fn the_feed_is_only_converted_when_the_stage_shows_it() {
-        let want = AtomicBool::new(false);
-        assert!(!should_upload_feed(true, &want), "feed off means no upload");
-        want.store(true, Ordering::Relaxed);
-        assert!(should_upload_feed(true, &want));
-        assert!(!should_upload_feed(false, &want), "headless never uploads");
+        assert!(!should_upload_feed(true, false), "feed off means no upload");
+        assert!(should_upload_feed(true, true));
+        assert!(!should_upload_feed(false, true), "headless never uploads");
     }
 
     #[test]
@@ -1384,33 +1428,24 @@ mod tests {
             opencv::core::Scalar::new(10.0, 20.0, 30.0, 0.0),
         )
         .unwrap();
-        let (bus, rx) = EventBus::new();
         let shared = Arc::new(Mutex::new(FrameMetrics::default()));
-        let mut pipeline = Pipeline::new(PipelineConfig {
-            camera: None,
-            tracker: None,
-            strategy: Box::new(AlwaysOn),
-            sinks: Arc::new(Mutex::new(Vec::new())),
-            event_bus: bus,
-            event_rx: Some(rx),
-            shared: shared.clone(),
-            instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
-            active: Arc::new(AtomicBool::new(true)),
-            feed_wanted: Arc::new(AtomicBool::new(true)),
-            // The art has its own cadence: the frame is rendered twice, but only
-            // the first is inside the interval.
-            ascii_wanted: Arc::new(AtomicBool::new(true)),
-            ascii_fps: 1.0,
-            ascii_cols: 32,
-            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
-            ascii_dump: None,
-            ascii_stdout: false,
-            // One upload per second, so two frames back to back is one upload.
-            feed_fps: 1.0,
-            max_frames: None,
-            debug: false,
-            emit_frames: true,
-        });
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            RuntimeConfig {
+                active: true,
+                feed: true,
+                // The art has its own cadence: the frame is rendered twice, but only
+                // the first is inside the interval.
+                ascii: true,
+                feed_fps: 1.0,
+                ascii_fps: 1.0,
+                ramp: Ramp::Blocks,
+            },
+            true,
+            32,
+            shared.clone(),
+        );
 
         let outcome = || {
             let mut detection = synthetic_detection(0.0);
@@ -1490,7 +1525,6 @@ mod tests {
 
     #[test]
     fn publishing_preserves_the_run_context() {
-        let (bus, rx) = EventBus::new();
         let shared = Arc::new(Mutex::new(FrameMetrics {
             mode: "Signal".to_string(),
             sink: "audio".to_string(),
@@ -1503,28 +1537,14 @@ mod tests {
             ),
             ..FrameMetrics::default()
         }));
-        let mut pipeline = Pipeline::new(PipelineConfig {
-            camera: None,
-            tracker: None,
-            strategy: Box::new(AlwaysOn),
-            sinks: Arc::new(Mutex::new(Vec::new())),
-            event_bus: bus,
-            event_rx: Some(rx),
-            shared: shared.clone(),
-            instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
-            active: Arc::new(AtomicBool::new(true)),
-            feed_wanted: Arc::new(AtomicBool::new(false)),
-            ascii_wanted: Arc::new(AtomicBool::new(false)),
-            ascii_fps: DEFAULT_ASCII_FPS,
-            ascii_cols: DEFAULT_COLS,
-            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
-            ascii_dump: None,
-            ascii_stdout: false,
-            max_frames: None,
-            debug: false,
-            emit_frames: false,
-            feed_fps: 0.0,
-        });
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            RuntimeConfig::new(0.0, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+            false,
+            DEFAULT_COLS,
+            shared.clone(),
+        );
         pipeline.tick().unwrap();
         pipeline.tick().unwrap();
 
@@ -1538,53 +1558,43 @@ mod tests {
 
     #[test]
     fn the_ascii_layer_only_runs_when_something_wants_to_see_it() {
-        let off = AtomicBool::new(false);
         assert!(
-            !ascii_wanted(true, &off, &None, false),
+            !ascii_wanted(true, false, &None, false),
             "a cleared toggle and no sink means no work"
         );
-        let on = AtomicBool::new(true);
         assert!(
-            ascii_wanted(true, &on, &None, false),
+            ascii_wanted(true, true, &None, false),
             "the stage is drawing it"
         );
         assert!(
-            ascii_wanted(false, &off, &Some("art.txt".to_string()), false),
+            ascii_wanted(false, false, &Some("art.txt".to_string()), false),
             "a dump file is a reason to build the grid even headless"
         );
-        assert!(ascii_wanted(false, &off, &None, true), "stdout counts too");
+        assert!(ascii_wanted(false, false, &None, true), "stdout counts too");
     }
 
     #[test]
     fn mock_mode_draws_ascii_from_the_synthetic_hand() {
-        let (bus, rx) = EventBus::new();
         let shared = Arc::new(Mutex::new(FrameMetrics::default()));
-        let mut pipeline = Pipeline::new(PipelineConfig {
-            camera: None,
-            tracker: None,
-            strategy: Box::new(FingerPositionStrategy::new(
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(FingerPositionStrategy::new(
                 0,
                 &crate::core::scale::preset("major pentatonic").unwrap(),
                 3,
             )),
-            sinks: Arc::new(Mutex::new(Vec::new())),
-            event_bus: bus,
-            event_rx: Some(rx),
-            shared: shared.clone(),
-            instrument: Arc::new(Mutex::new(InstrumentConfig::default())),
-            active: Arc::new(AtomicBool::new(true)),
-            feed_wanted: Arc::new(AtomicBool::new(false)),
-            ascii_wanted: Arc::new(AtomicBool::new(true)),
-            ascii_fps: 0.0,
-            ascii_cols: 40,
-            ascii_ramp: Arc::new(AtomicU8::new(Ramp::Blocks.index())),
-            ascii_dump: None,
-            ascii_stdout: false,
-            feed_fps: 0.0,
-            max_frames: None,
-            debug: false,
-            emit_frames: true,
-        });
+            None,
+            RuntimeConfig {
+                active: true,
+                feed: false,
+                ascii: true,
+                feed_fps: 0.0,
+                ascii_fps: 0.0,
+                ramp: Ramp::Blocks,
+            },
+            true,
+            40,
+            shared.clone(),
+        );
         // Two frames: the detection gate needs a second sighting before the hand
         // counts, and the mock art is drawn from the landmarks.
         pipeline.tick().unwrap();
@@ -1607,6 +1617,7 @@ mod tests {
         let TestHarness {
             mut pipeline,
             events,
+            control,
             ..
         } = test_pipeline(Box::new(AlwaysOn), None);
 
@@ -1615,7 +1626,8 @@ mod tests {
         pipeline.tick().unwrap();
         pipeline.tick().unwrap();
 
-        pipeline.active.store(false, Ordering::Relaxed);
+        control.send(UiCommand::Stop).unwrap();
+        pipeline.apply_commands();
         pipeline.pause();
 
         let recorded = events.lock().unwrap().clone();
@@ -1743,7 +1755,12 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let counters = Arc::new(CaptureCounters::default());
         let running = Arc::new(AtomicBool::new(true));
-        let active = Arc::new(AtomicBool::new(true));
+        let control = Arc::new(Mutex::new(RuntimeConfig::new(
+            DEFAULT_FEED_FPS,
+            DEFAULT_ASCII_FPS,
+            false,
+            Ramp::Blocks,
+        )));
 
         let mut produced = 0;
         let mut read = || -> Result<Mat> {
@@ -1760,7 +1777,7 @@ mod tests {
             .unwrap())
         };
 
-        capture_frames(&mut read, &tx, &active, &running, &counters).unwrap();
+        capture_frames(&mut read, &tx, &control, &running, &counters).unwrap();
 
         assert_eq!(counters.captured.load(Ordering::Relaxed), 5);
         assert_eq!(
@@ -1779,7 +1796,11 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let counters = Arc::new(CaptureCounters::default());
         let running = Arc::new(AtomicBool::new(true));
-        let active = Arc::new(AtomicBool::new(false));
+        let paused = RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        let paused = Arc::new(Mutex::new(RuntimeConfig {
+            active: false,
+            ..paused
+        }));
 
         // The loop would otherwise sleep on the Stop flag forever.
         let stop = running.clone();
@@ -1800,7 +1821,7 @@ mod tests {
             .unwrap())
         };
 
-        capture_frames(&mut read, &tx, &active, &running, &counters).unwrap();
+        capture_frames(&mut read, &tx, &paused, &running, &counters).unwrap();
         assert_eq!(produced, 0, "Stop means the camera is not read at all");
         assert_eq!(counters.captured.load(Ordering::Relaxed), 0);
     }
@@ -1809,17 +1830,18 @@ mod tests {
     fn a_picker_change_reaches_the_sinks_while_the_loop_is_running() {
         let TestHarness {
             mut pipeline,
-            instrument,
+            control,
             waveforms,
             ..
         } = test_pipeline(Box::new(AlwaysOn), Some(8));
         let running = Arc::new(AtomicBool::new(true));
 
         // Change the timbre mid-run, exactly as clicking the picker does.
-        let late = instrument.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(80));
-            late.lock().unwrap().set_waveform(Waveform::Square);
+            let mut instrument = InstrumentConfig::default();
+            instrument.set_waveform(Waveform::Square);
+            let _ = control.send(UiCommand::SetInstrument(instrument));
         });
 
         pipeline.run(&running).unwrap();

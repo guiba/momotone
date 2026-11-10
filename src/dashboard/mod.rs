@@ -17,10 +17,10 @@ pub mod gauges;
 pub mod metrics;
 pub mod skeleton;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Sender;
 use iced::widget::image::Handle;
 use iced::widget::{
     button, canvas, column, container, pick_list, row, rule, space, text, Column, Scrollable,
@@ -30,6 +30,7 @@ use iced::{time, Subscription};
 
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, Waveform};
+use crate::core::runtime::UiCommand;
 use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
 use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
@@ -75,25 +76,16 @@ enum Message {
 
 pub struct Dashboard {
     shared: Arc<Mutex<FrameMetrics>>,
-    /// Cleared by the Stop button; the pipeline loop checks it every frame.
-    active: Arc<AtomicBool>,
-    /// Mirrors `show_feed` so the pipeline knows whether to build the RGBA
-    /// upload at all.
-    feed: Arc<AtomicBool>,
-    /// Mirrors `show_ascii` so the pipeline only builds the luminance grid while
-    /// the stage is drawing it.
-    ascii: Arc<AtomicBool>,
-    /// The glyph ramp the ASCII layer renders with (`--ascii-ramp`).
+    /// The pipeline's control channel. Every toggle the stage makes is sent as a
+    /// command rather than written into a shared flag.
+    control: Sender<UiCommand>,
+    /// Mirrors the Start/Stop button so the header can show its own state without
+    /// asking the pipeline.
+    active: bool,
+    /// The instrument the pickers are editing. Sent to the pipeline on every change.
+    instrument: InstrumentConfig,
+    /// The glyph ramp the ASCII art renders with.
     ramp: Ramp,
-    /// Shared with the pipeline so the charset the UI picks is also the one the
-    /// terminal print and `--ascii-dump` use.
-    ramp_index: Arc<AtomicU8>,
-    /// The instrument the player is on. The pickers write to this and the
-    /// pipeline picks the change up on the next frame.
-    instrument: Arc<Mutex<InstrumentConfig>>,
-    /// Local mirror of the config, so the pick lists show the current choice
-    /// without locking on every `view`.
-    instrument_view: InstrumentConfig,
     tab: Tab,
     metrics: FrameMetrics,
     frame_image: Option<Handle>,
@@ -117,24 +109,17 @@ pub struct Dashboard {
 impl Dashboard {
     fn new(
         shared: Arc<Mutex<FrameMetrics>>,
-        active: Arc<AtomicBool>,
-        feed: Arc<AtomicBool>,
-        ascii: Arc<AtomicBool>,
-        instrument: Arc<Mutex<InstrumentConfig>>,
+        control: Sender<UiCommand>,
+        instrument: InstrumentConfig,
+        ramp: Ramp,
         fade_ms: f32,
-        ramp_index: Arc<AtomicU8>,
     ) -> Self {
-        let instrument_view = instrument
-            .lock()
-            .map(|config| config.clone())
-            .unwrap_or_default();
         Dashboard {
             shared,
-            active,
-            feed,
-            ascii,
+            control,
+            active: true,
             instrument,
-            instrument_view,
+            ramp,
             tab: Tab::Basic,
             metrics: FrameMetrics::default(),
             frame_image: None,
@@ -144,8 +129,6 @@ impl Dashboard {
             show_labels: false,
             show_feed: false,
             show_ascii: false,
-            ramp: Ramp::from_index(ramp_index.load(Ordering::Relaxed)),
-            ramp_index,
             note_trail: [0.0; NOTE_COUNT],
             fade_tau: fade_ms.max(1.0) / 1000.0,
             last_tick: Instant::now(),
@@ -186,8 +169,12 @@ impl Dashboard {
                 }
             }
             Message::ToggleRun => {
-                self.active
-                    .store(!self.active.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.active = !self.active;
+                let _ = self.control.send(if self.active {
+                    UiCommand::Start
+                } else {
+                    UiCommand::Stop
+                });
             }
             Message::ShowBasic => self.tab = Tab::Basic,
             Message::ShowAdvanced => self.tab = Tab::Advanced,
@@ -195,16 +182,16 @@ impl Dashboard {
             Message::ToggleLabels => self.show_labels = !self.show_labels,
             Message::ToggleFeed => {
                 self.show_feed = !self.show_feed;
-                self.feed.store(self.show_feed, Ordering::Relaxed);
+                let _ = self.control.send(UiCommand::SetFeed(self.show_feed));
             }
             Message::ToggleAscii => {
                 self.show_ascii = !self.show_ascii;
-                self.ascii.store(self.show_ascii, Ordering::Relaxed);
+                let _ = self.control.send(UiCommand::SetAscii(self.show_ascii));
             }
             Message::PickRamp(name) => {
                 if let Some(ramp) = Ramp::parse(&name) {
                     self.ramp = ramp;
-                    self.ramp_index.store(ramp.index(), Ordering::Relaxed);
+                    let _ = self.control.send(UiCommand::SetRamp(ramp));
                 }
             }
             Message::ClearHistory => {
@@ -218,13 +205,13 @@ impl Dashboard {
         }
     }
 
-    /// Write a picker change into the shared config and refresh the local mirror
-    /// so the pick lists show the new value immediately. The pipeline applies it
-    /// to the strategy and the sinks on its next frame.
+    /// Write a picker change into the local copy and hand it to the pipeline. A
+    /// click on the value that is already selected sends nothing at all.
     fn apply(&mut self, change: impl Fn(&mut InstrumentConfig) -> bool) {
-        if let Ok(mut config) = self.instrument.lock() {
-            change(&mut config);
-            self.instrument_view = config.clone();
+        if change(&mut self.instrument) {
+            let _ = self
+                .control
+                .send(UiCommand::SetInstrument(self.instrument.clone()));
         }
     }
 
@@ -237,7 +224,7 @@ impl Dashboard {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let running = self.active.load(Ordering::Relaxed);
+        let running = self.active;
 
         let header = row![
             text("Hand Gesture HUD").size(20),
@@ -338,7 +325,7 @@ impl Dashboard {
 
         let cards: Column<'_, Message> = match self.tab {
             Tab::Basic => column![
-                instrument_card(&self.instrument_view),
+                instrument_card(&self.instrument),
                 note_card(&self.metrics),
                 render_card(self.ramp, self.show_ascii),
                 meter_card("Volume", self.metrics.volume, VOLUME),
@@ -439,27 +426,23 @@ fn tab_button<'a>(label: &'a str, selected: bool, message: Message) -> Element<'
         .into()
 }
 
-/// `feed` mirrors the stage's feed button so the pipeline can skip the per-frame
-/// RGBA conversion when the camera is not shown.
+/// The dashboard talks to the pipeline only through the control channel: it never
+/// reaches into the frame loop's state.
 pub fn run(
     shared: Arc<Mutex<FrameMetrics>>,
-    active: Arc<AtomicBool>,
-    feed: Arc<AtomicBool>,
-    ascii: Arc<AtomicBool>,
-    instrument: Arc<Mutex<InstrumentConfig>>,
+    control: Sender<UiCommand>,
+    instrument: InstrumentConfig,
+    ramp: Ramp,
     fade_ms: f32,
-    ramp_index: Arc<AtomicU8>,
 ) -> iced::Result {
     iced::application(
         move || {
             Dashboard::new(
                 shared.clone(),
-                active.clone(),
-                feed.clone(),
-                ascii.clone(),
+                control.clone(),
                 instrument.clone(),
+                ramp,
                 fade_ms,
-                ramp_index.clone(),
             )
         },
         Dashboard::update,

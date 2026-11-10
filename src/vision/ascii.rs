@@ -70,20 +70,6 @@ impl Ramp {
             .collect()
     }
 
-    /// Position in `all()`, used to carry the choice across the dashboard ->
-    /// pipeline boundary in a single atomic.
-    pub fn index(self) -> u8 {
-        Self::all()
-            .iter()
-            .position(|ramp| *ramp == self)
-            .map_or(0, |position| position as u8)
-    }
-
-    pub fn from_index(index: u8) -> Ramp {
-        let ramps = Self::all();
-        ramps[(index as usize) % ramps.len()]
-    }
-
     pub fn parse(name: &str) -> Option<Ramp> {
         match name.trim().to_lowercase().as_str() {
             "blocks" | "block" => Some(Ramp::Blocks),
@@ -466,16 +452,9 @@ mod tests {
         assert_eq!(Ramp::parse("kaomoji"), None);
         assert_eq!(Ramp::Blocks.name(), "blocks");
         for &ramp in Ramp::all() {
-            assert_eq!(Ramp::from_index(ramp.index()), ramp);
             assert_eq!(Ramp::parse(ramp.name()), Some(ramp));
             assert_eq!(ramp.preview().chars().count(), LEVELS);
         }
-        // Out-of-range indices wrap instead of panicking, so a stale atomic can
-        // never crash the frame loop.
-        assert_eq!(
-            Ramp::from_index(99),
-            Ramp::all()[99usize % Ramp::all().len()]
-        );
     }
 
     #[test]

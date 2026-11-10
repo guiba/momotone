@@ -10,11 +10,12 @@ mod visualizer;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
+use crate::core::runtime::{control_channel, RuntimeConfig};
 use crate::core::Sink;
 use crate::core::Strategy;
 use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
@@ -274,9 +275,6 @@ fn main() -> Result<()> {
             Ramp::names().join(", ")
         )
     })?;
-    // The ramp is shared between the dashboard and the pipeline as an index, so a
-    // pick in the UI also changes the terminal print and `--ascii-dump` output.
-    let ascii_ramp = Arc::new(AtomicU8::new(ascii_ramp.index()));
 
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
@@ -378,7 +376,6 @@ fn main() -> Result<()> {
     let layout = instrument.layout.clone();
     let scale_name = instrument.scale.name.to_string();
     let root_name = instrument.root_name.clone();
-    let instrument = Arc::new(Mutex::new(instrument));
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
         mode: format!("{:?} / {:?}", args.mode, args.gesture),
@@ -390,14 +387,16 @@ fn main() -> Result<()> {
     }));
 
     let running = Arc::new(AtomicBool::new(true));
-    // Start/Stop button: cleared by the UI, checked by the pipeline every frame.
-    let active = Arc::new(AtomicBool::new(true));
-    // The stage hides the camera by default, so the pipeline skips the per-frame
-    // RGBA conversion until the feed button is pressed.
-    let feed = Arc::new(AtomicBool::new(false));
-    // Same shape as `feed`: the pipeline only builds the luminance grid while the
-    // stage says it is drawn.
-    let ascii = Arc::new(AtomicBool::new(args.ascii));
+    // Start/Stop, feed, ASCII and the glyph ramp all travel down one channel
+    // instead of living in four atomics the UI writes and the loop reads.
+    let (control_tx, control_rx) = control_channel();
+    let control = Arc::new(Mutex::new(RuntimeConfig::new(
+        args.feed_fps,
+        args.ascii_fps,
+        args.ascii,
+        ascii_ramp,
+    )));
+
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
         camera,
         tracker,
@@ -406,14 +405,10 @@ fn main() -> Result<()> {
         event_bus,
         event_rx: Some(event_rx),
         shared: shared.clone(),
+        control: control.clone(),
+        control_rx,
         instrument: instrument.clone(),
-        active: active.clone(),
-        feed_wanted: feed.clone(),
-        feed_fps: args.feed_fps,
-        ascii_wanted: ascii.clone(),
-        ascii_fps: args.ascii_fps,
         ascii_cols: args.ascii_cols,
-        ascii_ramp: ascii_ramp.clone(),
         ascii_dump: args.ascii_dump.clone(),
         // With no window there is no stage to look at, so `--ascii` means the
         // art goes to stdout instead.
@@ -438,15 +433,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(
-        shared,
-        active,
-        feed,
-        ascii,
-        instrument,
-        args.fade_ms,
-        ascii_ramp,
-    );
+    let ui_result = dashboard::run(shared, control_tx, instrument, ascii_ramp, args.fade_ms);
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
