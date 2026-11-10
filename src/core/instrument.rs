@@ -52,20 +52,36 @@ impl Waveform {
         }
     }
 
-    /// Sample value of one cycle at normalised phase `phase` in 0..1.
-    pub fn sample(self, phase: f32) -> f32 {
+    /// Sample value of one cycle at normalised phase `phase` in 0..1, truncated
+    /// to the `harmonics` that actually fit below Nyquist.
+    ///
+    /// A step function contains every harmonic, so the naive `if phase < 0.5`
+    /// square aliases badly above a few hundred Hz. The sum is capped, and the
+    /// ~18 % Gibbs overshoot at the discontinuity is divided back out.
+    pub fn sample_band_limited(self, phase: f32, harmonics: usize) -> f32 {
+        let tau = 2.0 * std::f32::consts::PI;
         let phase = phase - phase.floor();
+        const GIBBS: f32 = 1.18;
         match self {
-            Waveform::Sine => (phase * 2.0 * std::f32::consts::PI).sin(),
-            Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+            Waveform::Sine => (phase * tau).sin(),
+            // asin(sin(x)) is a triangle whose harmonics already fall off as 1/k^2,
+            // so it needs no truncation to stay in range.
+            Waveform::Triangle => (2.0 / std::f32::consts::PI) * (phase * tau).sin().asin(),
             Waveform::Square => {
-                if phase < 0.5 {
-                    1.0
-                } else {
-                    -1.0
+                let mut sum = 0.0;
+                for k in (1..=harmonics).step_by(2) {
+                    sum += (phase * tau * k as f32).sin() / k as f32;
                 }
+                (4.0 / std::f32::consts::PI) * sum / GIBBS
             }
-            Waveform::Saw => 2.0 * phase - 1.0,
+            Waveform::Saw => {
+                // 2p - 1 = -(2/pi) * sum sin(2*pi*k*p)/k over all k.
+                let mut sum = 0.0;
+                for k in 1..=harmonics {
+                    sum += (phase * tau * k as f32).sin() / k as f32;
+                }
+                -(2.0 / std::f32::consts::PI) * sum / GIBBS
+            }
         }
     }
 }
@@ -243,12 +259,13 @@ mod tests {
 
     #[test]
     fn waveform_shapes_match_their_textbook_values() {
-        // Each waveform is sampled at the same four points of the cycle.
+        // 24 harmonics is what the playable band actually gets at a 44.1k sample
+        // rate, so the band-limited values are close to the ideal shapes.
         let sine = [
-            Waveform::Sine.sample(0.0),
-            Waveform::Sine.sample(0.25),
-            Waveform::Sine.sample(0.5),
-            Waveform::Sine.sample(0.75),
+            Waveform::Sine.sample_band_limited(0.0, 24),
+            Waveform::Sine.sample_band_limited(0.25, 24),
+            Waveform::Sine.sample_band_limited(0.5, 24),
+            Waveform::Sine.sample_band_limited(0.75, 24),
         ];
         assert!(sine[0].abs() < 1e-6);
         assert!((sine[1] - 1.0).abs() < 1e-6);
@@ -256,26 +273,31 @@ mod tests {
         assert!((sine[3] + 1.0).abs() < 1e-6);
 
         let square = [
-            Waveform::Square.sample(0.1),
-            Waveform::Square.sample(0.4),
-            Waveform::Square.sample(0.6),
-            Waveform::Square.sample(0.9),
+            Waveform::Square.sample_band_limited(0.1, 24),
+            Waveform::Square.sample_band_limited(0.4, 24),
+            Waveform::Square.sample_band_limited(0.6, 24),
+            Waveform::Square.sample_band_limited(0.9, 24),
         ];
-        assert_eq!(square, [1.0, 1.0, -1.0, -1.0]);
+        assert!(
+            square[0] > 0.8 && square[1] > 0.8,
+            "first half of the cycle is high"
+        );
+        assert!(square[2] < -0.8 && square[3] < -0.8, "second half is low");
 
-        // Triangle peaks in the middle, saw ramps and jumps back.
-        assert!((Waveform::Triangle.sample(0.5) - 1.0).abs() < 1e-6);
-        assert!((Waveform::Triangle.sample(0.0) + 1.0).abs() < 1e-6);
-        assert!((Waveform::Saw.sample(0.0) + 1.0).abs() < 1e-6);
-        assert!((Waveform::Saw.sample(0.999) - 1.0).abs() < 1e-2);
+        // Triangle peaks a quarter of the way in; saw rises across the cycle.
+        assert!((Waveform::Triangle.sample_band_limited(0.25, 24) - 1.0).abs() < 1e-3);
+        assert!((Waveform::Triangle.sample_band_limited(0.75, 24) + 1.0).abs() < 1e-3);
+        assert!(
+            Waveform::Saw.sample_band_limited(0.9, 24) > Waveform::Saw.sample_band_limited(0.1, 24)
+        );
 
         // All four stay inside [-1, 1] across a cycle.
         for waveform in Waveform::all() {
-            for i in 0..=100 {
-                let value = waveform.sample(i as f32 / 100.0);
+            for i in 0..=200 {
+                let value = waveform.sample_band_limited(i as f32 / 200.0, 24);
                 assert!(
                     (-1.0..=1.0).contains(&value),
-                    "{waveform} out of range at {i}"
+                    "{waveform} out of range at {i}: {value}"
                 );
             }
         }

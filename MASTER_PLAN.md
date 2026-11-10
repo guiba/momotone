@@ -109,6 +109,26 @@ Each of these is a standalone commit. Do them in this order.
 the event path, honest clocks, measurable latency. Roughly 1 day of work, zero
 architectural risk.
 
+### Phase 1 result (branch `phase1-hot-path`)
+
+| Task | Outcome | Measured |
+| :-- | :-- | :-- |
+| 1.1 | `Synthesizer::new(gain)`; the callback integrates against `config.sample_rate` and prints it | `[Audio] device stream: 44100 Hz, 2 channels` |
+| 1.2 | `Sink: Send + Sync` → `Sink: Send`; the only remaining `unsafe` is the documented `StreamWrapper` (`cpal::Stream` is `!Send`, held by the thread that owns it) | compiles, tests green |
+| 1.3 | `BusMessage::{Event, Shutdown}`; the sink thread blocks on `rx.recv()` instead of waking every 10 ms; `run` closes the bus to unblock it on exit | dispatch→sink p99 0.1 ms |
+| 1.4 | `Voice` with a 15 ms one-pole glide on frequency *and* amplitude, band-limited square/saw (harmonics capped by Nyquist, Gibbs overshoot divided out), averaged voices, `tanh` soft clip | new tests: shape values, range, glide |
+| 1.5 | Mock mode runs on a deadline clock (`next += 33 ms`, sleep the remainder) | mock fps 26.4 → 30.3 |
+| 1.6 | `--ort-threads` (0 = runtime default). Measured detector p50: 13.7 ms @1 thread, 11.7 @2, 10.8 @4, 9.7 @8 — pinning is a knob, not a win; the frame is paced by the 33 ms camera read | `[Stages]` line |
+| 1.7 | `DetectionGate` (2 confirm frames, 3 grace frames) applied in `Pipeline::advance`; a miss inside the grace window keeps the previous keypoints instead of releasing | new pipeline test: flicker never fires, release only after the window |
+| 1.8 | skipped — needs a live comparison to eyeball | — |
+| 1.9 | Bench scaffolding in `tracker.rs` reduced from four ~20-line copies to `time_stage`/`time_legacy` | `cargo test --release -- --include-ignored bench_sampling` still runs |
+
+Deferred to Phase 3 by design: the audio callback still takes a `Mutex` (held only at
+the ~30 Hz event rate, and it allocates nothing), and note attack/release envelopes
+belong to the voice layer.
+
+Tests: 112 → 124 passing, gate green (`make verify`).
+
 ---
 
 ## 5. Phase 2 — State ownership & the frame loop *(the heart of the plan)*
@@ -342,7 +362,7 @@ everything later is judged against them.
 | Phase | Tasks | Effort | Status |
 | :-- | :-- | :-- | :-- |
 | 0 Baseline & CI | T0.1–T0.4 | 1 d | ☑ done |
-| 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☐ |
+| 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☑ done (T1.8 skipped) |
 | 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☐ |
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☐ |
 | 4 Presentation | T4.1–T4.6 | 2 d | ☐ |

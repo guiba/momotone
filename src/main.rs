@@ -51,6 +51,12 @@ struct Args {
     #[arg(long, value_enum, default_value = "mediapipe")]
     model: Model,
 
+    /// ONNX Runtime intra-op threads. 0 leaves the runtime default (one thread per
+    /// core); a positive number pins the pool, which is worth trying if the model's
+    /// thread churn makes the UI or the capture jitter.
+    #[arg(long, default_value_t = 0)]
+    ort_threads: usize,
+
     /// ONNX file for `--model yolo`. Get one with `scripts/get_pose_model.sh`.
     #[arg(long, default_value = "assets/yolo_hand_pose.onnx")]
     pose_path: String,
@@ -226,6 +232,7 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             args.score_threshold,
             args.debug,
             !args.landmarker_always,
+            args.ort_threads,
         ),
         Model::Yolo => HandTracker::yolo_pose(
             &args.pose_path,
@@ -233,6 +240,7 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             args.score_threshold,
             args.debug,
             !args.landmarker_always,
+            args.ort_threads,
         ),
     }
 }
@@ -303,7 +311,7 @@ fn main() -> Result<()> {
     let sink_label = match args.mode {
         Mode::Signal => {
             println!("Initializing Audio Engine... (gain {:.2})", args.amplitude);
-            let mut synth = Synthesizer::new(44100.0, 1, args.amplitude);
+            let mut synth = Synthesizer::new(args.amplitude);
             synth.start()?;
             sinks.push(Box::new(synth));
             "audio"

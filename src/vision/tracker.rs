@@ -52,6 +52,7 @@ impl HandTracker {
         score_threshold: f32,
         debug: bool,
         reuse_landmarks: bool,
+        ort_threads: usize,
     ) -> Result<Self> {
         Ok(Self::MediaPipe(Box::new(MediaPipeTracker::new(
             detector_path,
@@ -60,6 +61,7 @@ impl HandTracker {
             score_threshold,
             debug,
             reuse_landmarks,
+            ort_threads,
         )?)))
     }
 
@@ -69,6 +71,7 @@ impl HandTracker {
         score_threshold: f32,
         debug: bool,
         reuse_landmarks: bool,
+        ort_threads: usize,
     ) -> Result<Self> {
         Ok(Self::YoloPose(Box::new(YoloPoseTracker::new(
             pose_path,
@@ -76,6 +79,7 @@ impl HandTracker {
             score_threshold,
             debug,
             reuse_landmarks,
+            ort_threads,
         )?)))
     }
 
@@ -154,12 +158,24 @@ impl MediaPipeTracker {
         score_threshold: f32,
         debug: bool,
         reuse_landmarks: bool,
+        ort_threads: usize,
     ) -> Result<Self> {
+        // `--ort-threads 0` is ONNX Runtime's own default: one thread per core.
+        // Measured live with the webcam open, the BlazeHand detector is ~40 % faster
+        // using every core (9.7 ms p50) than pinned to one (13.7 ms), and the frame is
+        // paced by the 33 ms camera read anyway - so the default is left alone and the
+        // flag is an A/B knob for the jitter a full pool causes the UI and capture.
+        let threads = ort_threads;
+        let pin_error = |e| anyhow!("Failed to set ORT intra-op threads to {threads}: {e}");
         let detector_session = Session::builder()
             .with_context(|| format!("Failed to load detector {detector_path}"))?
+            .with_intra_threads(threads)
+            .map_err(pin_error)?
             .commit_from_file(detector_path)?;
         let landmarker_session = Session::builder()
             .with_context(|| format!("Failed to load landmarker {landmarker_path}"))?
+            .with_intra_threads(threads)
+            .map_err(pin_error)?
             .commit_from_file(landmarker_path)?;
 
         let anchors = load_anchors(anchors_path)?;
@@ -169,8 +185,13 @@ impl MediaPipeTracker {
 
         if debug {
             println!(
-                "[Tracker] Loaded detector: {detector_path}, landmarker: {landmarker_path}, {} anchors.",
-                anchors.len()
+                "[Tracker] Loaded detector: {detector_path}, landmarker: {landmarker_path}, {} anchors, ORT intra-op threads {}.",
+                anchors.len(),
+                if threads == 0 {
+                    "default (all cores)"
+                } else {
+                    "pinned"
+                }
             );
         }
 
@@ -631,7 +652,7 @@ mod tests {
         assert_eq!(warped_ptr, stage.warped.data());
     }
 
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// The old per-pixel sampler, kept only so the benchmark has something to compare
     /// against. Run with `cargo test --release -- --include-ignored bench_sampling`.
@@ -676,6 +697,51 @@ mod tests {
         data
     }
 
+    /// One stage, sampled N times: either with a buffer reused across calls (what
+    /// the tracker does) or allocated per call (what it used to do).
+    fn time_stage(frame: &Mat, affine: Affine, size: usize, fresh_buffer: bool) -> Duration {
+        const N: u32 = 300;
+        let mut reused = StageInput::new(size, size);
+        let start = Instant::now();
+        for _ in 0..N {
+            let map = if fresh_buffer {
+                let mut stage = StageInput::new(size, size);
+                sample_affine_to_tensor(
+                    frame,
+                    affine,
+                    size,
+                    size,
+                    &mut stage,
+                    TensorLayout::Nhwc,
+                    0.0,
+                )
+                .unwrap()
+            } else {
+                sample_affine_to_tensor(
+                    frame,
+                    affine,
+                    size,
+                    size,
+                    &mut reused,
+                    TensorLayout::Nhwc,
+                    0.0,
+                )
+                .unwrap()
+            };
+            std::hint::black_box(map);
+        }
+        start.elapsed() / N
+    }
+
+    fn time_legacy(frame: &Mat, affine: Affine, size: usize) -> Duration {
+        const N: u32 = 300;
+        let start = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(legacy_sample(frame, affine, size, size));
+        }
+        start.elapsed() / N
+    }
+
     #[test]
     #[ignore]
     fn bench_sampling() {
@@ -686,101 +752,22 @@ mod tests {
             core::Scalar::all(127.0),
         )
         .unwrap();
-        const N: u32 = 300;
-
-        // Detector stage (192x192), buffers reused vs allocated per call.
-        let mut stage = StageInput::new(192, 192);
-        let t = Instant::now();
-        for _ in 0..N {
-            let map = sample_affine_to_tensor(
-                &frame,
-                Affine::scale_translate(3.75, 280.0, 0.0),
-                192,
-                192,
-                &mut stage,
-                TensorLayout::Nhwc,
-                0.0,
-            )
-            .unwrap();
-            std::hint::black_box(map);
-        }
-        let reused_192 = t.elapsed() / N;
-
-        let t = Instant::now();
-        for _ in 0..N {
-            let mut fresh = StageInput::new(192, 192);
-            let map = sample_affine_to_tensor(
-                &frame,
-                Affine::scale_translate(3.75, 280.0, 0.0),
-                192,
-                192,
-                &mut fresh,
-                TensorLayout::Nhwc,
-                0.0,
-            )
-            .unwrap();
-            std::hint::black_box(map);
-        }
-        let fresh_192 = t.elapsed() / N;
-
-        let t = Instant::now();
-        for _ in 0..N {
-            std::hint::black_box(legacy_sample(
-                &frame,
-                Affine::scale_translate(3.75, 280.0, 0.0),
-                192,
-                192,
-            ));
-        }
-        let old_192 = t.elapsed() / N;
-
-        // Landmarker stage (224x224).
-        let mut stage = StageInput::new(224, 224);
-        let t = Instant::now();
-        for _ in 0..N {
-            let map = sample_affine_to_tensor(
-                &frame,
+        // The affine each stage really applies on a 640x480 frame.
+        let stages = [
+            ("detector", 192, Affine::scale_translate(3.75, 280.0, 0.0)),
+            (
+                "landmarker",
+                224,
                 Affine::scale_translate(2.7, 200.0, 100.0),
-                224,
-                224,
-                &mut stage,
-                TensorLayout::Nhwc,
-                0.0,
-            )
-            .unwrap();
-            std::hint::black_box(map);
+            ),
+        ];
+        for (name, size, affine) in stages {
+            println!(
+                "{name} {size}x{size}: reused {:?}  fresh {:?}  legacy {:?}",
+                time_stage(&frame, affine, size, false),
+                time_stage(&frame, affine, size, true),
+                time_legacy(&frame, affine, size),
+            );
         }
-        let reused_224 = t.elapsed() / N;
-
-        let t = Instant::now();
-        for _ in 0..N {
-            let mut fresh = StageInput::new(224, 224);
-            let map = sample_affine_to_tensor(
-                &frame,
-                Affine::scale_translate(2.7, 200.0, 100.0),
-                224,
-                224,
-                &mut fresh,
-                TensorLayout::Nhwc,
-                0.0,
-            )
-            .unwrap();
-            std::hint::black_box(map);
-        }
-        let fresh_224 = t.elapsed() / N;
-
-        let t = Instant::now();
-        for _ in 0..N {
-            std::hint::black_box(legacy_sample(
-                &frame,
-                Affine::scale_translate(2.7, 200.0, 100.0),
-                224,
-                224,
-            ));
-        }
-        let old_224 = t.elapsed() / N;
-
-        println!("192x192: reused {reused_192:?}  fresh {fresh_192:?}  old {old_192:?}");
-        println!("224x224: reused {reused_224:?}  fresh {fresh_224:?}  old {old_224:?}");
     }
 }

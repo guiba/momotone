@@ -21,7 +21,8 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use opencv::prelude::*;
 
-use crate::core::event_bus::{EventBus, QueuedEvent};
+use crate::core::detection_gate::DetectionGate;
+use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::geometry::hand_geometry;
 use crate::core::instrument::InstrumentConfig;
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
@@ -32,14 +33,18 @@ use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
 
-/// Mock mode emulates a 30 fps camera so the telemetry looks real.
-const MOCK_CADENCE_MS: u64 = 33;
-/// How often the paused loop checks the Start/Stop flag and refreshes the UI.
-const PAUSE_POLL_MS: u64 = 50;
+/// Mock mode emulates a 30 fps camera so the telemetry looks real. The loop uses a
+/// deadline rather than a flat sleep: macOS `thread::sleep(33 ms)` actually returns
+/// after ~41 ms, so a naive sleep makes every mock number 25 % wrong.
+const MOCK_CADENCE: Duration = Duration::from_millis(33);
 /// How long inference waits for the capture stage before re-checking the flags.
 const FRAME_POLL_MS: u64 = 20;
-/// How often the sink thread wakes up to look for an event or a shutdown.
-const SINK_POLL_MS: u64 = 20;
+/// Frames of confirmed detection before a gesture may start, and frames of no
+/// detection tolerated before the hand is declared lost.
+const DETECT_CONFIRM_FRAMES: u32 = 2;
+const DETECT_GRACE_FRAMES: u32 = 3;
+/// How often the paused loop checks the Start/Stop flag and refreshes the UI.
+const PAUSE_POLL_MS: u64 = 50;
 /// Frames per second the dashboard is handed a new camera image. The iced
 /// renderer uploads each `image::Handle` to the GPU synchronously (a 640x480
 /// RGBA frame is under its 2 MB sync threshold), so every upload costs a
@@ -88,7 +93,7 @@ pub struct Pipeline {
     /// Drained by whoever owns it: the pipeline thread while running inline, the
     /// sink thread once `run` has spawned it. Exactly one consumer, so events reach
     /// the sinks in the order they were dispatched.
-    event_rx: Option<Receiver<QueuedEvent>>,
+    event_rx: Option<Receiver<BusMessage>>,
     shared: Arc<Mutex<FrameMetrics>>,
     /// The instrument the player is currently on. The dashboard pickers write
     /// to it; the pipeline notices the version change and re-keys the strategy
@@ -104,6 +109,11 @@ pub struct Pipeline {
     /// Frames the capture stage read and dropped, so a bottleneck is visible
     /// instead of invisible.
     capture: Arc<CaptureCounters>,
+    /// Debounces the detection gate so a flickering anchor score does not click the
+    /// note on and off.
+    gate: DetectionGate,
+    /// Deadline of the next synthetic frame, for mock mode's paced clock.
+    next_mock_frame: Instant,
     /// Rolling stage timings. The frame loop is paced by the slowest stage, so a
     /// regression shows up as a tail here long before the average moves.
     stage_capture: Samples,
@@ -165,7 +175,7 @@ pub struct PipelineConfig {
     pub strategy: Box<dyn Strategy>,
     pub sinks: Arc<Mutex<Vec<Box<dyn Sink>>>>,
     pub event_bus: EventBus,
-    pub event_rx: Option<Receiver<QueuedEvent>>,
+    pub event_rx: Option<Receiver<BusMessage>>,
     pub shared: Arc<Mutex<FrameMetrics>>,
     pub instrument: Arc<Mutex<InstrumentConfig>>,
     pub active: Arc<AtomicBool>,
@@ -237,6 +247,8 @@ impl Pipeline {
             metrics: context,
             previous_landmarks: Vec::new(),
             capture: Arc::new(CaptureCounters::default()),
+            gate: DetectionGate::new(DETECT_CONFIRM_FRAMES, DETECT_GRACE_FRAMES),
+            next_mock_frame: Instant::now(),
             stage_capture: Samples::default(),
             stage_inference: Samples::default(),
             stage_latency: Samples::default(),
@@ -342,7 +354,6 @@ impl Pipeline {
         // longer holds the frame loop hostage.
         let sink_handle = {
             let sinks = self.sinks.clone();
-            let running = running.clone();
             let debug = self.debug;
             let dispatch = self.stage_dispatch.clone();
             let rx = self.event_rx.take();
@@ -350,24 +361,18 @@ impl Pipeline {
                 let Some(rx) = rx else {
                     return;
                 };
-                while running.load(Ordering::Relaxed) {
-                    match rx.recv_timeout(Duration::from_millis(SINK_POLL_MS)) {
-                        Ok(queued) => {
-                            // How long the gesture waited in the queue before an
-                            // output saw it: part of the hand-to-sound budget that
-                            // neither capture nor inference accounts for.
-                            let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
-                            if let Ok(mut samples) = dispatch.lock() {
-                                samples.push(age_ms);
-                            }
-                            apply_to_sinks(&sinks, &queued.event, debug);
-                        }
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => break,
+                while let Ok(message) = rx.recv() {
+                    let queued = match message {
+                        BusMessage::Event(queued) => queued,
+                        BusMessage::Shutdown => break,
+                    };
+                    // How long the gesture waited in the queue before an output saw
+                    // it: part of the hand-to-sound budget that neither capture nor
+                    // inference accounts for.
+                    let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(mut samples) = dispatch.lock() {
+                        samples.push(age_ms);
                     }
-                }
-                // Flush whatever was dispatched on the way out, then close the outputs.
-                while let Ok(queued) = rx.try_recv() {
                     apply_to_sinks(&sinks, &queued.event, debug);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
@@ -455,6 +460,9 @@ impl Pipeline {
         }
 
         running.store(false, Ordering::Relaxed);
+        // Unblock the sink thread: everything dispatched before this arrives first,
+        // because the channel is FIFO.
+        self.event_bus.close();
         if let Some(handle) = capture_handle {
             let _ = handle.join();
         }
@@ -515,9 +523,14 @@ impl Pipeline {
     /// own threads.
     pub fn tick(&mut self) -> Result<bool> {
         if self.camera.is_none() {
-            // Mock mode has no camera, so pace it like one to keep the telemetry
-            // (fps, jitter, history) realistic.
-            std::thread::sleep(Duration::from_millis(MOCK_CADENCE_MS));
+            // Mock mode has no camera, so pace it with a deadline clock rather than a
+            // flat sleep: sleeping 33 ms on macOS returns after ~41 ms, which makes
+            // every mock telemetry number 25 % wrong.
+            let now = Instant::now();
+            if now < self.next_mock_frame {
+                std::thread::sleep(self.next_mock_frame - now);
+            }
+            self.next_mock_frame += MOCK_CADENCE;
             self.advance(FrameOutcome {
                 detection: synthetic_detection(self.started.elapsed().as_secs_f64()),
                 frame: None,
@@ -571,12 +584,29 @@ impl Pipeline {
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
         self.sync_instrument();
         let FrameOutcome {
-            detection,
+            mut detection,
             frame,
             capture_ms,
             inference_ms,
             latency_ms,
         } = outcome;
+
+        // Debounce the detector. The anchor score flickers around the threshold, so
+        // a raw compare makes the note click on and off while the hand sits still:
+        // a gesture needs a couple of confirmed sightings to start, and a couple of
+        // missed frames do not end it.
+        let present = self.gate.observe(detection.hand_landmarks.is_some());
+        if !present {
+            detection.hand_landmarks = None;
+            detection.r#box = None;
+            detection.score = 0.0;
+        } else if detection.hand_landmarks.is_none() {
+            // Inside the grace window: keep the last known keypoints instead of
+            // releasing, so a one-frame dropout is inaudible.
+            detection.hand_landmarks = Some(self.previous_landmarks.clone());
+            detection.r#box = self.metrics.hand_box;
+            detection.score = self.metrics.confidence;
+        }
 
         let now = Instant::now();
         let gap_ms = now.duration_since(self.last_publish).as_secs_f64() * 1000.0;
@@ -860,9 +890,12 @@ fn apply_to_sinks(sinks: &SinkList, event: &GestureEvent, debug: bool) {
     }
 }
 
-fn drain_events(rx: &Receiver<QueuedEvent>, sinks: &SinkList, debug: bool) {
-    while let Ok(queued) = rx.try_recv() {
-        apply_to_sinks(sinks, &queued.event, debug);
+fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList, debug: bool) {
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.event, debug),
+            BusMessage::Shutdown => break,
+        }
     }
 }
 
@@ -1233,7 +1266,8 @@ mod tests {
             events,
             ..
         } = test_pipeline(Box::new(AlwaysSignal), None);
-        pipeline.tick().unwrap();
+        pipeline.tick().unwrap(); // first sighting: the gate is still confirming
+        pipeline.tick().unwrap(); // second sighting: the gesture is live
 
         // The OUTPUT card reads `frequency` when there is no note, so a theremin
         // run must publish the hertz and not leave a stale note behind.
@@ -1492,6 +1526,7 @@ mod tests {
             feed_fps: 0.0,
         });
         pipeline.tick().unwrap();
+        pipeline.tick().unwrap();
 
         let snapshot = shared.lock().unwrap();
         assert_eq!(snapshot.scale, "major pentatonic");
@@ -1550,6 +1585,9 @@ mod tests {
             debug: false,
             emit_frames: true,
         });
+        // Two frames: the detection gate needs a second sighting before the hand
+        // counts, and the mock art is drawn from the landmarks.
+        pipeline.tick().unwrap();
         pipeline.tick().unwrap();
 
         let snapshot = shared.lock().unwrap();
@@ -1572,7 +1610,9 @@ mod tests {
             ..
         } = test_pipeline(Box::new(AlwaysOn), None);
 
-        // With no camera the pipeline synthesises a hand, so the strategy fires.
+        // With no camera the pipeline synthesises a hand, so the strategy fires once
+        // the gate has confirmed the gesture.
+        pipeline.tick().unwrap();
         pipeline.tick().unwrap();
 
         pipeline.active.store(false, Ordering::Relaxed);
@@ -1642,6 +1682,60 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(pipeline.metrics.volume, 0.0);
         assert!(!pipeline.gesture_active);
+    }
+
+    #[test]
+    fn the_gate_needs_two_sightings_and_only_releases_after_the_grace_window() {
+        let TestHarness {
+            mut pipeline,
+            events,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), None);
+
+        let frame = |detection: HandDetectionResult| FrameOutcome {
+            detection,
+            frame: None,
+            capture_ms: 0.0,
+            inference_ms: 0.0,
+            latency_ms: 0.0,
+        };
+        let found = || {
+            let mut detection = synthetic_detection(0.0);
+            detection.frame_size = (640, 480);
+            frame(detection)
+        };
+        let absent = || frame(HandDetectionResult::default());
+
+        // The confidence flicker the tracker produces (0.97 -> 0.00 with a hand in
+        // view) must not click the instrument on and off.
+        pipeline.advance(found()).unwrap();
+        pipeline.advance(absent()).unwrap();
+        pipeline.advance(found()).unwrap();
+        pipeline.advance(absent()).unwrap();
+        assert!(events.lock().unwrap().is_empty(), "a flicker is not a hand");
+        assert!(!pipeline.metrics.detected);
+
+        // Two sightings in a row start the gesture; the grace window keeps it alive
+        // while the anchor score dips, and only the fourth miss releases it.
+        pipeline.advance(found()).unwrap();
+        pipeline.advance(found()).unwrap();
+        assert!(pipeline.metrics.detected, "the second sighting confirms it");
+        pipeline.advance(absent()).unwrap();
+        pipeline.advance(absent()).unwrap();
+        pipeline.advance(absent()).unwrap();
+        assert!(
+            pipeline.metrics.detected,
+            "three misses are still inside the grace window"
+        );
+        pipeline.advance(absent()).unwrap();
+        assert!(!pipeline.metrics.detected, "the fourth miss loses the hand");
+
+        let sent = events.lock().unwrap();
+        assert!(
+            sent.iter()
+                .any(|e| matches!(e.payload, GesturePayload::Note { note: 0, .. })),
+            "the release is emitted once the grace window expires"
+        );
     }
 
     #[test]
@@ -1782,8 +1876,9 @@ mod tests {
         let recorded = events.lock().unwrap();
         assert_eq!(
             recorded.len(),
-            3,
-            "events dispatched by inference reach the sinks on their own thread"
+            2,
+            "events dispatched by inference reach the sinks on their own thread: of the \
+             three frames, the first is spent confirming the detection"
         );
         assert!(
             !running.load(Ordering::Relaxed),

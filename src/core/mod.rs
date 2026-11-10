@@ -1,3 +1,4 @@
+pub mod detection_gate;
 pub mod event_bus;
 pub mod geometry;
 pub mod grid;
@@ -52,7 +53,10 @@ pub struct HandDetectionResult {
 }
 
 /// Interface for an output sink (Audio or MIDI).
-pub trait Sink: Send + Sync {
+///
+/// `Send` is the only bound that matters: the sink list is owned by a single thread
+/// and guarded by a mutex, so nothing ever calls into two sinks at once.
+pub trait Sink: Send {
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
     fn handle_event(&mut self, event: &GestureEvent) -> Result<()>;
