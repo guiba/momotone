@@ -136,6 +136,15 @@ Tests: 112 → 124 passing, gate green (`make verify`).
 **Goal:** one loop, one config, one snapshot. This is where the 1707-line `pipeline.rs`
 becomes readable.
 
+**Done (branch `phase2-config-and-commands`, merged to master):** T2.1 and T2.2.
+`RuntimeConfig { active, feed, ascii, feed_fps, ascii_fps, ramp }` replaced the four
+`AtomicBool`s and the `AtomicU8` ramp the dashboard used to write directly; the UI now
+only sends `UiCommand::{Start, Stop, SetFeed, SetAscii, SetRamp, SetInstrument}` and the
+pipeline drains that channel at the top of every frame. `InstrumentConfig.version`,
+`Pipeline.applied_version`, `Ramp::index`/`from_index` and the cached
+`feed_interval`/`ascii_interval` fields are gone. `Pipeline` has 32 fields (was 38),
+127 tests pass, and the gate is green. T2.3–T2.5 are still open.
+
 ### T2.1 — `RuntimeConfig` replaces the atomics
 ```rust
 pub struct RuntimeConfig {
@@ -363,7 +372,7 @@ everything later is judged against them.
 | :-- | :-- | :-- | :-- |
 | 0 Baseline & CI | T0.1–T0.4 | 1 d | ☑ done |
 | 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☑ done (T1.8 skipped) |
-| 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☐ |
+| 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ◑ T2.1, T2.2 done |
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☐ |
 | 4 Presentation | T4.1–T4.6 | 2 d | ☐ |
 | 5 Observability & test infra | T5.1–T5.6 | 3 d | ☐ |
