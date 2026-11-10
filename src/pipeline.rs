@@ -105,6 +105,7 @@ struct CaptureCounters {
 type SinkList = Arc<Mutex<Vec<Box<dyn Sink>>>>;
 
 pub struct Pipeline {
+    // --- the stages -----------------------------------------------------------
     camera: Option<WebcamSource>,
     tracker: Option<HandTracker>,
     strategy: Box<dyn Strategy>,
@@ -124,50 +125,73 @@ pub struct Pipeline {
     control: Arc<Mutex<RuntimeConfig>>,
     /// Commands from the UI, drained at the top of every frame.
     control_rx: Option<Receiver<UiCommand>>,
-    metrics: FrameMetrics,
-    previous_landmarks: Vec<Landmark>,
-    /// Frames the capture stage read and dropped, so a bottleneck is visible
-    /// instead of invisible.
-    capture: Arc<CaptureCounters>,
+
+    // --- what the hand is doing ---------------------------------------------
     /// Debounces the detection gate so a flickering anchor score does not click the
     /// note on and off.
     gate: DetectionGate,
-    /// Deadline of the next synthetic frame, for mock mode's paced clock.
-    next_mock_frame: Instant,
-    /// Rolling stage timings. The frame loop is paced by the slowest stage, so a
-    /// regression shows up as a tail here long before the average moves.
-    stage_capture: Samples,
-    stage_inference: Samples,
-    stage_latency: Samples,
-    /// Read by the sink thread, which is a different thread, hence the shared ring.
-    stage_dispatch: Arc<Mutex<Samples>>,
+    previous_landmarks: Vec<Landmark>,
     /// True while a gesture is actively driving the sinks. Used to send exactly
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
     gesture_active: bool,
-    last_detection: Instant,
+    metrics: FrameMetrics,
+
+    // --- run state -------------------------------------------------------------
+    run: RunFlags,
+    telemetry: Telemetry,
+    presentation: Presentation,
+    /// Frames the capture stage read and dropped, so a bottleneck is visible
+    /// instead of invisible.
+    counters: Arc<CaptureCounters>,
+}
+
+/// How this run is bounded: when to stop, whether to publish frames at all, and
+/// whether to print the per-frame line.
+struct RunFlags {
+    max_frames: Option<u32>,
+    emit_frames: bool,
+    debug: bool,
+}
+
+/// Clocks and the rolling samples of each stage: everything the dashboard and the
+/// summary line measure.
+struct Telemetry {
+    started: Instant,
     /// Wall clock of the last published frame; the fps is derived from the gap
     /// between publishes, which stays honest once the stages overlap.
     last_publish: Instant,
+    last_detection: Instant,
     /// Exponentially smoothed publish interval, in milliseconds.
     avg_gap_ms: f64,
-    started: Instant,
-    max_frames: Option<u32>,
-    debug: bool,
-    emit_frames: bool,
-    /// Wall clock at which the next camera frame is allowed to go to the UI.
-    /// Seeded with "now" so the very first frame is uploaded.
-    next_feed: Instant,
-    next_ascii: Instant,
+    /// Deadline of the next synthetic frame, for mock mode's paced clock.
+    next_mock: Instant,
+    /// Rolling stage timings. The frame loop is paced by the slowest stage, so a
+    /// regression shows up as a tail here long before the average moves.
+    capture: Samples,
+    inference: Samples,
+    latency: Samples,
+    /// Read by the sink thread, which is a different thread, hence the shared ring.
+    dispatch: Arc<Mutex<Samples>>,
+}
+
+/// Everything that turns a frame into pixels or glyphs for a human. Kept separate
+/// from the loop so the presenter can move to its own thread without the tracker
+/// having to know about it.
+struct Presentation {
+    /// Per-cell EMA state so the art settles instead of flickering.
+    ascii: AsciiLayer,
     /// Columns of the ASCII grid; rows follow from the frame aspect.
-    ascii_cols: usize,
+    cols: usize,
     /// Terminal mode: print the art to stdout so the renderer can be checked
     /// without a window (`--no-ui --ascii`).
-    ascii_stdout: bool,
+    stdout: bool,
     /// Optional path to write each rendered ASCII frame to.
-    ascii_dump: Option<String>,
-    /// Per-cell EMA state so the art settles instead of flickering.
-    ascii_layer: AsciiLayer,
+    dump: Option<String>,
+    /// Wall clock at which the next camera frame is allowed to go to the UI. Seeded
+    /// with "now" so the very first frame is uploaded.
+    next_feed: Instant,
+    next_ascii: Instant,
 }
 
 /// Everything the loop needs to run, grouped so `Pipeline::new` is not a
@@ -228,6 +252,8 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
+        // One clock reading for every deadline, so the first frame is due immediately.
+        let now = Instant::now();
         let mut pipeline = Pipeline {
             camera,
             tracker,
@@ -239,28 +265,34 @@ impl Pipeline {
             control,
             control_rx: Some(control_rx),
             metrics: context,
-            previous_landmarks: Vec::new(),
-            capture: Arc::new(CaptureCounters::default()),
             gate: DetectionGate::new(DETECT_CONFIRM_FRAMES, DETECT_GRACE_FRAMES),
-            next_mock_frame: Instant::now(),
-            stage_capture: Samples::default(),
-            stage_inference: Samples::default(),
-            stage_latency: Samples::default(),
-            stage_dispatch: Arc::new(Mutex::new(Samples::default())),
+            previous_landmarks: Vec::new(),
             gesture_active: false,
-            last_detection: Instant::now(),
-            last_publish: Instant::now(),
-            avg_gap_ms: 0.0,
-            started: Instant::now(),
-            max_frames,
-            debug,
-            emit_frames,
-            next_feed: Instant::now(),
-            next_ascii: Instant::now(),
-            ascii_cols,
-            ascii_stdout,
-            ascii_dump,
-            ascii_layer: AsciiLayer::new(),
+            counters: Arc::new(CaptureCounters::default()),
+            run: RunFlags {
+                max_frames,
+                emit_frames,
+                debug,
+            },
+            telemetry: Telemetry {
+                started: now,
+                last_publish: now,
+                last_detection: now,
+                avg_gap_ms: 0.0,
+                next_mock: now,
+                capture: Samples::default(),
+                inference: Samples::default(),
+                latency: Samples::default(),
+                dispatch: Arc::new(Mutex::new(Samples::default())),
+            },
+            presentation: Presentation {
+                ascii: AsciiLayer::new(),
+                cols: ascii_cols,
+                stdout: ascii_stdout,
+                dump: ascii_dump,
+                next_feed: now,
+                next_ascii: now,
+            },
         };
         // Seed the instrument so the strategy, the sinks and the published keyboard
         // agree from the very first frame.
@@ -340,7 +372,7 @@ impl Pipeline {
         self.metrics.waveform = config.waveform.name().to_string();
         self.metrics.layout = config.layout.clone();
 
-        if self.debug {
+        if self.run.debug {
             println!(
                 "[Instrument] {} {} - {}x{} grid, {} waveform",
                 config.scale.name,
@@ -364,7 +396,7 @@ impl Pipeline {
             let tx = frame_tx.clone();
             let running = running.clone();
             let control = self.control.clone();
-            let counters = self.capture.clone();
+            let counters = self.counters.clone();
             std::thread::spawn(move || {
                 if let Err(e) = capture_frames(
                     &mut || camera.get_frame(),
@@ -383,8 +415,8 @@ impl Pipeline {
         // longer holds the frame loop hostage.
         let sink_handle = {
             let sinks = self.sinks.clone();
-            let debug = self.debug;
-            let dispatch = self.stage_dispatch.clone();
+            let debug = self.run.debug;
+            let dispatch = self.telemetry.dispatch.clone();
             let rx = self.event_rx.take();
             std::thread::spawn(move || {
                 let Some(rx) = rx else {
@@ -430,6 +462,7 @@ impl Pipeline {
             }
 
             if self
+                .run
                 .max_frames
                 .is_some_and(|n| self.metrics.frames >= n as u64)
             {
@@ -437,7 +470,7 @@ impl Pipeline {
             }
         }
 
-        if self.debug {
+        if self.run.debug {
             let frames = self.metrics.frames.max(1);
             println!(
                 "[Pipeline] {} frames in {:.2} s: {:.1} fps, {:.2} ms/frame end to end (capture {:.2} ms, inference {:.2} ms, {} frames dropped)",
@@ -475,14 +508,15 @@ impl Pipeline {
     /// frame: the sort is cheap but repeating it 30 times a second is not needed.
     fn stage_profile(&self) -> StageProfile {
         let dispatch = self
-            .stage_dispatch
+            .telemetry
+            .dispatch
             .lock()
             .map(|samples| profile(&samples))
             .unwrap_or_default();
         StageProfile {
-            inference: profile(&self.stage_inference),
-            capture: profile(&self.stage_capture),
-            end_to_end: profile(&self.stage_latency),
+            inference: profile(&self.telemetry.inference),
+            capture: profile(&self.telemetry.capture),
+            end_to_end: profile(&self.telemetry.latency),
             dispatch,
         }
     }
@@ -496,10 +530,10 @@ impl Pipeline {
             self.event_bus.dispatch(GestureEvent::no_gesture());
         }
         if let Some(rx) = &self.event_rx {
-            drain_events(rx, &self.sinks, self.debug);
+            drain_events(rx, &self.sinks, self.run.debug);
         }
         // Otherwise the stopped interval shows up as a huge fps dip on resume.
-        self.last_publish = Instant::now();
+        self.telemetry.last_publish = Instant::now();
 
         if self.metrics.paused {
             return;
@@ -526,12 +560,12 @@ impl Pipeline {
             // Sleeping 33 ms on macOS returns after ~41 ms, which would make every
             // mock number 25 % wrong; aim at the deadline instead.
             let now = Instant::now();
-            if now < self.next_mock_frame {
-                std::thread::sleep(self.next_mock_frame - now);
+            if now < self.telemetry.next_mock {
+                std::thread::sleep(self.telemetry.next_mock - now);
             }
-            self.next_mock_frame += MOCK_CADENCE;
+            self.telemetry.next_mock += MOCK_CADENCE;
             return Ok(FrameRead::Frame(synthetic_frame(
-                self.started.elapsed().as_secs_f64(),
+                self.telemetry.started.elapsed().as_secs_f64(),
             )));
         };
 
@@ -555,13 +589,11 @@ impl Pipeline {
         }
     }
 
-    /// Everything that happens to a frame once the tracker has returned: the
-    /// instrument sync, metrics, the gesture dispatch, and the publish.
+    /// A frame, stage by stage: gate the detection, record the timings, paint the
+    /// preview, track the hand, draw the art, run the gesture, publish.
     ///
-    /// The instrument check lives here rather than in `tick` so it happens on
-    /// every frame whichever stage produced it - the staged `run` loop never goes
-    /// through `tick`, and a picker change that never reaches the strategy or the
-    /// sinks is invisible except by ear.
+    /// Each stage is a function of the frame and the pipeline's state, so the
+    /// presentation code can be exercised without a camera or an ONNX model.
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
         self.apply_commands();
         let settings = self.settings();
@@ -573,10 +605,28 @@ impl Pipeline {
             latency_ms,
         } = outcome;
 
-        // Debounce the detector. The anchor score flickers around the threshold, so
-        // a raw compare makes the note click on and off while the hand sits still:
-        // a gesture needs a couple of confirmed sightings to start, and a couple of
-        // missed frames do not end it.
+        self.debounce(&mut detection);
+        self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
+        self.update_preview(frame.as_ref(), &settings);
+        self.update_tracking(&detection);
+        self.update_ascii(frame.as_ref(), &detection, &settings);
+        self.dispatch_gesture(&detection);
+
+        // Inline mode: this thread still owns the receiver. Once `run` has spawned
+        // the sink thread it is gone, and that stage is the only consumer.
+        if let Some(rx) = &self.event_rx {
+            drain_events(rx, &self.sinks, self.run.debug);
+        }
+        self.publish();
+        self.report_frame();
+        Ok(())
+    }
+
+    /// Debounce the detector. The anchor score flickers around the threshold, so a
+    /// raw compare makes the note click on and off while the hand sits still: a
+    /// gesture needs a couple of confirmed sightings to start, and a couple of
+    /// missed frames do not end it.
+    fn debounce(&mut self, detection: &mut HandDetectionResult) {
         let present = self.gate.observe(detection.hand_landmarks.is_some());
         if !present {
             detection.hand_landmarks = None;
@@ -589,55 +639,76 @@ impl Pipeline {
             detection.r#box = self.metrics.hand_box;
             detection.score = self.metrics.confidence;
         }
+    }
 
+    /// Frame counter, publish-cadence fps and the rolling percentiles of each stage.
+    fn record_timing(
+        &mut self,
+        detection: &HandDetectionResult,
+        capture_ms: f64,
+        inference_ms: f64,
+        latency_ms: f64,
+    ) {
         let now = Instant::now();
-        let gap_ms = now.duration_since(self.last_publish).as_secs_f64() * 1000.0;
-        self.last_publish = now;
+        let gap_ms = now
+            .duration_since(self.telemetry.last_publish)
+            .as_secs_f64()
+            * 1000.0;
+        self.telemetry.last_publish = now;
 
         // Smooth the *interval*, not the reciprocal rate. With the stages
         // overlapping, individual gaps alternate between a queued frame (a
         // millisecond) and a full inference, and an EMA of fps turns that jitter
         // into a number that bears no relation to the frame rate.
-        self.avg_gap_ms = if self.avg_gap_ms == 0.0 {
+        self.telemetry.avg_gap_ms = if self.telemetry.avg_gap_ms == 0.0 {
             gap_ms
         } else {
-            0.9 * self.avg_gap_ms + 0.1 * gap_ms
+            0.9 * self.telemetry.avg_gap_ms + 0.1 * gap_ms
         };
-        self.metrics.fps = (1000.0 / self.avg_gap_ms.max(1.0)) as f32;
+        self.metrics.fps = (1000.0 / self.telemetry.avg_gap_ms.max(1.0)) as f32;
 
         // Stage timings, in milliseconds, into the rolling rings the summary and
         // the dashboard read as percentiles.
-        self.stage_capture.push(capture_ms);
-        self.stage_inference.push(inference_ms);
-        self.stage_latency.push(latency_ms);
+        self.telemetry.capture.push(capture_ms);
+        self.telemetry.inference.push(inference_ms);
+        self.telemetry.latency.push(latency_ms);
 
         self.metrics.frames += 1;
         if self.metrics.frames.is_multiple_of(PROFILE_REFRESH_FRAMES) {
             self.metrics.perf = self.stage_profile();
         }
-        self.metrics.uptime_ms = self.started.elapsed().as_millis() as u64;
+        self.metrics.uptime_ms = self.telemetry.started.elapsed().as_millis() as u64;
         self.metrics.paused = false;
         self.metrics.frame_size = detection.frame_size;
         self.metrics.frame_ms = inference_ms;
         self.metrics.capture_ms = capture_ms;
         self.metrics.latency_ms = latency_ms;
-        self.metrics.captured = self.capture.captured.load(Ordering::Relaxed);
-        self.metrics.dropped = self.capture.dropped.load(Ordering::Relaxed);
+        self.metrics.captured = self.counters.captured.load(Ordering::Relaxed);
+        self.metrics.dropped = self.counters.dropped.load(Ordering::Relaxed);
+        self.metrics.detector_us = detection.timings.detector_us;
+        self.metrics.landmarker_us = detection.timings.landmarker_us;
+    }
 
-        if let Some(frame) = frame.as_ref() {
-            if should_upload_feed(self.emit_frames, settings.feed) && feed_due(self.next_feed, now)
+    /// Convert a frame to RGBA for the dashboard only when the stage is showing it
+    /// and the upload cadence is due - 1.2 MB per frame otherwise.
+    fn update_preview(&mut self, frame: Option<&Mat>, settings: &RuntimeConfig) {
+        let now = Instant::now();
+        if let Some(frame) = frame {
+            if should_upload_feed(self.run.emit_frames, settings.feed)
+                && feed_due(self.presentation.next_feed, now)
             {
-                self.next_feed = now + feed_interval(settings.feed_fps);
+                self.presentation.next_feed = now + feed_interval(settings.feed_fps);
                 self.metrics.frame_pixels = frame_to_rgba(frame);
             } else {
                 // Keep the shared snapshot free of pixels the UI will discard.
                 self.metrics.frame_pixels.clear();
             }
         }
+    }
 
-        self.metrics.detector_us = detection.timings.detector_us;
-        self.metrics.landmarker_us = detection.timings.landmarker_us;
-
+    /// Where the hand is: keypoints, box, confidence, jitter, how long it has been
+    /// lost and the derived geometry the strategies and the dashboard read.
+    fn update_tracking(&mut self, detection: &HandDetectionResult) {
         // Tracking state. `clone_from` keeps the Vec's capacity, so the landmark
         // list stops reallocating every frame.
         self.metrics.detected = detection.r#box.is_some();
@@ -663,61 +734,13 @@ impl Pipeline {
         }
 
         if self.metrics.detected {
-            self.last_detection = Instant::now();
+            self.telemetry.last_detection = Instant::now();
         }
-        self.metrics.lost_ms = self.last_detection.elapsed().as_millis() as u64;
+        self.metrics.lost_ms = self.telemetry.last_detection.elapsed().as_millis() as u64;
         self.metrics.jitter_px = landmark_jitter(&self.previous_landmarks, &self.metrics.landmarks);
         self.previous_landmarks.clone_from(&self.metrics.landmarks);
 
-        // ASCII backdrop. It has its own cadence and its own toggle: the art is
-        // a deliberately coarse view of the frame, so building it costs a resize
-        // plus one pass per cell instead of a 1.2 MB texture upload, and it can
-        // update slower than the skeleton without looking stale.
-        if ascii_wanted(
-            self.emit_frames,
-            settings.ascii,
-            &self.ascii_dump,
-            self.ascii_stdout,
-        ) && feed_due(self.next_ascii, now)
-        {
-            self.next_ascii = now + feed_interval(settings.ascii_fps);
-            let grid = match &frame {
-                Some(frame) => self
-                    .ascii_layer
-                    .render(frame, self.ascii_cols)
-                    .unwrap_or_else(|error| {
-                        if self.debug {
-                            eprintln!("[Ascii] {error}");
-                        }
-                        AsciiGrid::default()
-                    }),
-                // Mock mode has no camera pixels, so the art comes from the
-                // synthetic skeleton - the toggle still demos without a webcam.
-                None if !self.metrics.landmarks.is_empty() => self.ascii_layer.render_landmarks(
-                    &self.metrics.landmarks,
-                    detection.frame_size,
-                    self.ascii_cols,
-                ),
-                None => AsciiGrid::default(),
-            };
-            self.metrics.ascii = grid;
-
-            if !self.metrics.ascii.is_empty() {
-                let ramp = settings.ramp;
-                if self.ascii_stdout {
-                    print_ascii(&self.metrics.ascii, ramp);
-                }
-                if let Some(path) = &self.ascii_dump {
-                    if let Err(error) = std::fs::write(path, self.metrics.ascii.text(ramp)) {
-                        if self.debug {
-                            eprintln!("[Ascii] failed to write {path}: {error}");
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(geometry) = hand_geometry(&detection) {
+        if let Some(geometry) = hand_geometry(detection) {
             self.metrics.spread = geometry.spread;
             self.metrics.extension = geometry.extension;
             self.metrics.tilt_deg = geometry.tilt_deg;
@@ -728,11 +751,72 @@ impl Pipeline {
             self.metrics.tilt_deg = 0.0;
             self.metrics.palm_length = 0.0;
         }
+    }
 
-        // Gesture -> sinks. A sink that never receives anything keeps whatever it
-        // was last told, so the *absence* of a gesture has to be announced too:
-        // without the release event the synthesizer keeps oscillating forever.
-        if let Some(event) = self.strategy.process(&detection) {
+    /// The ASCII backdrop. It has its own cadence and its own toggle: the art is a
+    /// deliberately coarse view of the frame, so building it costs a resize plus one
+    /// pass per cell instead of a 1.2 MB texture upload, and it can update slower
+    /// than the skeleton without looking stale.
+    fn update_ascii(
+        &mut self,
+        frame: Option<&Mat>,
+        detection: &HandDetectionResult,
+        settings: &RuntimeConfig,
+    ) {
+        let now = Instant::now();
+        if ascii_wanted(
+            self.run.emit_frames,
+            settings.ascii,
+            &self.presentation.dump,
+            self.presentation.stdout,
+        ) && feed_due(self.presentation.next_ascii, now)
+        {
+            self.presentation.next_ascii = now + feed_interval(settings.ascii_fps);
+            let grid = match frame {
+                Some(frame) => self
+                    .presentation
+                    .ascii
+                    .render(frame, self.presentation.cols)
+                    .unwrap_or_else(|error| {
+                        if self.run.debug {
+                            eprintln!("[Ascii] {error}");
+                        }
+                        AsciiGrid::default()
+                    }),
+                // Mock mode has no camera pixels, so the art comes from the
+                // synthetic skeleton - the toggle still demos without a webcam.
+                None if !self.metrics.landmarks.is_empty() => {
+                    self.presentation.ascii.render_landmarks(
+                        &self.metrics.landmarks,
+                        detection.frame_size,
+                        self.presentation.cols,
+                    )
+                }
+                None => AsciiGrid::default(),
+            };
+            self.metrics.ascii = grid;
+
+            if !self.metrics.ascii.is_empty() {
+                let ramp = settings.ramp;
+                if self.presentation.stdout {
+                    print_ascii(&self.metrics.ascii, ramp);
+                }
+                if let Some(path) = &self.presentation.dump {
+                    if let Err(error) = std::fs::write(path, self.metrics.ascii.text(ramp)) {
+                        if self.run.debug {
+                            eprintln!("[Ascii] failed to write {path}: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gesture -> metrics -> event bus. A sink that never receives anything keeps
+    /// whatever it was last told, so the *absence* of a gesture has to be announced
+    /// too: without the release event the synthesizer keeps oscillating forever.
+    fn dispatch_gesture(&mut self, detection: &HandDetectionResult) {
+        if let Some(event) = self.strategy.process(detection) {
             match &event.payload {
                 GesturePayload::Note { note, velocity } => {
                     self.metrics.note = Some(*note);
@@ -763,16 +847,12 @@ impl Pipeline {
                 self.event_bus.dispatch(release);
             }
         }
+    }
 
-        // Inline mode: this thread still owns the receiver. Once `run` has spawned
-        // the sink thread it is gone, and that stage is the only consumer.
-        if let Some(rx) = &self.event_rx {
-            drain_events(rx, &self.sinks, self.debug);
-        }
-
-        self.publish();
-
-        if self.debug && self.metrics.frames.is_multiple_of(10) {
+    /// The line `--debug` prints every ten frames: what the player is hearing and
+    /// how long the frame took.
+    fn report_frame(&self) {
+        if self.run.debug && self.metrics.frames.is_multiple_of(10) {
             // What the player actually hears this frame: a keyboard note, a
             // theremin frequency, or nothing.
             let sounding = match (self.metrics.note, self.metrics.frequency) {
@@ -797,8 +877,6 @@ impl Pipeline {
                 self.metrics.tip_y,
             );
         }
-
-        Ok(())
     }
 
     fn push_log(&mut self, event: &GestureEvent) {
