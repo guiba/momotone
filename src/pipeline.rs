@@ -1,6 +1,6 @@
 //! The capture -> inference -> gesture -> sink loop, decoupled from the UI.
 //!
-//! `Pipeline::run` splits the frame loop into three stages on three threads:
+//! `Pipeline::run` is the frame loop, split into three stages on three threads:
 //!
 //! * **capture** reads the webcam and pushes the frame into a capacity-1 channel.
 //!   When inference is behind, the queued frame is dropped rather than making the
@@ -10,8 +10,8 @@
 //! * **sinks** drain the event bus and talk to the audio/MIDI outputs, so a
 //!   blocking MIDI write cannot stall a frame.
 //!
-//! `Pipeline::tick` is the same frame driven single-threaded, which is what the
-//! tests and any headless one-shot use.
+//! A frame is produced by `next_frame` - the webcam, or the synthetic hand in mock
+//! mode - and everything else (`advance`) is the same whichever source it came from.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,6 +71,27 @@ struct FrameOutcome {
     capture_ms: f64,
     inference_ms: f64,
     latency_ms: f64,
+}
+
+/// What the frame stage produced this iteration.
+enum FrameRead {
+    /// A frame to process.
+    Frame(FrameOutcome),
+    /// The capture stage has not handed one over yet.
+    Waiting,
+    /// The capture stage is gone: the camera closed or the run is winding down.
+    Ended,
+}
+
+/// A mock frame: synthetic landmarks, no pixels, no model.
+fn synthetic_frame(seconds: f64) -> FrameOutcome {
+    FrameOutcome {
+        detection: synthetic_detection(seconds),
+        frame: None,
+        capture_ms: 0.0,
+        inference_ms: 0.0,
+        latency_ms: 0.0,
+    }
 }
 
 #[derive(Default)]
@@ -392,7 +413,6 @@ impl Pipeline {
         };
 
         // Stage 2: this thread.
-        let mock = self.tracker.is_none();
         while running.load(Ordering::Relaxed) {
             self.apply_commands();
             if !self.is_active() {
@@ -403,39 +423,12 @@ impl Pipeline {
                 continue;
             }
 
-            if mock {
-                // Mock mode has no camera, so `tick` drives the frame itself and
-                // paces it like a 30 fps one to keep the telemetry realistic.
-                if !self.tick()? {
-                    break;
-                }
-            } else {
-                let outcome = match frame_rx.recv_timeout(Duration::from_millis(FRAME_POLL_MS)) {
-                    Ok(captured) => {
-                        let inference_start = Instant::now();
-                        let latency_ms = inference_start
-                            .duration_since(captured.captured_at)
-                            .as_secs_f64()
-                            * 1000.0;
-                        let Some(tracker) = self.tracker.as_mut() else {
-                            break;
-                        };
-                        let detection = tracker.process_frame(&captured.frame)?;
-                        FrameOutcome {
-                            detection,
-                            frame: Some(captured.frame),
-                            capture_ms: captured.capture_ms,
-                            inference_ms: inference_start.elapsed().as_secs_f64() * 1000.0,
-                            latency_ms,
-                        }
-                    }
-                    // Capture is behind; re-check the Start/Stop flag and try again.
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    // The capture stage stopped: the camera is gone.
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
-                self.advance(outcome)?;
+            match self.next_frame(&frame_rx)? {
+                FrameRead::Frame(outcome) => self.advance(outcome)?,
+                FrameRead::Waiting => continue,
+                FrameRead::Ended => break,
             }
+
             if self
                 .max_frames
                 .is_some_and(|n| self.metrics.frames >= n as u64)
@@ -524,62 +517,42 @@ impl Pipeline {
         self.publish();
     }
 
-    /// One camera frame end to end. Returns `false` when the camera is gone.
-    ///
-    /// This is the single-threaded path: it captures, infers and publishes. The
-    /// staged `run` loop does the same thing with the camera and the sinks on their
-    /// own threads.
-    pub fn tick(&mut self) -> Result<bool> {
-        if self.camera.is_none() {
-            // Mock mode has no camera, so pace it with a deadline clock rather than a
-            // flat sleep: sleeping 33 ms on macOS returns after ~41 ms, which makes
-            // every mock telemetry number 25 % wrong.
+    /// The next frame, from whichever source this run has: the webcam through the
+    /// capacity-1 channel the capture thread fills, or the synthetic hand in mock
+    /// mode (no camera, no model). Mock mode is paced by a deadline clock rather
+    /// than a flat sleep, so its telemetry is honest.
+    fn next_frame(&mut self, frames: &Receiver<CapturedFrame>) -> Result<FrameRead> {
+        let Some(tracker) = self.tracker.as_mut() else {
+            // Sleeping 33 ms on macOS returns after ~41 ms, which would make every
+            // mock number 25 % wrong; aim at the deadline instead.
             let now = Instant::now();
             if now < self.next_mock_frame {
                 std::thread::sleep(self.next_mock_frame - now);
             }
             self.next_mock_frame += MOCK_CADENCE;
-            self.advance(FrameOutcome {
-                detection: synthetic_detection(self.started.elapsed().as_secs_f64()),
-                frame: None,
-                capture_ms: 0.0,
-                inference_ms: 0.0,
-                latency_ms: 0.0,
-            })?;
-            return Ok(true);
-        }
-
-        let outcome = {
-            let Some(camera) = self.camera.as_mut() else {
-                return Ok(false);
-            };
-            let capture_start = Instant::now();
-            let frame = match camera.get_frame() {
-                Ok(frame) => frame,
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("[Pipeline] camera frame failed: {e}");
-                    }
-                    return Ok(false);
-                }
-            };
-            let capture_ms = capture_start.elapsed().as_secs_f64() * 1000.0;
-            let Some(tracker) = self.tracker.as_mut() else {
-                return Ok(false);
-            };
-            let inference_start = Instant::now();
-            let detection = tracker.process_frame(&frame)?;
-            FrameOutcome {
-                detection,
-                frame: Some(frame),
-                capture_ms,
-                inference_ms: inference_start.elapsed().as_secs_f64() * 1000.0,
-                latency_ms: 0.0,
-            }
+            return Ok(FrameRead::Frame(synthetic_frame(
+                self.started.elapsed().as_secs_f64(),
+            )));
         };
 
-        self.advance(outcome)?;
-        Ok(true)
+        match frames.recv_timeout(Duration::from_millis(FRAME_POLL_MS)) {
+            Ok(captured) => {
+                let inference_start = Instant::now();
+                let detection = tracker.process_frame(&captured.frame)?;
+                Ok(FrameRead::Frame(FrameOutcome {
+                    detection,
+                    frame: Some(captured.frame),
+                    capture_ms: captured.capture_ms,
+                    inference_ms: inference_start.elapsed().as_secs_f64() * 1000.0,
+                    latency_ms: inference_start
+                        .duration_since(captured.captured_at)
+                        .as_secs_f64()
+                        * 1000.0,
+                }))
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(FrameRead::Waiting),
+            Err(RecvTimeoutError::Disconnected) => Ok(FrameRead::Ended),
+        }
     }
 
     /// Everything that happens to a frame once the tracker has returned: the
@@ -1293,8 +1266,8 @@ mod tests {
             events,
             ..
         } = test_pipeline(Box::new(AlwaysSignal), None);
-        pipeline.tick().unwrap(); // first sighting: the gate is still confirming
-        pipeline.tick().unwrap(); // second sighting: the gesture is live
+        pipeline.advance(synthetic_frame(0.0)).unwrap(); // first sighting: the gate is still confirming
+        pipeline.advance(synthetic_frame(0.0)).unwrap(); // second sighting: the gesture is live
 
         // The OUTPUT card reads `frequency` when there is no note, so a theremin
         // run must publish the hertz and not leave a stale note behind.
@@ -1320,7 +1293,7 @@ mod tests {
             control,
             ..
         } = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
         assert_eq!(
             pipeline.metrics.layout.len(),
             15,
@@ -1331,7 +1304,7 @@ mod tests {
         let instrument = InstrumentConfig::new("chromatic", "C", 4, Waveform::Saw).unwrap();
         control.send(UiCommand::SetInstrument(instrument)).unwrap();
 
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
         assert_eq!(pipeline.metrics.layout.rows, 4);
         assert_eq!(pipeline.metrics.layout.cols, 12);
         assert_eq!(pipeline.metrics.scale, "chromatic");
@@ -1545,8 +1518,8 @@ mod tests {
             DEFAULT_COLS,
             shared.clone(),
         );
-        pipeline.tick().unwrap();
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
 
         let snapshot = shared.lock().unwrap();
         assert_eq!(snapshot.scale, "major pentatonic");
@@ -1597,8 +1570,8 @@ mod tests {
         );
         // Two frames: the detection gate needs a second sighting before the hand
         // counts, and the mock art is drawn from the landmarks.
-        pipeline.tick().unwrap();
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
 
         let snapshot = shared.lock().unwrap();
         assert_eq!((snapshot.ascii.cols, snapshot.ascii.rows), (40, 30));
@@ -1623,8 +1596,8 @@ mod tests {
 
         // With no camera the pipeline synthesises a hand, so the strategy fires once
         // the gate has confirmed the gesture.
-        pipeline.tick().unwrap();
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
 
         control.send(UiCommand::Stop).unwrap();
         pipeline.apply_commands();
@@ -1655,9 +1628,9 @@ mod tests {
             None,
         );
 
-        pipeline.tick().unwrap(); // hand present -> note
-        pipeline.tick().unwrap(); // hand gone   -> release
-        pipeline.tick().unwrap(); // still gone  -> nothing more
+        pipeline.advance(synthetic_frame(0.0)).unwrap(); // hand present -> note
+        pipeline.advance(synthetic_frame(0.0)).unwrap(); // hand gone   -> release
+        pipeline.advance(synthetic_frame(0.0)).unwrap(); // still gone  -> nothing more
 
         let sent = events.lock().unwrap();
         assert_eq!(sent.len(), 2, "exactly one note and one release");
@@ -1689,8 +1662,8 @@ mod tests {
             }),
             None,
         );
-        pipeline.tick().unwrap();
-        pipeline.tick().unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(pipeline.metrics.volume, 0.0);
         assert!(!pipeline.gesture_active);
