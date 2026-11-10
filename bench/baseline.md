@@ -128,3 +128,37 @@ release in the middle of a held gesture. Verified by the new pipeline test
 
 Still open: the audio block's own latency (cpal does not expose buffer size; read it
 from the callback block length), and capture resolution (T1.8).
+
+---
+
+# After Phase 2 (`phase2-loop-rewrite`, same machine, release build)
+
+Same commands as section 1, 300 frames, live camera, MediaPipe:
+
+```
+[Pipeline] 300 frames in 9.99 s: 29.9 fps, 33.31 ms/frame end to end (capture 35.26 ms, inference 11.54 ms, 0 frames dropped)
+[Stages] p50/p95/p99/max ms - capture 33.5/38.4/39.1/40.4  inference 11.3/14.2/15.8/17.2  camera->publish 0.0/0.0/0.0/0.0  dispatch->sink 0.0/0.0/0.0/0.0  (128 samples)
+```
+
+| Metric | Phase 0/1 | Phase 2 |
+| :-- | :-- | :-- |
+| fps | 29.4 | 29.9 |
+| ms/frame | 33.30 | 33.31 |
+| capture p50 | 33.2 | 33.5 |
+| inference p50 | 8.2 | 11.3 |
+| dropped | 0 | 0 |
+
+Mock mode (deadline clock): 300 frames in 9.87 s = **30.4 fps**, 32.90 ms/frame — the
+clock is still honest after the loop rewrite.
+
+With the dashboard open and the ASCII backdrop on (`--ascii --max-frames 250`): 29.7 fps,
+capture 33.2 ms p50, inference 11.5 ms p50, **2 frames dropped** — the only frame loss in
+the whole Phase 2 set, and it comes from the UI/ASCII work that still runs on the inference
+thread. That is exactly the cost Phase 4 moves to a presenter thread.
+
+The inference p50 difference vs section 1 (8.2 → 11.3 ms) is not the refactor: the Phase 0
+run had no hand in front of the camera, so the 224×224 landmarker almost never ran. With a
+hand in view the two-stage pipeline costs ~11 ms, and the loop is still paced by the 33 ms
+camera read. **Net effect of Phase 2 on performance: none, by design** — the win is one
+frame path (`next_frame` → `advance`) and six named stages instead of `run`/`tick` and a
+210-line `advance`.

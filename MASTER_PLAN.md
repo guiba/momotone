@@ -136,14 +136,15 @@ Tests: 112 → 124 passing, gate green (`make verify`).
 **Goal:** one loop, one config, one snapshot. This is where the 1707-line `pipeline.rs`
 becomes readable.
 
-**Done (branch `phase2-config-and-commands`, merged to master):** T2.1 and T2.2.
+**Done (branches `phase2-config-and-commands` and `phase2-loop-rewrite`): T2.1–T2.5.**
 `RuntimeConfig { active, feed, ascii, feed_fps, ascii_fps, ramp }` replaced the four
 `AtomicBool`s and the `AtomicU8` ramp the dashboard used to write directly; the UI now
 only sends `UiCommand::{Start, Stop, SetFeed, SetAscii, SetRamp, SetInstrument}` and the
 pipeline drains that channel at the top of every frame. `InstrumentConfig.version`,
 `Pipeline.applied_version`, `Ramp::index`/`from_index` and the cached
-`feed_interval`/`ascii_interval` fields are gone. `Pipeline` has 32 fields (was 38),
-127 tests pass, and the gate is green. T2.3–T2.5 are still open.
+`feed_interval`/`ascii_interval` fields are gone. `run` is the only loop, `advance` is six
+small stages, and `Pipeline` has 17 fields holding four subsystem structs instead of 27
+loose ones. 127 tests pass, the gate is green, and the measured loop is unchanged.
 
 ### T2.1 — `RuntimeConfig` replaces the atomics
 ```rust
@@ -168,44 +169,56 @@ select). **Effort S.**
 (`a_picker_change_reaches_the_sinks_while_the_loop_is_running`) still passes, now
 asserting on a received command.
 
-### T2.3 — `InputSource` enum; delete `Pipeline::tick`
-```rust
-enum InputSource {
-    Camera { cam: WebcamSource },
-    Video { decoder: ..., fps: f32 },
-    Synthetic { cadence: Duration, phase: f64 },
-}
-```
-`run` becomes: receive → `advance` → loop. Mock and video are sources, not
-special cases. `Option<HandTracker>` stays (mock genuinely has no tracker) but the
-`Option<WebcamSource>` and the mock branch in `run` disappear. Move the inline `tick`
-path into tests as a helper that constructs a synthetic source and calls `run` with
-`max_frames`. **Effort M.**
-*Verification:* all pipeline tests still pass through one code path.
+### T2.3 — one frame path; `Pipeline::tick` deleted — **done**
+`run` is now receive → `advance` → loop, and mock mode and the camera are produced by the
+same function (`next_frame`) feeding the same `advance`.
+
+*Deviation from the sketch:* there is no `InputSource` enum yet. `Option<WebcamSource>`
+is still the discriminator because a video source does not exist, and inventing an enum
+before its second member would be abstraction for its own sake. When `--video` lands, the
+enum goes into `next_frame` and nothing else changes. The inline single-threaded path the
+tests used to rely on is replaced by `advance(synthetic_frame(t))`.
+*Verification:* all pipeline tests run through one code path; measured loop unchanged.
 *Unblocks:* `--video` reproducible runs, fixture tests, the benchmark harness.
 
-### T2.4 — Split `advance()` into four named stages
-```rust
-fn advance(&mut self, frame: CapturedFrame) -> Result<()> {
-    self.sync_instrument();
-    let detection = self.infer(&frame)?;
-    self.update_tracking(&detection);
-    self.update_visuals(&frame, &detection);   // presenter thread, not here
-    self.dispatch_gesture(&detection);
-    self.publish();
-}
-```
-Each stage ~40 lines, each unit-testable in isolation. **Effort M.**
-*Verification:* CC drops from 29 to ≤ 12 per function; new tests per stage.
+### T2.4 — Split `advance()` into named stages — **done**
+Six functions of 20–60 lines each — `debounce`, `record_timing`, `update_preview`,
+`update_tracking`, `update_ascii`, `dispatch_gesture` — instead of one 210-line body,
+followed by `publish` and `report_frame`. `update_preview` and `update_ascii` are now
+separate from the tracking, which is what makes moving them to a presenter thread
+(Phase 4) a cut-and-paste job rather than a surgery. **Effort M.**
+*Verification:* the cadence tests (`the_feed_is_only_converted_when_the_stage_shows_it`,
+`the_preview_upload_is_throttled_to_its_cadence`,
+`the_ascii_layer_only_runs_when_something_wants_to_see_it`) now exercise one stage each.
 
-### T2.5 — Group `Pipeline`'s 32 fields
-`Pipeline { source, tracker, strategy, instrument, presenter, control, metrics, clocks }`.
-**Effort S.** Do it as the tail of T2.4.
+### T2.5 — Group `Pipeline`'s fields — **done**
+27 loose fields → 17, of which four are named subsystems: `RunFlags { max_frames,
+emit_frames, debug }`, `Telemetry { started, last_publish, last_detection, avg_gap_ms,
+next_mock, the capture/inference/latency rings, the dispatch ring }`, `Presentation { ascii
+layer, cols, stdout, dump, next_feed, next_ascii }` and `CaptureCounters`. **Effort S.**
+*Verification:* gate green; measured loop unchanged.
 
-**Phase 2 exit:** `run` is the only loop; `advance` is four functions; the UI talks to
-the pipeline through commands and a snapshot, not four atomics and a version number.
-Roughly 2–3 days. **Risk:** highest of the plan — land each task as a separate commit
-with the existing 112 tests as the guard.
+**Phase 2 exit:** reached. `run` is the only loop, `advance` is six functions, and the UI
+talks to the pipeline through commands and a snapshot rather than four atomics and a
+version number.
+
+### Phase 2 result — before/after (release build, 300 frames, live camera)
+
+| | before (Phase 1) | after (Phase 2) |
+| :-- | :-- | :-- |
+| fps | 29.4 | **29.9** |
+| ms/frame | 33.30 | 33.31 |
+| capture p50 / p95 | 33.2 / 37.3 | 33.5 / 38.4 |
+| inference p50 / p95 | 8.2 / 14.7 | 11.3 / 14.2 |
+| dropped frames | 0 | 0 |
+| mock fps | 30.3 | 30.4 |
+
+Inference p50 moved from 8.2 to 11.3 ms between the two runs — the same code, so this is
+machine drift (the earlier run had no hand in view, so the landmarker mostly did not run;
+the Phase 2 run had a hand and ran it). The refactor is a wash on speed, which is the
+point: the win is that the loop is one path with named stages, not a micro-optimisation.
+With the UI open (250 frames, `--ascii`): 29.7 fps, capture 33.2 p50, inference 11.5 p50,
+2 frames dropped.
 
 ---
 
