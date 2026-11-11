@@ -4,8 +4,8 @@ mod dashboard;
 mod gesture;
 mod midi;
 mod pipeline;
+mod presentation;
 mod vision;
-mod visualizer;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -23,10 +23,11 @@ use crate::gesture::theremin::ThereminStrategy;
 use crate::gesture::Strategy;
 use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
-use crate::vision::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
+use crate::presentation::annotator::Visualizer;
+use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
+use crate::presentation::presenter::DEFAULT_FEED_FPS;
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
-use crate::visualizer::Visualizer;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -119,7 +120,7 @@ struct Args {
     /// `image::Handle` to the GPU synchronously, so a 640x480 preview costs a
     /// blocking wgpu round trip per upload while the skeleton and keyboard keep
     /// updating at full frame rate. 0 sends every frame.
-    #[arg(long, default_value_t = pipeline::DEFAULT_FEED_FPS)]
+    #[arg(long, default_value_t = DEFAULT_FEED_FPS)]
     feed_fps: f32,
 
     /// Draw the camera as ASCII art behind the skeleton. The dashboard's `ascii`

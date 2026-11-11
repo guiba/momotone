@@ -11,7 +11,7 @@
 //! `main.rs`, `pipeline.rs` and `dashboard/mod.rs`.
 
 use crate::core::instrument::InstrumentConfig;
-use crate::vision::ascii::Ramp;
+use crate::presentation::ascii::Ramp;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 #[derive(Debug, Clone, PartialEq)]

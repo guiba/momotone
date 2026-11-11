@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use crate::core::grid::GridLayout;
 use crate::core::telemetry::StageProfile;
 use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
-use crate::vision::ascii::AsciiGrid;
+use crate::presentation::ascii::AsciiGrid;
 
 /// Maximum number of events kept in the on-screen log.
 pub const LOG_CAPACITY: usize = 12;

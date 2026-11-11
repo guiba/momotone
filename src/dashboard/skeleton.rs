@@ -18,7 +18,7 @@ use crate::core::grid::GridLayout;
 use crate::core::Landmark;
 use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
 use crate::dashboard::metrics::{note_for_frequency, note_frequency, note_index, note_name};
-use crate::vision::ascii::{AsciiGrid, Ramp};
+use crate::presentation::ascii::{AsciiGrid, Ramp};
 
 /// MediaPipe `HandLandmarksConnections`: (a, b, finger group) where group 0 is
 /// the palm, 1..5 are thumb..pinky. See `visualizer/mod.rs` for the same list

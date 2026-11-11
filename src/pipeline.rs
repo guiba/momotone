@@ -29,7 +29,8 @@ use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Landmark, Sink};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
 use crate::gesture::{HandEstimator, HandState, Strategy};
-use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp, DEFAULT_ASCII_FPS};
+use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
+use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
 
@@ -41,13 +42,6 @@ const MOCK_CADENCE: Duration = Duration::from_millis(33);
 const FRAME_POLL_MS: u64 = 20;
 /// How often the paused loop checks the Start/Stop flag and refreshes the UI.
 const PAUSE_POLL_MS: u64 = 50;
-/// Frames per second the dashboard is handed a new camera image. The iced
-/// renderer uploads each `image::Handle` to the GPU synchronously (a 640x480
-/// RGBA frame is under its 2 MB sync threshold), so every upload costs a
-/// blocking `wgpu` round trip inside the render loop. The keyboard and skeleton
-/// still update every frame; only the preview is throttled. `--feed-fps 0`
-/// sends every frame.
-pub const DEFAULT_FEED_FPS: f32 = 15.0;
 
 /// A frame handed from the capture stage to inference.
 struct CapturedFrame {
@@ -135,6 +129,8 @@ pub struct Pipeline {
     run: RunFlags,
     telemetry: Telemetry,
     presentation: Presentation,
+    /// Taken by `run` and handed to the presenter thread.
+    jobs_rx: Option<Receiver<PresentJob>>,
     /// Frames the capture stage read and dropped, so a bottleneck is visible
     /// instead of invisible.
     counters: Arc<CaptureCounters>,
@@ -169,23 +165,19 @@ struct Telemetry {
     dispatch: Arc<Mutex<Samples>>,
 }
 
-/// Everything that turns a frame into pixels or glyphs for a human. Kept separate
-/// from the loop so the presenter can move to its own thread without the tracker
-/// having to know about it.
+/// Presentation wiring: who the frame is handed to, and what that thread does with
+/// it. All drawing, terminal printing and file I/O happens on the presenter's own
+/// thread, so nothing the instrument does not need for sound can add latency.
 struct Presentation {
-    /// Per-cell EMA state so the art settles instead of flickering.
-    ascii: AsciiLayer,
-    /// Columns of the ASCII grid; rows follow from the frame aspect.
-    cols: usize,
-    /// Terminal mode: print the art to stdout so the renderer can be checked
-    /// without a window (`--no-ui --ascii`).
+    /// `None` once the run has ended: dropping the last sender closes the channel
+    /// and the presenter's loop exits.
+    jobs: Option<Sender<PresentJob>>,
+    /// Taken by `run` and moved onto its own thread.
+    presenter: Option<Presenter>,
+    /// Terminal mode and the dump path: either makes a frame worth sending even with
+    /// no window open.
     stdout: bool,
-    /// Optional path to write each rendered ASCII frame to.
     dump: Option<String>,
-    /// Wall clock at which the next camera frame is allowed to go to the UI. Seeded
-    /// with "now" so the very first frame is uploaded.
-    next_feed: Instant,
-    next_ascii: Instant,
 }
 
 /// Everything the loop needs to run, grouped so `Pipeline::new` is not a
@@ -248,6 +240,9 @@ impl Pipeline {
 
         // One clock reading for every deadline, so the first frame is due immediately.
         let now = Instant::now();
+        // Presentation runs on its own thread: the frame loop only ever hands it a
+        // frame, and never converts a pixel itself.
+        let (jobs_tx, jobs_rx) = crossbeam_channel::bounded(1);
         let mut pipeline = Pipeline {
             camera,
             tracker,
@@ -279,18 +274,44 @@ impl Pipeline {
                 dispatch: Arc::new(Mutex::new(Samples::default())),
             },
             presentation: Presentation {
-                ascii: AsciiLayer::new(),
-                cols: ascii_cols,
+                jobs: Some(jobs_tx),
+                presenter: Some(Presenter::new(
+                    ascii_cols,
+                    ascii_stdout,
+                    ascii_dump.clone(),
+                    debug,
+                )),
                 stdout: ascii_stdout,
                 dump: ascii_dump,
-                next_feed: now,
-                next_ascii: now,
             },
+            jobs_rx: Some(jobs_rx),
         };
         // Seed the instrument so the strategy, the sinks and the published keyboard
         // agree from the very first frame.
         pipeline.apply_instrument(&instrument);
         pipeline
+    }
+
+    /// Hand the frame to the presenter. The channel holds one frame: a presenter
+    /// still drawing the previous one drops this frame rather than drifting behind
+    /// the camera, which is exactly right for a picture nobody is measuring.
+    fn hand_over(&mut self, frame: Option<Mat>, state: &HandState, settings: &RuntimeConfig) {
+        let Some(jobs) = &self.presentation.jobs else {
+            return;
+        };
+        if !Presenter::wanted(
+            self.run.emit_frames && settings.feed,
+            settings.ascii,
+            self.presentation.stdout,
+            &self.presentation.dump,
+        ) {
+            return;
+        }
+        let _ = jobs.try_send(PresentJob {
+            frame,
+            landmarks: state.landmarks.clone(),
+            frame_size: state.frame_size,
+        });
     }
 
     /// Hand the frame snapshot to the dashboard. The pixel buffer is *moved*
@@ -299,9 +320,13 @@ impl Pipeline {
     /// wasted copy every frame.
     fn publish(&mut self) {
         if let Ok(mut shared) = self.shared.lock() {
-            let pixels = std::mem::take(&mut self.metrics.frame_pixels);
+            // The presenter thread owns the picture; refreshing the telemetry must
+            // not wipe it.
+            let pixels = std::mem::take(&mut shared.frame_pixels);
+            let grid = std::mem::take(&mut shared.ascii);
             *shared = self.metrics.clone();
             shared.frame_pixels = pixels;
+            shared.ascii = grid;
         }
     }
 
@@ -437,6 +462,18 @@ impl Pipeline {
             })
         };
 
+        // Stage 4: presentation. Converting a frame to RGBA, quantising it into the
+        // ASCII grid, printing to a terminal and writing a dump file are all things
+        // the instrument does not need in order to make sound; on their own thread
+        // they cannot show up as frame latency.
+        let presenter_handle = std::thread::spawn({
+            let shared = self.shared.clone();
+            let control = self.control.clone();
+            let jobs = self.jobs_rx.take().unwrap();
+            let presenter = self.presentation.presenter.take().unwrap();
+            move || presenter.run(shared, control, jobs)
+        });
+
         // Stage 2: this thread.
         while running.load(Ordering::Relaxed) {
             self.apply_commands();
@@ -490,10 +527,14 @@ impl Pipeline {
         // Unblock the sink thread: everything dispatched before this arrives first,
         // because the channel is FIFO.
         self.event_bus.close();
+        // Dropping the last job sender ends the presenter after it has drawn what is
+        // already queued.
+        drop(self.presentation.jobs.take());
         if let Some(handle) = capture_handle {
             let _ = handle.join();
         }
         let _ = sink_handle.join();
+        let _ = presenter_handle.join();
         Ok(())
     }
 
@@ -582,11 +623,11 @@ impl Pipeline {
         }
     }
 
-    /// A frame, stage by stage: resolve the hand, record the timings, paint the
-    /// preview, publish the tracking, draw the art, run the gesture.
+    /// A frame, stage by stage: resolve the hand, record the timings, publish the
+    /// tracking, run the gesture, hand the picture to the presenter.
     ///
     /// Each stage is a function of the frame and the pipeline's state, so the
-    /// presentation code can be exercised without a camera or an ONNX model.
+    /// gesture code can be exercised without a camera or an ONNX model.
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
         self.apply_commands();
         let settings = self.settings();
@@ -602,10 +643,10 @@ impl Pipeline {
         let state = self.estimator.update(&detection);
 
         self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
-        self.update_preview(frame.as_ref(), &settings);
         self.update_tracking(&state);
-        self.update_ascii(frame.as_ref(), &state, &settings);
         self.dispatch_gesture(&state);
+        // Last, and off this thread: nothing a human looks at can delay a frame.
+        self.hand_over(frame, &state, &settings);
 
         // Inline mode: this thread still owns the receiver. Once `run` has spawned
         // the sink thread it is gone, and that stage is the only consumer.
@@ -665,23 +706,6 @@ impl Pipeline {
         self.metrics.landmarker_us = detection.timings.landmarker_us;
     }
 
-    /// Convert a frame to RGBA for the dashboard only when the stage is showing it
-    /// and the upload cadence is due - 1.2 MB per frame otherwise.
-    fn update_preview(&mut self, frame: Option<&Mat>, settings: &RuntimeConfig) {
-        let now = Instant::now();
-        if let Some(frame) = frame {
-            if should_upload_feed(self.run.emit_frames, settings.feed)
-                && feed_due(self.presentation.next_feed, now)
-            {
-                self.presentation.next_feed = now + feed_interval(settings.feed_fps);
-                self.metrics.frame_pixels = frame_to_rgba(frame);
-            } else {
-                // Keep the shared snapshot free of pixels the UI will discard.
-                self.metrics.frame_pixels.clear();
-            }
-        }
-    }
-
     /// Where the hand is, copied out of the estimator into the snapshot the
     /// dashboard reads.
     fn update_tracking(&mut self, state: &HandState) {
@@ -714,58 +738,6 @@ impl Pipeline {
         self.metrics.extension = state.geometry.extension;
         self.metrics.tilt_deg = state.geometry.tilt_deg;
         self.metrics.palm_length = state.geometry.palm_length;
-    }
-
-    /// The ASCII backdrop. It has its own cadence and its own toggle: the art is a
-    /// deliberately coarse view of the frame, so building it costs a resize plus one
-    /// pass per cell instead of a 1.2 MB texture upload, and it can update slower
-    /// than the skeleton without looking stale.
-    fn update_ascii(&mut self, frame: Option<&Mat>, state: &HandState, settings: &RuntimeConfig) {
-        let now = Instant::now();
-        if ascii_wanted(
-            self.run.emit_frames,
-            settings.ascii,
-            &self.presentation.dump,
-            self.presentation.stdout,
-        ) && feed_due(self.presentation.next_ascii, now)
-        {
-            self.presentation.next_ascii = now + feed_interval(settings.ascii_fps);
-            let grid = match frame {
-                Some(frame) => self
-                    .presentation
-                    .ascii
-                    .render(frame, self.presentation.cols)
-                    .unwrap_or_else(|error| {
-                        if self.run.debug {
-                            eprintln!("[Ascii] {error}");
-                        }
-                        AsciiGrid::default()
-                    }),
-                // Mock mode has no camera pixels, so the art comes from the
-                // synthetic skeleton - the toggle still demos without a webcam.
-                None if !state.landmarks.is_empty() => self.presentation.ascii.render_landmarks(
-                    &state.landmarks,
-                    state.frame_size,
-                    self.presentation.cols,
-                ),
-                None => AsciiGrid::default(),
-            };
-            self.metrics.ascii = grid;
-
-            if !self.metrics.ascii.is_empty() {
-                let ramp = settings.ramp;
-                if self.presentation.stdout {
-                    print_ascii(&self.metrics.ascii, ramp);
-                }
-                if let Some(path) = &self.presentation.dump {
-                    if let Err(error) = std::fs::write(path, self.metrics.ascii.text(ramp)) {
-                        if self.run.debug {
-                            eprintln!("[Ascii] failed to write {path}: {error}");
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Gesture -> metrics -> event bus.
@@ -926,61 +898,9 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList, debug: bool) {
     }
 }
 
-/// The stage only needs camera pixels while the feed toggle is on; headless runs
-/// never need them.
-fn should_upload_feed(emit_frames: bool, want: bool) -> bool {
-    emit_frames && want
-}
-
-/// The ASCII grid is only worth building if something will look at it: the stage
-/// toggle, a terminal run, or a dump file. A dump or terminal run works even
-/// with `--no-ui`, where there is no stage to toggle.
-fn ascii_wanted(emit_frames: bool, want: bool, dump: &Option<String>, stdout: bool) -> bool {
-    stdout || dump.is_some() || should_upload_feed(emit_frames, want)
-}
-
-/// Home the cursor rather than clearing the screen, so consecutive frames
-/// overwrite in place and the art animates instead of scrolling.
-fn print_ascii(grid: &AsciiGrid, ramp: Ramp) {
-    print!("\x1B[H{}", grid.text(ramp));
-}
-
-/// `fps <= 0` means "every frame". The interval is clamped to a minute so an
-/// absurd rate cannot overflow `Instant + Duration`.
-fn feed_interval(fps: f32) -> Duration {
-    if fps > 0.0 {
-        Duration::from_secs_f64((1.0 / fps as f64).min(60.0))
-    } else {
-        Duration::ZERO
-    }
-}
-
-/// Is a camera frame due? `next` is the wall clock at which the upload is
-/// allowed; an interval of zero makes every frame due.
-fn feed_due(next: Instant, now: Instant) -> bool {
-    now >= next
-}
-
-/// BGR OpenCV frame -> RGBA bytes for the iced `image` handle.
-fn frame_to_rgba(frame: &Mat) -> Vec<u8> {
-    let count = (frame.cols() as usize) * (frame.rows() as usize) * (frame.channels() as usize);
-    // Safe: `frame` is a freshly captured, contiguous Mat, so its buffer holds
-    // exactly `count` bytes starting at `data()`.
-    let src = unsafe { std::slice::from_raw_parts(frame.data(), count) };
-    bgr_to_rgba(src)
-}
-
-fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(src.len() / 3 * 4);
-    for pixel in src.as_chunks::<3>().0 {
-        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
-    }
-    rgba
-}
-
 /// A synthetic, moving hand so the dashboard can be exercised without a
 /// webcam or the ONNX models (`--mode mock`).
-fn synthetic_detection(seconds: f64) -> HandDetectionResult {
+pub(crate) fn synthetic_detection(seconds: f64) -> HandDetectionResult {
     let t = seconds as f32;
     // The centre sweeps almost the full 640 px view so the mock hand walks the
     // whole keyboard, low notes on the left and high notes on the right.
@@ -1065,7 +985,7 @@ mod tests {
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
     use crate::gesture::keyboard::FingerPositionStrategy;
-    use crate::vision::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
+    use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
 
     #[test]
     fn synthetic_hand_has_21_landmarks() {
@@ -1082,15 +1002,6 @@ mod tests {
         assert!(geometry.palm_length > 0.0);
         assert!(geometry.spread > 0.0);
         assert!(geometry.extension[1] > geometry.extension[0]);
-    }
-
-    #[test]
-    fn bgr_pixels_become_rgba() {
-        // Two BGR pixels.
-        assert_eq!(
-            bgr_to_rgba(&[1, 2, 3, 4, 5, 6]),
-            vec![3, 2, 1, 255, 6, 5, 4, 255]
-        );
     }
 
     /// A sink that records every event it is handed, so the tests can inspect
@@ -1228,28 +1139,6 @@ mod tests {
             control: control_tx,
             waveforms,
         }
-    }
-
-    #[test]
-    #[ignore]
-    /// Quantifies what the feed gate and the cadence save. Run with
-    /// `cargo test --release -- --include-ignored bench_feed_upload --nocapture`.
-    fn bench_feed_upload() {
-        let frame = opencv::core::Mat::new_rows_cols_with_default(
-            480,
-            640,
-            opencv::core::CV_8UC3,
-            opencv::core::Scalar::new(128.0, 128.0, 128.0, 0.0),
-        )
-        .unwrap();
-        let start = Instant::now();
-        for _ in 0..200 {
-            let pixels = frame_to_rgba(&frame);
-            assert_eq!(pixels.len(), 640 * 480 * 4);
-        }
-        let converted = start.elapsed().as_secs_f64() * 1000.0 / 200.0;
-
-        println!("frame_to_rgba 640x480: {:.3} ms/frame", converted);
     }
 
     #[test]
@@ -1393,139 +1282,62 @@ mod tests {
     }
 
     #[test]
-    fn the_feed_is_only_converted_when_the_stage_shows_it() {
-        assert!(!should_upload_feed(true, false), "feed off means no upload");
-        assert!(should_upload_feed(true, true));
-        assert!(!should_upload_feed(false, true), "headless never uploads");
+    fn the_picture_is_handed_over_only_when_someone_is_watching() {
+        let TestHarness {
+            mut pipeline,
+            control,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+            true,
+            DEFAULT_COLS,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        let jobs = pipeline.jobs_rx.take().unwrap();
+
+        // Nothing is on, so the frame is dropped rather than copied to a thread that
+        // has nowhere to draw it.
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        assert!(jobs.try_recv().is_err(), "no audience, no job");
+
+        // The dashboard turns the feed on; now the frame goes over.
+        control.send(UiCommand::SetFeed(true)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        let job = jobs.try_recv().unwrap();
+        assert!(job.frame.is_none(), "a mock frame carries no pixels");
+        assert_eq!(job.landmarks.len(), 21, "but it does carry the hand");
+        assert_eq!(job.frame_size, (640, 480));
     }
 
     #[test]
-    fn the_preview_upload_is_throttled_to_its_cadence() {
-        let deadline = Instant::now();
-        let later = deadline + Duration::from_millis(66);
-        assert!(
-            feed_due(deadline, deadline),
-            "a frame at the deadline is due"
-        );
-        assert!(feed_due(deadline, later), "an overdue deadline is due");
-        assert!(
-            !feed_due(later, deadline),
-            "nothing is due before its deadline"
-        );
-        assert_eq!(
-            feed_interval(0.0),
-            Duration::ZERO,
-            "a zero rate means every frame"
-        );
-        assert_eq!(
-            feed_interval(-1.0),
-            Duration::ZERO,
-            "so does a nonsense rate"
-        );
-    }
-
-    #[test]
-    fn pixels_are_moved_into_the_snapshot_and_dropped_between_uploads() {
-        let frame = opencv::core::Mat::new_rows_cols_with_default(
-            480,
-            640,
-            opencv::core::CV_8UC3,
-            opencv::core::Scalar::new(10.0, 20.0, 30.0, 0.0),
-        )
-        .unwrap();
-        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+    fn publishing_keeps_whatever_the_presenter_drew() {
+        // The presenter writes the picture into the snapshot on its own thread; a
+        // telemetry refresh from the frame thread must not wipe it.
+        let shared = Arc::new(Mutex::new(FrameMetrics {
+            frame_pixels: vec![7u8; 8],
+            ascii: crate::presentation::ascii::AsciiGrid {
+                cols: 4,
+                rows: 2,
+                cells: vec![3u8; 8],
+            },
+            ..FrameMetrics::default()
+        }));
         let TestHarness { mut pipeline, .. } = test_pipeline_with(
             Box::new(AlwaysOn),
             None,
-            RuntimeConfig {
-                active: true,
-                feed: true,
-                // The art has its own cadence: the frame is rendered twice, but only
-                // the first is inside the interval.
-                ascii: true,
-                feed_fps: 1.0,
-                ascii_fps: 1.0,
-                ramp: Ramp::Blocks,
-            },
-            true,
-            32,
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+            false,
+            DEFAULT_COLS,
             shared.clone(),
         );
-
-        let outcome = || {
-            let mut detection = synthetic_detection(0.0);
-            detection.frame_size = (640, 480);
-            FrameOutcome {
-                detection,
-                frame: Some(frame.clone()),
-                capture_ms: 1.0,
-                inference_ms: 1.0,
-                latency_ms: 1.0,
-            }
-        };
-
-        pipeline.advance(outcome()).unwrap();
-        {
-            let snapshot = shared.lock().unwrap();
-            assert_eq!(
-                snapshot.frame_pixels.len(),
-                640 * 480 * 4,
-                "the first frame is uploaded"
-            );
-            assert_eq!(
-                &snapshot.frame_pixels[..4],
-                &[30, 20, 10, 255],
-                "BGR became RGBA"
-            );
-            // 640x480 at 32 columns is 24 rows, and the frame is one flat grey,
-            // so every cell has to land in the same bucket.
-            assert_eq!((snapshot.ascii.cols, snapshot.ascii.rows), (32, 24));
-            assert!(
-                snapshot
-                    .ascii
-                    .cells
-                    .iter()
-                    .all(|&level| level == snapshot.ascii.cells[0]),
-                "a flat frame must produce a flat grid"
-            );
-        }
-        // The buffer was moved into the snapshot rather than cloned, so the
-        // pipeline is left holding nothing instead of a second 1.2 MB copy.
-        assert!(
-            pipeline.metrics.frame_pixels.is_empty(),
-            "publishing must not keep a second copy of the frame"
-        );
-
-        // A second frame inside the interval must not rebuild the art: the grid
-        // is still the render from the first frame, even though this one is white.
-        let bright = opencv::core::Mat::new_rows_cols_with_default(
-            480,
-            640,
-            opencv::core::CV_8UC3,
-            opencv::core::Scalar::all(255.0),
-        )
-        .unwrap();
-        let mut detection = synthetic_detection(0.0);
-        detection.frame_size = (640, 480);
-        pipeline
-            .advance(FrameOutcome {
-                detection,
-                frame: Some(bright),
-                capture_ms: 1.0,
-                inference_ms: 1.0,
-                latency_ms: 1.0,
-            })
-            .unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
 
         let snapshot = shared.lock().unwrap();
-        assert!(
-            snapshot.frame_pixels.is_empty(),
-            "a frame inside the feed interval carries no pixels"
-        );
-        assert!(
-            snapshot.ascii.cells.iter().all(|&level| level == 0),
-            "the ASCII grid keeps the previous render until its own cadence is due"
-        );
+        assert_eq!(snapshot.frames, 1, "the telemetry moved");
+        assert_eq!(snapshot.frame_pixels, vec![7u8; 8], "the picture survived");
+        assert_eq!(snapshot.ascii.cols, 4, "and so did the art");
     }
 
     #[test]
@@ -1545,7 +1357,7 @@ mod tests {
         let TestHarness { mut pipeline, .. } = test_pipeline_with(
             Box::new(AlwaysOn),
             None,
-            RuntimeConfig::new(0.0, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
             false,
             DEFAULT_COLS,
             shared.clone(),
@@ -1559,62 +1371,6 @@ mod tests {
         assert_eq!(snapshot.layout.len(), 15);
         assert_eq!(snapshot.mode, "Signal");
         assert!(snapshot.detected, "the mock hand should register");
-    }
-
-    #[test]
-    fn the_ascii_layer_only_runs_when_something_wants_to_see_it() {
-        assert!(
-            !ascii_wanted(true, false, &None, false),
-            "a cleared toggle and no sink means no work"
-        );
-        assert!(
-            ascii_wanted(true, true, &None, false),
-            "the stage is drawing it"
-        );
-        assert!(
-            ascii_wanted(false, false, &Some("art.txt".to_string()), false),
-            "a dump file is a reason to build the grid even headless"
-        );
-        assert!(ascii_wanted(false, false, &None, true), "stdout counts too");
-    }
-
-    #[test]
-    fn mock_mode_draws_ascii_from_the_synthetic_hand() {
-        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
-        let TestHarness { mut pipeline, .. } = test_pipeline_with(
-            Box::new(FingerPositionStrategy::new(
-                0,
-                &crate::core::scale::preset("major pentatonic").unwrap(),
-                3,
-            )),
-            None,
-            RuntimeConfig {
-                active: true,
-                feed: false,
-                ascii: true,
-                feed_fps: 0.0,
-                ascii_fps: 0.0,
-                ramp: Ramp::Blocks,
-            },
-            true,
-            40,
-            shared.clone(),
-        );
-        // Two frames: the detection gate needs a second sighting before the hand
-        // counts, and the mock art is drawn from the landmarks.
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
-
-        let snapshot = shared.lock().unwrap();
-        assert_eq!((snapshot.ascii.cols, snapshot.ascii.rows), (40, 30));
-        assert!(
-            snapshot.ascii.cells.iter().any(|&level| level > 0),
-            "the mock hand lights up cells"
-        );
-        assert!(
-            snapshot.ascii.cells.contains(&0),
-            "the empty background stays empty"
-        );
     }
 
     #[test]

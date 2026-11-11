@@ -12,18 +12,18 @@ Companion documents: `ARCHITECTURE.md` (diagnosis), `ROADMAP.md` (older feature 
 
 The rearchitecture is finished when all of these are true and measurable:
 
-| Target | Current | Done when |
-| :-- | :-- | :-- |
-| One frame path | `run` + `tick` + mock branch | one loop; `InputSource::Camera \| Video \| Synthetic` |
-| One source of truth for "what is sounding" | 4 places | an `InstrumentState` owned by the simulation layer; sinks translate it |
-| `unsafe impl` count | 2 | 0 |
-| File I/O / GPU upload on the inference thread | yes (`--ascii-dump`, RGBA conversion) | none; presenter thread owns it |
-| Locks in the audio callback | 1 per block | 0 (atomics / double buffer) |
-| Longest function | `Pipeline::advance`, 212 lines, CC 29 | no function > ~60 lines, CC ≤ 12 |
-| `pipeline.rs` | 1707 lines | < 700 lines |
-| Untested presentation code | ~1.65k lines | stage view testable from a snapshot |
-| CI | none | fmt + clippy `-D warnings` + check + test green |
-| Latency | unmeasured; ~60–90 ms worst case | measured, documented, ≤ 50 ms target |
+| Target | Started at | Done when | Where we are |
+| :-- | :-- | :-- | :-- |
+| One frame path | `run` + `tick` + mock branch | one loop; `InputSource::Camera \| Video \| Synthetic` | ☑ one loop (`next_frame` → `advance`); ☐ no `InputSource` enum yet (nothing needs it until `--video` exists) |
+| One source of truth for "what is sounding" | 4 places | an `InstrumentState` owned by the simulation layer; sinks translate it | ☑ `HandState` owns the hand, `Performance` owns what is sounding, `Voice` owns what is audible |
+| `unsafe impl` count | 2 | 0 | ◑ 1 left: `StreamWrapper` (`cpal::Stream` is `!Send`), documented |
+| File I/O / GPU upload on the inference thread | yes (`--ascii-dump`, RGBA conversion) | none; presenter thread owns it | ☑ moved to the presenter thread (Phase 4, T4.2) |
+| Locks in the audio callback | 1 per block | 0 (atomics / double buffer) | ☑ 0: the callback reads four atomics, the voice is owned by the closure |
+| Longest function | `Pipeline::advance`, 212 lines, CC 29 | no function > ~60 lines, CC ≤ 12 | ☑ `advance` is 27 lines calling six named stages |
+| `pipeline.rs` | 1707 lines | < 700 lines | ◑ 1668 lines; presentation (T4.3) is the next cut |
+| Untested presentation code | ~1.65k lines | stage view testable from a snapshot | ◑ the presenter is now pure-function testable; the iced stage is not |
+| CI | none | fmt + clippy `-D warnings` + check + test green | ☑ `make verify`, green |
+| Latency | unmeasured; ~60–90 ms worst case | measured, documented, ≤ 50 ms target | ☑ measured, in `bench/baseline.md`; the loop is paced by the 33 ms camera read |
 
 ---
 

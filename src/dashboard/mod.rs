@@ -35,7 +35,7 @@ use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
 use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
-use crate::vision::ascii::Ramp;
+use crate::presentation::ascii::Ramp;
 
 /// Number of samples kept for the rolling sparklines (~4 s at 30 fps).
 const HISTORY: usize = 120;
