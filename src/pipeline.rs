@@ -21,15 +21,14 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use opencv::prelude::*;
 
-use crate::core::detection_gate::DetectionGate;
 use crate::core::event_bus::{BusMessage, EventBus};
-use crate::core::geometry::hand_geometry;
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
 use crate::core::types::{GestureEvent, GesturePayload};
-use crate::core::{HandDetectionResult, Landmark, Sink, Strategy};
+use crate::core::{HandDetectionResult, Landmark, Sink};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
+use crate::gesture::{HandEstimator, HandState, Strategy};
 use crate::vision::ascii::{AsciiGrid, AsciiLayer, Ramp, DEFAULT_ASCII_FPS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
@@ -40,10 +39,6 @@ use crate::vision::tracker::HandTracker;
 const MOCK_CADENCE: Duration = Duration::from_millis(33);
 /// How long inference waits for the capture stage before re-checking the flags.
 const FRAME_POLL_MS: u64 = 20;
-/// Frames of confirmed detection before a gesture may start, and frames of no
-/// detection tolerated before the hand is declared lost.
-const DETECT_CONFIRM_FRAMES: u32 = 2;
-const DETECT_GRACE_FRAMES: u32 = 3;
 /// How often the paused loop checks the Start/Stop flag and refreshes the UI.
 const PAUSE_POLL_MS: u64 = 50;
 /// Frames per second the dashboard is handed a new camera image. The iced
@@ -127,10 +122,9 @@ pub struct Pipeline {
     control_rx: Option<Receiver<UiCommand>>,
 
     // --- what the hand is doing ---------------------------------------------
-    /// Debounces the detection gate so a flickering anchor score does not click the
-    /// note on and off.
-    gate: DetectionGate,
-    previous_landmarks: Vec<Landmark>,
+    /// The single source of truth about the hand: hysteresis, the grace window, the
+    /// smoothed fingertip, the loudness and the geometry all live here.
+    estimator: HandEstimator,
     /// True while a gesture is actively driving the sinks. Used to send exactly
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
@@ -265,8 +259,7 @@ impl Pipeline {
             control,
             control_rx: Some(control_rx),
             metrics: context,
-            gate: DetectionGate::new(DETECT_CONFIRM_FRAMES, DETECT_GRACE_FRAMES),
-            previous_landmarks: Vec::new(),
+            estimator: HandEstimator::new(),
             gesture_active: false,
             counters: Arc::new(CaptureCounters::default()),
             run: RunFlags {
@@ -589,8 +582,8 @@ impl Pipeline {
         }
     }
 
-    /// A frame, stage by stage: gate the detection, record the timings, paint the
-    /// preview, track the hand, draw the art, run the gesture, publish.
+    /// A frame, stage by stage: resolve the hand, record the timings, paint the
+    /// preview, publish the tracking, draw the art, run the gesture.
     ///
     /// Each stage is a function of the frame and the pipeline's state, so the
     /// presentation code can be exercised without a camera or an ONNX model.
@@ -598,19 +591,21 @@ impl Pipeline {
         self.apply_commands();
         let settings = self.settings();
         let FrameOutcome {
-            mut detection,
+            detection,
             frame,
             capture_ms,
             inference_ms,
             latency_ms,
         } = outcome;
 
-        self.debounce(&mut detection);
+        // One resolution of the raw detection, shared by every stage below.
+        let state = self.estimator.update(&detection);
+
         self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
         self.update_preview(frame.as_ref(), &settings);
-        self.update_tracking(&detection);
-        self.update_ascii(frame.as_ref(), &detection, &settings);
-        self.dispatch_gesture(&detection);
+        self.update_tracking(&state);
+        self.update_ascii(frame.as_ref(), &state, &settings);
+        self.dispatch_gesture(&state);
 
         // Inline mode: this thread still owns the receiver. Once `run` has spawned
         // the sink thread it is gone, and that stage is the only consumer.
@@ -620,25 +615,6 @@ impl Pipeline {
         self.publish();
         self.report_frame();
         Ok(())
-    }
-
-    /// Debounce the detector. The anchor score flickers around the threshold, so a
-    /// raw compare makes the note click on and off while the hand sits still: a
-    /// gesture needs a couple of confirmed sightings to start, and a couple of
-    /// missed frames do not end it.
-    fn debounce(&mut self, detection: &mut HandDetectionResult) {
-        let present = self.gate.observe(detection.hand_landmarks.is_some());
-        if !present {
-            detection.hand_landmarks = None;
-            detection.r#box = None;
-            detection.score = 0.0;
-        } else if detection.hand_landmarks.is_none() {
-            // Inside the grace window: keep the last known keypoints instead of
-            // releasing, so a one-frame dropout is inaudible.
-            detection.hand_landmarks = Some(self.previous_landmarks.clone());
-            detection.r#box = self.metrics.hand_box;
-            detection.score = self.metrics.confidence;
-        }
     }
 
     /// Frame counter, publish-cadence fps and the rolling percentiles of each stage.
@@ -706,24 +682,19 @@ impl Pipeline {
         }
     }
 
-    /// Where the hand is: keypoints, box, confidence, jitter, how long it has been
-    /// lost and the derived geometry the strategies and the dashboard read.
-    fn update_tracking(&mut self, detection: &HandDetectionResult) {
-        // Tracking state. `clone_from` keeps the Vec's capacity, so the landmark
-        // list stops reallocating every frame.
-        self.metrics.detected = detection.r#box.is_some();
-        self.metrics.confidence = detection.score;
-        self.metrics.hand_box = detection.r#box;
-        match &detection.hand_landmarks {
-            Some(landmarks) => self.metrics.landmarks.clone_from(landmarks),
-            None => self.metrics.landmarks.clear(),
-        }
-        self.metrics.landmark_count = self.metrics.landmarks.len();
-        // The note anchor: landmark 8 is the index fingertip.
-        if let Some(tip) = self.metrics.landmarks.get(8) {
-            self.metrics.tip_x = tip.x;
-            self.metrics.tip_y = tip.y;
-        }
+    /// Where the hand is, copied out of the estimator into the snapshot the
+    /// dashboard reads.
+    fn update_tracking(&mut self, state: &HandState) {
+        self.metrics.detected = state.present;
+        self.metrics.confidence = state.confidence;
+        self.metrics.hand_box = state.hand_box;
+        // `clone_from` keeps the Vec's capacity, so the landmark list stops
+        // reallocating every frame.
+        self.metrics.landmarks.clone_from(&state.landmarks);
+        self.metrics.landmark_count = state.landmarks.len();
+        // The note anchor: the smoothed index fingertip the pitch is read from.
+        self.metrics.tip_x = state.tip.0;
+        self.metrics.tip_y = state.tip.1;
         // Which cell the sounding note belongs to, for the crosshair and the
         // cell highlight. Notes are unique in the grid, so this is exact.
         if let Some(note) = self.metrics.note {
@@ -733,36 +704,23 @@ impl Pipeline {
             }
         }
 
-        if self.metrics.detected {
+        if state.present {
             self.telemetry.last_detection = Instant::now();
         }
         self.metrics.lost_ms = self.telemetry.last_detection.elapsed().as_millis() as u64;
-        self.metrics.jitter_px = landmark_jitter(&self.previous_landmarks, &self.metrics.landmarks);
-        self.previous_landmarks.clone_from(&self.metrics.landmarks);
+        self.metrics.jitter_px = state.jitter_px;
 
-        if let Some(geometry) = hand_geometry(detection) {
-            self.metrics.spread = geometry.spread;
-            self.metrics.extension = geometry.extension;
-            self.metrics.tilt_deg = geometry.tilt_deg;
-            self.metrics.palm_length = geometry.palm_length;
-        } else {
-            self.metrics.spread = 0.0;
-            self.metrics.extension = [0.0; 5];
-            self.metrics.tilt_deg = 0.0;
-            self.metrics.palm_length = 0.0;
-        }
+        self.metrics.spread = state.geometry.spread;
+        self.metrics.extension = state.geometry.extension;
+        self.metrics.tilt_deg = state.geometry.tilt_deg;
+        self.metrics.palm_length = state.geometry.palm_length;
     }
 
     /// The ASCII backdrop. It has its own cadence and its own toggle: the art is a
     /// deliberately coarse view of the frame, so building it costs a resize plus one
     /// pass per cell instead of a 1.2 MB texture upload, and it can update slower
     /// than the skeleton without looking stale.
-    fn update_ascii(
-        &mut self,
-        frame: Option<&Mat>,
-        detection: &HandDetectionResult,
-        settings: &RuntimeConfig,
-    ) {
+    fn update_ascii(&mut self, frame: Option<&Mat>, state: &HandState, settings: &RuntimeConfig) {
         let now = Instant::now();
         if ascii_wanted(
             self.run.emit_frames,
@@ -785,13 +743,11 @@ impl Pipeline {
                     }),
                 // Mock mode has no camera pixels, so the art comes from the
                 // synthetic skeleton - the toggle still demos without a webcam.
-                None if !self.metrics.landmarks.is_empty() => {
-                    self.presentation.ascii.render_landmarks(
-                        &self.metrics.landmarks,
-                        detection.frame_size,
-                        self.presentation.cols,
-                    )
-                }
+                None if !state.landmarks.is_empty() => self.presentation.ascii.render_landmarks(
+                    &state.landmarks,
+                    state.frame_size,
+                    self.presentation.cols,
+                ),
                 None => AsciiGrid::default(),
             };
             self.metrics.ascii = grid;
@@ -815,8 +771,8 @@ impl Pipeline {
     /// Gesture -> metrics -> event bus. A sink that never receives anything keeps
     /// whatever it was last told, so the *absence* of a gesture has to be announced
     /// too: without the release event the synthesizer keeps oscillating forever.
-    fn dispatch_gesture(&mut self, detection: &HandDetectionResult) {
-        if let Some(event) = self.strategy.process(detection) {
+    fn dispatch_gesture(&mut self, state: &HandState) {
+        if let Some(event) = self.strategy.process(state) {
             match &event.payload {
                 GesturePayload::Note { note, velocity } => {
                     self.metrics.note = Some(*note);
@@ -1010,18 +966,6 @@ fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
     rgba
 }
 
-fn landmark_jitter(previous: &[Landmark], current: &[Landmark]) -> f32 {
-    if previous.len() != current.len() || current.is_empty() {
-        return 0.0;
-    }
-    let total: f32 = previous
-        .iter()
-        .zip(current)
-        .map(|(a, b)| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt())
-        .sum();
-    total / current.len() as f32
-}
-
 /// A synthetic, moving hand so the dashboard can be exercised without a
 /// webcam or the ONNX models (`--mode mock`).
 fn synthetic_detection(seconds: f64) -> HandDetectionResult {
@@ -1104,10 +1048,11 @@ fn finger_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::geometry::hand_geometry;
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
-    use crate::strategies::FingerPositionStrategy;
+    use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::vision::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
 
     #[test]
@@ -1120,17 +1065,11 @@ mod tests {
 
     #[test]
     fn synthetic_hand_geometry_is_sane() {
-        let detection = synthetic_detection(2.0);
-        let geometry = hand_geometry(&detection).unwrap();
+        let landmarks = synthetic_detection(2.0).hand_landmarks.unwrap();
+        let geometry = hand_geometry(&landmarks).unwrap();
         assert!(geometry.palm_length > 0.0);
         assert!(geometry.spread > 0.0);
         assert!(geometry.extension[1] > geometry.extension[0]);
-    }
-
-    #[test]
-    fn jitter_is_zero_for_identical_landmarks() {
-        let landmarks = synthetic_detection(0.0).hand_landmarks.unwrap();
-        assert!((landmark_jitter(&landmarks, &landmarks) - 0.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1175,11 +1114,10 @@ mod tests {
     struct AlwaysOn;
 
     impl Strategy for AlwaysOn {
-        fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
-            detection
-                .hand_landmarks
-                .as_ref()
-                .map(|_| GestureEvent::new_note(60, 0.8, "Finger Position"))
+        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+            state
+                .present
+                .then(|| GestureEvent::new_note(60, 0.8, "Finger Position"))
         }
     }
 
@@ -1188,11 +1126,10 @@ mod tests {
     struct AlwaysSignal;
 
     impl Strategy for AlwaysSignal {
-        fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
-            detection
-                .hand_landmarks
-                .as_ref()
-                .map(|_| GestureEvent::new_signal(220.0, 0.5, "Theremin"))
+        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+            state
+                .present
+                .then(|| GestureEvent::new_signal(220.0, 0.5, "Theremin"))
         }
     }
 
@@ -1202,8 +1139,8 @@ mod tests {
     }
 
     impl Strategy for FirstFrameOnly {
-        fn process(&self, detection: &HandDetectionResult) -> Option<GestureEvent> {
-            if detection.hand_landmarks.is_none() || !self.armed.load(Ordering::Relaxed) {
+        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+            if !state.present || !self.armed.load(Ordering::Relaxed) {
                 return None;
             }
             self.armed.store(false, Ordering::Relaxed);

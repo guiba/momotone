@@ -1,9 +1,9 @@
 mod audio;
 mod core;
 mod dashboard;
+mod gesture;
 mod midi;
 mod pipeline;
-mod strategies;
 mod vision;
 mod visualizer;
 
@@ -17,12 +17,12 @@ use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::runtime::{control_channel, RuntimeConfig};
 use crate::core::Sink;
-use crate::core::Strategy;
 use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
+use crate::gesture::keyboard::FingerPositionStrategy;
+use crate::gesture::theremin::ThereminStrategy;
+use crate::gesture::Strategy;
 use crate::midi::MidiOutputEngine;
 use crate::pipeline::Pipeline;
-use crate::strategies::theremin::ThereminStrategy;
-use crate::strategies::FingerPositionStrategy;
 use crate::vision::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
@@ -193,9 +193,9 @@ struct Args {
     gesture: Gesture,
 
     /// Frequency band the theremin sweeps when `--gesture theremin`.
-    #[arg(long, default_value_t = strategies::theremin::DEFAULT_LOW_HZ)]
+    #[arg(long, default_value_t = gesture::theremin::DEFAULT_LOW_HZ)]
     theremin_low_hz: f32,
-    #[arg(long, default_value_t = strategies::theremin::DEFAULT_HIGH_HZ)]
+    #[arg(long, default_value_t = gesture::theremin::DEFAULT_HIGH_HZ)]
     theremin_high_hz: f32,
 
     /// Run the pipeline without opening the iced dashboard.

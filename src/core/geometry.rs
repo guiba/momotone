@@ -5,7 +5,6 @@
 //! resolutions and distances. The dashboard reads these values; strategies can
 //! reuse them instead of recomputing.
 
-use crate::core::HandDetectionResult;
 use crate::core::Landmark;
 
 pub const FINGER_NAMES: [&str; 5] = ["Thumb", "Index", "Middle", "Ring", "Pinky"];
@@ -36,8 +35,7 @@ fn distance(a: &Landmark, b: &Landmark) -> f32 {
 }
 
 /// Returns `None` when the landmark set is too small to be a hand.
-pub fn hand_geometry(detection: &HandDetectionResult) -> Option<HandGeometry> {
-    let landmarks = detection.hand_landmarks.as_ref()?;
+pub fn hand_geometry(landmarks: &[Landmark]) -> Option<HandGeometry> {
     if landmarks.len() < 21 {
         return None;
     }
@@ -68,7 +66,7 @@ mod tests {
 
     /// 21 landmarks of a straight, upright hand: wrist at (100, 300), five
     /// fingers 120 px tall, thumb sticking out by `thumb_x`.
-    fn upright_hand(thumb_x: f32) -> HandDetectionResult {
+    fn upright_hand(thumb_x: f32) -> Vec<Landmark> {
         let mut landmarks = vec![
             Landmark {
                 x: 100.0,
@@ -106,13 +104,7 @@ mod tests {
                 });
             }
         }
-        HandDetectionResult {
-            hand_landmarks: Some(landmarks),
-            r#box: Some((60.0, 100.0, 200.0, 250.0)),
-            frame_size: (640, 480),
-            score: 0.9,
-            timings: Default::default(),
-        }
+        landmarks
     }
 
     #[test]
@@ -138,7 +130,6 @@ mod tests {
 
     #[test]
     fn no_geometry_without_landmarks() {
-        let empty = HandDetectionResult::default();
-        assert!(hand_geometry(&empty).is_none());
+        assert!(hand_geometry(&[]).is_none());
     }
 }
