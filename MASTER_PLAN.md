@@ -123,9 +123,9 @@ architectural risk.
 | 1.8 | skipped — needs a live comparison to eyeball | — |
 | 1.9 | Bench scaffolding in `tracker.rs` reduced from four ~20-line copies to `time_stage`/`time_legacy` | `cargo test --release -- --include-ignored bench_sampling` still runs |
 
-Deferred to Phase 3 by design: the audio callback still takes a `Mutex` (held only at
-the ~30 Hz event rate, and it allocates nothing), and note attack/release envelopes
-belong to the voice layer.
+Deferred to Phase 3 by design: the audio callback still took a `Mutex`, and note
+attack/release envelopes belonged to the voice layer. Both were cleared in Phase 3 —
+see §6.
 
 Tests: 112 → 124 passing, gate green (`make verify`).
 
@@ -222,78 +222,72 @@ With the UI open (250 frames, `--ascii`): 29.7 fps, capture 33.2 p50, inference 
 
 ---
 
-## 6. Phase 3 — The missing instrument layer
+## 6. Phase 3 — The missing instrument layer *(done, branch `phase3-instrument`)*
 
 **Goal:** one object that knows what is sounding, one estimator that knows where the
 hand is.
 
-### T3.1 — Canonical `HandState`
-Add `perception/estimator.rs`: takes raw landmark detections, applies hysteresis +
-smoothing, outputs
-```rust
-struct HandState { landmarks: [Landmark; 21], palm: (f32,f32), bbox: Rect,
-                   spread: f32, extension: [f32;5], tilt: f32, confidence: f32,
-                   present: bool }
-```
-Delete `strategies::spread_volume` (duplicates `geometry::spread` with a different
-normalisation) and fold `TipSmoother` into the estimator. Document the smoothing
-constant in one place instead of three. **Effort M.**
-*Verification:* one test suite for the estimator (jitter suppression vs sweep
-following — the existing test `the_smoothing_kills_jitter_but_follows_a_sweep` moves
-there).
+### Phase 3 result
 
-### T3.2 — `Strategy::process(&mut self, &HandState)`
-Change `Strategy` to `process(&mut self, state: &HandState) -> Option<Performance>`.
-Delete the `Mutex` in `TipSmoother`. Re-evaluate whether `Sink: Sync` is needed at all
-(Phase 1 already relaxed it). **Effort S.**
+| Task | Outcome | Verified |
+| :-- | :-- | :-- |
+| **T3.1** `HandState` | `src/gesture/estimator.rs`: `HandEstimator::update(&HandDetectionResult) -> HandState { present, landmarks, hand_box, frame_size, confidence, tip, volume, geometry, jitter_px }`. It owns the hysteresis gate, the fingertip EMA, the geometry and the jitter measurement; the strategies read it and mutate nothing. `strategies/` → `gesture/`. | estimator test suite: jitter suppression vs sweep following, gate confirm/grace behaviour |
+| **T3.2** `Strategy::process(&mut self, &HandState)` | Done. `TipSmoother` and its `Mutex` are gone from both strategies; `hand_geometry` now takes `&[Landmark]` instead of the whole `HandDetectionResult` (the tracker's box no longer travels through the gesture layer). | keyboard/theremin tests pass unchanged in meaning |
+| **T3.3** Voice/envelope | Partly, and deliberately. The voice is one monophonic `Voice` in `audio/synthesizer.rs` with a one-pole envelope: attack 12 ms, release 60 ms, pitch glide 15 ms. A released voice fades to `SILENT` and the callback then skips the oscillator. **Deviation:** no `instrument/voice.rs`. A `Voice` is an audio-rendering object; MIDI's "voice" is a note gate with a completely different lifecycle, so sharing the struct would couple two sinks that have nothing in common. The shared abstraction that *does* exist is `Performance`, which both sinks consume. | `the_envelope_ramps_up_and_down_instead_of_stepping`, `a_frequency_change_glides_instead_of_jumping` |
+| **T3.4** A real `Release` | `enum Performance { Note { note, velocity }, Signal { frequency, amplitude }, Release }`. `GestureEvent` and `GesturePayload` are deleted; `note == 0` and the "dummy payload" comment are gone. `NoteGate::attack` no longer special-cases note 0 — `Performance::Release` calls `gate.release()` directly. | MIDI test `the_release_event_ends_the_note_exactly_once` |
+| **T3.5** Presentation out of the event type | Done. `Performance` carries no `text`/`color`; `EventLogEntry` is `{ uptime_ms, detail }` and the log line is derived from the performance. The backdrop colour is derived from the pitch class in the presenter. | — |
 
-### T3.3 — Voice/envelope module
-`instrument/voice.rs`: `Voice { freq_target, freq_current, amp, env: Adsr, timbre }`
-with `attack()`, `release()`, `set_target()`. Both sinks consume it: audio renders it,
-MIDI maps it onto note-on/off + CC. `NoteGate` (already excellent) moves into
-`output/midi_sink.rs` unchanged. **Effort M.**
+The same commit made the audio callback lock-free (the Phase 1 deferral): the control
+side writes four atomics (`Target { sounding, frequency, amplitude, waveform }`) and the
+callback owns the voice outright. No `Mutex`, no allocation, no syscall inside the block.
 
-### T3.4 — A real `Release`, not `note: 0`
-Replace the `GestureEvent::no_gesture()` dummy payload with
-`enum Performance { NoteOn { note, vel }, NoteOff, SetVolume(f32), Signal { freq, amp } }`
-or keep the two-variant payload but add an explicit `Release` variant. The `note == 0`
-magic value and the "dummy payload" comment disappear. **Effort S.**
-
-### T3.5 — Presentation out of the event type
-`GestureEvent.text` and `.color` are UI fields riding through every sink. Move them to
-the snapshot; derive colour from the pitch class in the presenter. **Effort S.**
-
-**Phase 3 exit:** adding a new output (OSC) or a new gesture touches exactly one file.
-Roughly 2 days.
+**Phase 3 exit:** adding a gesture is one file in `src/gesture/`; adding an output is one
+`Sink` impl in `src/output/` plus one line in `main.rs`. `Sink::handle_event` became
+`Sink::handle(&Performance)`. Tests 127 → 131.
 
 ---
 
-## 7. Phase 4 — Presentation decoupling
+## 7. Phase 4 — Presentation decoupling *(in progress: T4.1, T4.2 done)*
 
 **Goal:** drawing is a pure function of a snapshot; nothing that touches the GPU or the
 disk runs on the inference thread.
 
-1. **T4.1 — `presentation/` module.** Move `vision/ascii.rs` → `presentation/ascii.rs`;
-   move `visualizer/mod.rs` into it (or delete it once the dashboard can dump a frame).
-   **Effort S.**
-2. **T4.2 — Presenter thread.** A `Presenter` receives `(frame_pixels, ascii_grid)` at
-   its own cadence on its own thread. `--ascii-dump`, stdout printing and RGBA
-   conversion all move there. Delete six throttle fields from `Pipeline`. **Effort M.**
-3. **T4.3 — `StageView` snapshot.** The UI receives
-   `StageView { hand: HandStateView, instrument: InstrumentView, perf: PerfView, trail: [f32;49] }`
-   instead of the 39-field `FrameMetrics`. Split `FrameMetrics` into
-   `Tracking` / `Performance` / `Perf` / `Context` sub-structs first, then compose.
-   **Effort M.**
-4. **T4.4 — Move `note_trail` into the published snapshot** (ROADMAP finding 10): the
-   pipeline owns the decay, the UI only draws it. **Effort S.**
-5. **T4.5 — Headless stage tests.** `Skeleton::draw` and `keyboard()` become pure
-   functions returning primitives; snapshot-test the primitive lists (cell count for a
-   given layout, letterbox mapping, trail brightness). This is the cheapest way to
-   cover 1.65k currently untested lines. **Effort M.**
-6. **T4.6 — Cache the static backdrop.** The 49 base cells + separators + octave labels
-   only change when the panel size or layout changes. **Effort S.**
+1. **T4.1 — `presentation/` module — done.** `vision/ascii.rs` → `presentation/ascii.rs`,
+   `visualizer/mod.rs` → `presentation/annotator.rs` (the `--image` skeleton dump).
+   `presentation/` is now `ascii`, `presenter`, `annotator`.
+2. **T4.2 — Presenter thread — done.** `Presenter` owns the ASCII layer, the two cadence
+   deadlines, the stdout mode and the dump path, and runs on its own thread draining a
+   capacity-1 `PresentJob` channel. `Pipeline::advance` now calls one function,
+   `hand_over`, which moves the frame (no copy) into that channel and does no drawing.
+   `update_preview` and `update_ascii` are deleted from the pipeline; so are
+   `frame_to_rgba`, `bgr_to_rgba`, `print_ascii`, `feed_interval`, `feed_due`,
+   `should_upload_feed` and `ascii_wanted` — five of `Presentation`'s six fields went with
+   the presenter, and the two that remain (`stdout`, `dump`) only decide whether a frame
+   is worth handing over at all.
+   `publish` moves the presenter's pixels and grid out of the shared snapshot, replaces the
+   rest, and moves them back, so the two threads never overwrite each other.
+   **Deviation:** the job is `(Option<Mat>, Vec<Landmark>, frame_size)` rather than
+   `(frame_pixels, ascii_grid)` — the presenter does the conversion itself, which keeps the
+   frame thread from touching the RGBA buffer at all.
+3. **T4.3 — `StageView` snapshot — not started.** `FrameMetrics` still has ~35 fields.
+   The natural next cut is `presentation: PresentationSnapshot` (pixels + grid) split out
+   from tracking/performance/context.
+4. **T4.4 — `note_trail` into the snapshot — not started.** The UI still decays the trail
+   on its own tick (`dashboard/mod.rs:141-169`), so the keyboard's state is UI-owned.
+5. **T4.5 — Headless stage tests — partially done.** The presenter is now tested headlessly
+   (cadence, flat-frame grid, mock-mode art, snapshot preservation). `Skeleton::draw` /
+   `keyboard()` still need to become pure functions returning primitives.
+6. **T4.6 — Cache the static backdrop — not started.**
 
-**Phase 4 exit:** no I/O or GPU work on the frame thread; the UI is testable. ~2 days.
+**Measurements after T4.2 (release build, 300 frames):** mock 30.2 fps / 32.91 ms per
+frame, 0 dropped; live camera `--no-ui` 29.9 fps, capture p50 33.4 ms, inference p50 10.2
+ms, 0 dropped; live with `--ascii` (headless) 29.4 fps, capture p50 33.3 ms, inference p50
+11.7 ms, **0 dropped** — Phase 2's UI+ASCII run dropped 2 frames. Tests 131 → 135.
+
+**Phase 4 exit (remaining):** no I/O or GPU work on the frame thread (reached for ASCII
+and the dump; the `image::Handle` upload is still iced's job on the UI thread), and the
+stage is testable from a snapshot.
+
 
 ---
 
@@ -331,16 +325,16 @@ Only after phases 2–4. Each is now a single-file change instead of a five-file
 ```
 Phase 0 (baseline, CI, latency)
    │
-   ├─► Phase 1 (hot-path fixes: 1.1→1.9, independent of each other)
+   ├─► Phase 1 (hot-path fixes: 1.1→1.9, independent of each other)   ☑
    │        │
    │        ▼
-   ├─► Phase 2 (2.1 → 2.2 → 2.3 → 2.4 → 2.5)   ← strict order
+   ├─► Phase 2 (2.1 → 2.2 → 2.3 → 2.4 → 2.5)   ← strict order          ☑
    │        │
    │        ▼
-   ├─► Phase 3 (3.1 → 3.2 → 3.3 → 3.4, 3.5 anytime after 2.4)
+   ├─► Phase 3 (3.1 → 3.2 → 3.3 → 3.4, 3.5 anytime after 2.4)          ☑
    │        │
    │        ▼
-   ├─► Phase 4 (4.1, 4.2 need 2.3/2.4; 4.3 needs 4.2; 4.5 needs 4.3)
+   ├─► Phase 4 (4.1, 4.2 need 2.3/2.4; 4.3 needs 4.2; 4.5 needs 4.3)   ◑ 4.1, 4.2 ☑
    │        │
    │        ▼
    └─► Phase 5, then Phase 6
@@ -385,11 +379,29 @@ everything later is judged against them.
 | :-- | :-- | :-- | :-- |
 | 0 Baseline & CI | T0.1–T0.4 | 1 d | ☑ done |
 | 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☑ done (T1.8 skipped) |
-| 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ◑ T2.1, T2.2 done |
-| 3 Instrument layer | T3.1–T3.5 | 2 d | ☐ |
-| 4 Presentation | T4.1–T4.6 | 2 d | ☐ |
+| 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☑ done |
+| 3 Instrument layer | T3.1–T3.5 | 2 d | ☑ done (T3.3 kept the voice in `audio/` on purpose) |
+| 4 Presentation | T4.1–T4.6 | 2 d | ◑ T4.1, T4.2 done; T4.3–T4.6 open |
 | 5 Observability & test infra | T5.1–T5.6 | 3 d | ☐ |
 | 6 Unlocked features | — | ongoing | ☐ |
 
-Fill in per task: branch name, before/after frame time, before/after test count, and
-whether the `Definition of done` table row is satisfied.
+Branch `phase3-instrument` carries Phase 3 and the first two Phase 4 tasks. Current gate:
+`make verify` green, **135 tests passing**, 4 ignored benches, clippy clean.
+
+### Where to pick up
+
+1. **T4.3** — split `FrameMetrics` (35 fields) into `Tracking` / `Performance` /
+   `Perf` / `Context`, then a `StageView` the UI composes. This is the last thing standing
+   between the app and the target layout in `ARCHITECTURE.md`.
+2. **T4.4** — move `note_trail` out of `Dashboard` into the pipeline's published snapshot.
+   It is small, and it makes the keyboard render a pure function of a snapshot — which is
+   what T4.5 needs.
+3. **T4.5** — turn `keyboard()` / `skeleton()` in `dashboard/skeleton.rs` into functions
+   returning primitives and snapshot-test them. ~1.5k lines of UI code are currently
+   exercised only by hand.
+4. Then Phase 5: `tracing`, `--video` fixture source, tracker fixture test, golden trace.
+
+Current shape: `src/` is 9,850 lines of Rust across 24 files. `pipeline.rs` is 1,668 of
+them and owns capture, tracking, gesture dispatch, sinks and telemetry; the presenter is
+443 lines and owns everything a human sees; the estimator is 304. The iced layer
+(`dashboard/`) is 1,843 lines and is still the least-tested part of the app.
