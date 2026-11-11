@@ -7,7 +7,7 @@
 //! synthesizer can oscillate at an arbitrary frequency, while the MIDI sink has
 //! nothing to do with it (MIDI cannot express a continuous pitch).
 
-use crate::core::types::GestureEvent;
+use crate::core::types::Performance;
 use crate::gesture::band_position;
 use crate::gesture::estimator::HandState;
 use crate::gesture::Strategy;
@@ -50,7 +50,7 @@ impl Default for ThereminStrategy {
 }
 
 impl Strategy for ThereminStrategy {
-    fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+    fn process(&mut self, state: &HandState) -> Option<Performance> {
         if !state.present {
             return None;
         }
@@ -60,18 +60,16 @@ impl Strategy for ThereminStrategy {
         // too would make every gesture two axes the player has to learn.
         let (x_position, _) = band_position(state.tip.0, state.tip.1, state.frame_size);
 
-        Some(GestureEvent::new_signal(
-            self.frequency(x_position),
-            state.volume,
-            "Theremin",
-        ))
+        Some(Performance::Signal {
+            frequency: self.frequency(x_position),
+            amplitude: state.volume,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::GesturePayload;
     use crate::core::Landmark;
     use crate::gesture::spread_volume;
 
@@ -104,12 +102,12 @@ mod tests {
     }
 
     fn signal(strategy: &mut ThereminStrategy, tip_x: f32, volume: f32) -> (f32, f32) {
-        match strategy.process(&state(tip_x, volume)).unwrap().payload {
-            GesturePayload::Signal {
+        match strategy.process(&state(tip_x, volume)).unwrap() {
+            Performance::Signal {
                 frequency,
                 amplitude,
             } => (frequency, amplitude),
-            _ => panic!("expected a signal payload"),
+            _ => panic!("expected a signal performance"),
         }
     }
 

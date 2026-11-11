@@ -734,15 +734,10 @@ fn log_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
         .rev()
         .take(6)
         .map(|entry| {
-            text(format!(
-                "{}s  {}  {}",
-                entry.uptime_ms / 1000,
-                entry.text,
-                entry.detail
-            ))
-            .size(11)
-            .color(MUTED)
-            .into()
+            text(format!("{}s  {}", entry.uptime_ms / 1000, entry.detail))
+                .size(11)
+                .color(MUTED)
+                .into()
         })
         .collect();
 

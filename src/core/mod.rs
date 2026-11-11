@@ -9,7 +9,7 @@ pub mod telemetry;
 pub mod types;
 
 use crate::core::instrument::Waveform;
-use crate::core::types::GestureEvent;
+use crate::core::types::Performance;
 use anyhow::Result;
 
 // Traits defining the interface for all components.
@@ -59,7 +59,8 @@ pub struct HandDetectionResult {
 pub trait Sink: Send {
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
-    fn handle_event(&mut self, event: &GestureEvent) -> Result<()>;
+    /// Apply one frame's worth of performance to the output.
+    fn handle(&mut self, performance: &Performance) -> Result<()>;
     /// Timbral change, where the sink has something to change. Sinks that cannot
     /// express it (MIDI, which hands the timbre to the receiving device) ignore
     /// it, so a default no-op keeps every sink trivially conformant.

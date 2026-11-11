@@ -1,22 +1,84 @@
+//! The audio output: one monophonic voice, driven by the event bus.
+//!
+//! The split is deliberate, and it is the one real-time audio apps get right:
+//!
+//! * the **control side** (`apply`) only writes targets into a handful of atomics;
+//! * the **callback** reads those atomics and does every float operation.
+//!
+//! Nothing inside the callback locks, allocates, or touches the filesystem, so a
+//! 30 Hz stream of gesture events can never delay an audio block. The voice state
+//! (phase, the glided pitch, the envelope) lives in the callback, where it can be
+//! mutated without any synchronisation at all - the control side never needs it.
+
 use crate::core::instrument::Waveform;
-use crate::core::types::{GestureEvent, GesturePayload};
+use crate::core::types::Performance;
 use crate::core::Sink;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 
-/// Time constant of the frequency and amplitude glide, in seconds. The strategy
-/// retargets the voice every frame (33 ms); without a ramp the oscillator jumps
-/// straight to the new pitch and a keyboard sweep clicks.
+/// Time constant of the amplitude ramp upwards. A note never starts on a step;
+/// the 12 ms attack is what stops a keyboard sweep from clicking.
+const ATTACK_SECONDS: f32 = 0.012;
+/// Time constant of the amplitude ramp downwards. Longer than the attack, because
+/// a note that cuts off instantly sounds like a gate closing, and the ear reads
+/// that as a click.
+const RELEASE_SECONDS: f32 = 0.06;
+/// Time constant of the pitch glide. The strategy retargets the voice every frame
+/// (33 ms), so without a ramp a keyboard sweep jumps between notes in one sample.
 const GLIDE_SECONDS: f32 = 0.015;
+/// Below this the voice is inaudible, and the callback skips the oscillator.
+const SILENT: f32 = 1e-4;
 /// Harmonics kept for the discontinuous waveforms. A step function contains every
 /// harmonic; a 44.1 kHz sample can only play up to 22.05 kHz, so anything above
 /// that would alias into the audible band.
 const MAX_HARMONICS: usize = 24;
 
-/// A single oscillator. The waveform is the timbre: sine is the pure theremin,
-/// the others add harmonics and read more like a real instrument.
-#[derive(Clone)]
+/// What the control side wants the voice to be doing.
+///
+/// Four atomics instead of a mutex: one writer (the sink thread) and one reader
+/// (the audio callback). A read is not atomic as a whole, so a block can catch a
+/// half-updated target - pitch and loudness a frame apart. That is inaudible and
+/// it is the standard trade-off for this pattern; a lock in the audio callback
+/// would be worse.
+#[derive(Debug, Default)]
+struct Target {
+    sounding: AtomicBool,
+    /// f32 stored as its bit pattern.
+    frequency: AtomicU32,
+    amplitude: AtomicU32,
+    waveform: AtomicU8,
+}
+
+impl Target {
+    fn set(&self, frequency: f32, amplitude: f32, waveform: Waveform) {
+        self.frequency.store(frequency.to_bits(), Ordering::Relaxed);
+        self.amplitude.store(amplitude.to_bits(), Ordering::Relaxed);
+        self.waveform.store(waveform.index(), Ordering::Relaxed);
+        self.sounding.store(true, Ordering::Relaxed);
+    }
+
+    fn stop(&self) {
+        self.sounding.store(false, Ordering::Relaxed);
+    }
+
+    fn is_sounding(&self) -> bool {
+        self.sounding.load(Ordering::Relaxed)
+    }
+
+    fn read(&self) -> (f32, f32, Waveform) {
+        (
+            f32::from_bits(self.frequency.load(Ordering::Relaxed)),
+            f32::from_bits(self.amplitude.load(Ordering::Relaxed)),
+            Waveform::from_index(self.waveform.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// A single oscillator with an attack/release envelope. The waveform is the
+/// timbre: sine is the pure theremin, the others add harmonics and read more like
+/// a real instrument.
 struct Voice {
     /// The pitch the hand is asking for.
     target_frequency: f32,
@@ -30,28 +92,44 @@ struct Voice {
 }
 
 impl Voice {
-    fn new(frequency: f32, amplitude: f32, waveform: Waveform) -> Self {
+    fn idle() -> Self {
         Self {
-            target_frequency: frequency,
-            frequency,
-            target_amplitude: amplitude,
-            amplitude,
+            target_frequency: 0.0,
+            frequency: 0.0,
+            target_amplitude: 0.0,
+            amplitude: 0.0,
             phase: 0.0,
-            waveform,
+            waveform: Waveform::Sine,
         }
     }
 
-    fn set_target(&mut self, frequency: f32, amplitude: f32) {
+    fn set_target(&mut self, frequency: f32, amplitude: f32, waveform: Waveform) {
         self.target_frequency = frequency;
         self.target_amplitude = amplitude;
+        self.waveform = waveform;
+    }
+
+    fn release(&mut self) {
+        self.target_amplitude = 0.0;
+    }
+
+    fn is_silent(&self) -> bool {
+        self.target_amplitude <= SILENT && self.amplitude <= SILENT
     }
 
     fn next_sample(&mut self, sample_rate: f32) -> f32 {
-        // One-pole glide: never overshoots, costs one multiply per sample, and
-        // keeps the phase continuous when the hand moves to another key.
-        let glide = 1.0 / (sample_rate * GLIDE_SECONDS);
-        self.frequency += (self.target_frequency - self.frequency) * glide;
-        self.amplitude += (self.target_amplitude - self.amplitude) * glide;
+        // One-pole ramps: never overshoot, one multiply per sample, and the phase
+        // stays continuous when the hand moves to another key. The envelope
+        // attacks faster than it releases, which is how a struck note sounds.
+        let envelope = if self.target_amplitude > self.amplitude {
+            ATTACK_SECONDS
+        } else {
+            RELEASE_SECONDS
+        };
+        self.frequency +=
+            (self.target_frequency - self.frequency) * (1.0 / (sample_rate * GLIDE_SECONDS));
+        self.amplitude +=
+            (self.target_amplitude - self.amplitude) * (1.0 / (sample_rate * envelope));
 
         let value = self
             .waveform
@@ -84,25 +162,21 @@ fn soft_clip(value: f32) -> f32 {
     value.signum() * (0.9 + 0.1 * ((magnitude - 0.9) / 0.1).tanh())
 }
 
-/// Shared state between the control thread and the audio callback.
-struct SynthesizerState {
-    voices: Vec<Voice>,
-    /// Timbre applied to the next voice that starts.
-    waveform: Waveform,
+/// MIDI number -> hertz. A4 = 69 is 440 Hz by convention.
+fn note_frequency(note: u8) -> f32 {
+    440.0 * 2.0f32.powf((note as i32 - 69) as f32 / 12.0)
 }
 
-/// Wrapper to allow cpal::Stream (which is !Send) to be used inside a Send struct.
-/// This is safe because the stream is only ever touched from the thread that owns
-/// the sink: `handle_event` writes the shared state, the stream itself is never
-/// read - holding it is the point, dropping it stops the audio.
+/// `cpal::Stream` is `!Send`. Holding it is the point - dropping it stops the
+/// audio - and the stream is only ever touched by the thread that owns this sink.
 struct StreamWrapper(#[allow(dead_code)] cpal::Stream);
 
 unsafe impl Send for StreamWrapper {}
 
 pub struct Synthesizer {
-    /// Master gain applied to every event amplitude (`--amplitude`).
+    /// Master gain applied to every performance amplitude (`--amplitude`).
     gain: f32,
-    state: Arc<Mutex<SynthesizerState>>,
+    target: Arc<Target>,
     stream: Option<StreamWrapper>,
 }
 
@@ -112,51 +186,35 @@ impl Synthesizer {
     pub fn new(gain: f32) -> Self {
         Self {
             gain: gain.clamp(0.0, 1.0),
-            state: Arc::new(Mutex::new(SynthesizerState {
-                voices: Vec::new(),
-                waveform: Waveform::Sine,
-            })),
+            target: Arc::new(Target::default()),
             stream: None,
         }
     }
 
-    pub fn update_from_event(&self, event: &GestureEvent) -> Result<()> {
-        let mut state = self.state.lock().map_err(|_| anyhow!("Mutex lock error"))?;
-        match &event.payload {
-            GesturePayload::Signal {
+    /// Apply one frame's performance. This only ever sets targets - it never
+    /// touches the stream, so it is safe to call at the frame rate.
+    pub fn apply(&self, performance: &Performance) -> Result<()> {
+        let waveform = Waveform::from_index(self.target.waveform.load(Ordering::Relaxed));
+        match performance {
+            Performance::Signal {
                 frequency,
                 amplitude,
-            } => {
-                let amplitude = (amplitude * self.gain).clamp(0.0, 1.0);
-                let waveform = state.waveform;
-                if state.voices.is_empty() {
-                    state
-                        .voices
-                        .push(Voice::new(*frequency, amplitude, waveform));
-                } else {
-                    for voice in state.voices.iter_mut() {
-                        voice.set_target(*frequency, amplitude);
-                    }
-                }
-            }
-            GesturePayload::Note { note, velocity } => {
-                // note 0 is the pipeline's "no gesture" release: it must silence
-                // the oscillator, otherwise the last note latches and keeps
-                // sounding after the hand leaves the frame.
-                if *note == 0 || *velocity <= 0.0 {
-                    state.voices.clear();
+            } => self.target.set(
+                *frequency,
+                (amplitude * self.gain).clamp(0.0, 1.0),
+                waveform,
+            ),
+            Performance::Note { note, velocity } => {
+                if *velocity <= 0.0 {
+                    // A pinched hand is silent: release instead of attacking a
+                    // note nobody is asking for.
+                    self.target.stop();
                 } else {
                     let amplitude = (velocity * self.gain).clamp(0.0, 1.0);
-                    let freq = 440.0 * 2.0f32.powf((*note as i32 - 69) as f32 / 12.0);
-                    let waveform = state.waveform;
-                    if state.voices.is_empty() {
-                        state.voices.push(Voice::new(freq, amplitude, waveform));
-                    } else {
-                        // A held note keeps its envelope; only the loudness moves.
-                        state.voices[0].set_target(freq, amplitude);
-                    }
+                    self.target.set(note_frequency(*note), amplitude, waveform);
                 }
             }
+            Performance::Release => self.target.stop(),
         }
         Ok(())
     }
@@ -174,26 +232,34 @@ impl Sink for Synthesizer {
             config.sample_rate, config.channels
         );
 
-        let state_ref = self.state.clone();
+        let target = self.target.clone();
         let sample_rate = config.sample_rate as f32;
         let channels = config.channels as usize;
 
+        // The voice belongs to the callback: nothing else can reach it, so it
+        // needs no lock and no allocation per block.
+        let mut voice = Voice::idle();
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if let Ok(mut state) = state_ref.lock() {
-                    // Voices are averaged rather than summed, so N voices can never
-                    // exceed the amplitude the gain asked for.
-                    let scale = 1.0 / state.voices.len().max(1) as f32;
-                    for frame in data.chunks_mut(channels) {
-                        let mut mixed = 0.0;
-                        for voice in state.voices.iter_mut() {
-                            mixed += voice.next_sample(sample_rate);
-                        }
-                        let mixed = soft_clip(mixed * scale);
-                        for sample in frame.iter_mut() {
-                            *sample = mixed;
-                        }
+                if target.is_sounding() {
+                    let (frequency, amplitude, waveform) = target.read();
+                    voice.set_target(frequency, amplitude, waveform);
+                } else {
+                    voice.release();
+                }
+
+                if voice.is_silent() {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
+                    return;
+                }
+
+                for frame in data.chunks_mut(channels) {
+                    let value = voice.next_sample(sample_rate);
+                    for sample in frame.iter_mut() {
+                        *sample = value;
                     }
                 }
             },
@@ -211,19 +277,17 @@ impl Sink for Synthesizer {
         Ok(())
     }
 
-    fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
-        self.update_from_event(event)
+    fn handle(&mut self, performance: &Performance) -> Result<()> {
+        self.apply(performance)
     }
 
-    /// Change the timbre. Applied to every voice already sounding as well, so a
-    /// picker click is audible on the note being held, not only on the next one.
+    /// Change the timbre. The callback reads the timbre from the target on every
+    /// block, so a picker click is audible on the note being held, not only on the
+    /// next one.
     fn set_waveform(&mut self, waveform: Waveform) {
-        if let Ok(mut state) = self.state.lock() {
-            state.waveform = waveform;
-            for voice in state.voices.iter_mut() {
-                voice.waveform = waveform;
-            }
-        }
+        self.target
+            .waveform
+            .store(waveform.index(), Ordering::Relaxed);
     }
 }
 
@@ -232,102 +296,142 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_note_starts_a_voice_and_the_release_kills_it() {
+    fn a_note_sets_the_target_and_a_release_silences_it() {
         let synth = Synthesizer::new(1.0);
 
         synth
-            .update_from_event(&GestureEvent::new_note(60, 0.8, "Finger Position"))
+            .apply(&Performance::Note {
+                note: 60,
+                velocity: 0.8,
+            })
             .unwrap();
-        assert_eq!(synth.state.lock().unwrap().voices.len(), 1);
+        let (frequency, amplitude, waveform) = synth.target.read();
+        assert!(
+            (frequency - 261.6).abs() < 0.1,
+            "MIDI 60 is middle C, got {frequency}"
+        );
+        assert!((amplitude - 0.8).abs() < 1e-6);
+        assert_eq!(waveform, Waveform::Sine);
 
         // The pipeline sends this the frame after the hand leaves: without it the
         // oscillator would latch and keep sounding forever.
-        synth
-            .update_from_event(&GestureEvent::no_gesture())
-            .unwrap();
-        assert!(synth.state.lock().unwrap().voices.is_empty());
+        synth.apply(&Performance::Release).unwrap();
+        assert!(!synth.target.is_sounding());
     }
 
     #[test]
-    fn a_signal_glides_one_voice_instead_of_restarting_it() {
+    fn a_continuous_signal_retargets_the_same_voice() {
         let synth = Synthesizer::new(1.0);
         synth
-            .update_from_event(&GestureEvent::new_signal(220.0, 0.5, "Theremin"))
+            .apply(&Performance::Signal {
+                frequency: 220.0,
+                amplitude: 0.5,
+            })
             .unwrap();
         synth
-            .update_from_event(&GestureEvent::new_signal(440.0, 0.8, "Theremin"))
+            .apply(&Performance::Signal {
+                frequency: 440.0,
+                amplitude: 0.8,
+            })
             .unwrap();
 
-        let state = synth.state.lock().unwrap();
-        assert_eq!(state.voices.len(), 1, "a continuous signal rides one voice");
-        assert!((state.voices[0].target_frequency - 440.0).abs() < 1e-6);
-        assert!((state.voices[0].target_amplitude - 0.8).abs() < 1e-6);
+        let (frequency, amplitude, _) = synth.target.read();
+        assert!((frequency - 440.0).abs() < 1e-6);
+        assert!((amplitude - 0.8).abs() < 1e-6);
     }
 
     #[test]
     fn zero_velocity_is_silent() {
         let synth = Synthesizer::new(1.0);
         synth
-            .update_from_event(&GestureEvent::new_note(60, 0.0, "pinched"))
+            .apply(&Performance::Note {
+                note: 60,
+                velocity: 0.0,
+            })
             .unwrap();
-        assert!(synth.state.lock().unwrap().voices.is_empty());
+        assert!(!synth.target.is_sounding());
     }
 
     #[test]
     fn gain_scales_the_amplitude() {
         let synth = Synthesizer::new(0.25);
         synth
-            .update_from_event(&GestureEvent::new_note(60, 1.0, "Finger Position"))
+            .apply(&Performance::Note {
+                note: 60,
+                velocity: 1.0,
+            })
             .unwrap();
-        let voice = &synth.state.lock().unwrap().voices[0];
-        assert!((voice.amplitude - 0.25).abs() < 1e-6);
-        assert!((voice.frequency - 261.6).abs() < 0.1);
+        let (_, amplitude, _) = synth.target.read();
+        assert!((amplitude - 0.25).abs() < 1e-6);
     }
 
     #[test]
-    fn a_waveform_change_reaches_the_voice_already_sounding() {
+    fn a_waveform_change_reaches_the_note_being_held() {
         let mut synth = Synthesizer::new(1.0);
         synth
-            .update_from_event(&GestureEvent::new_note(60, 0.5, "Finger Position"))
+            .apply(&Performance::Note {
+                note: 60,
+                velocity: 0.5,
+            })
             .unwrap();
-        assert_eq!(
-            synth.state.lock().unwrap().voices[0].waveform,
-            Waveform::Sine
-        );
+        assert_eq!(synth.target.read().2, Waveform::Sine);
 
         synth.set_waveform(Waveform::Saw);
-        {
-            let state = synth.state.lock().unwrap();
-            assert_eq!(state.waveform, Waveform::Saw);
-            assert_eq!(state.voices[0].waveform, Waveform::Saw);
-        }
+        assert_eq!(synth.target.read().2, Waveform::Saw);
+    }
 
-        // A voice started after the change inherits it.
-        synth
-            .update_from_event(&GestureEvent::no_gesture())
-            .unwrap();
-        synth
-            .update_from_event(&GestureEvent::new_note(69, 1.0, "Finger Position"))
-            .unwrap();
-        assert_eq!(
-            synth.state.lock().unwrap().voices[0].waveform,
-            Waveform::Saw
+    #[test]
+    fn the_envelope_ramps_up_and_down_instead_of_stepping() {
+        let mut voice = Voice::idle();
+        voice.set_target(440.0, 1.0, Waveform::Sine);
+
+        // After one attack time constant the amplitude is near 63 % of the
+        // target: it started from zero, so it has not reached it yet.
+        for _ in 0..(44100.0 * ATTACK_SECONDS) as usize {
+            voice.next_sample(44100.0);
+        }
+        assert!(
+            voice.amplitude > 0.5,
+            "attack only reached {}",
+            voice.amplitude
         );
+        assert!(voice.amplitude < 1.0, "the attack is a ramp, not a step");
+
+        voice.release();
+        for _ in 0..(44100.0 * RELEASE_SECONDS) as usize {
+            voice.next_sample(44100.0);
+        }
+        assert!(
+            voice.amplitude < 0.4,
+            "release only reached {}",
+            voice.amplitude
+        );
+
+        // A released voice fades to nothing, and then the callback skips it.
+        for _ in 0..(44100.0 * RELEASE_SECONDS * 10.0) as usize {
+            voice.next_sample(44100.0);
+        }
+        assert!(voice.is_silent(), "the voice went silent");
     }
 
     #[test]
     fn a_frequency_change_glides_instead_of_jumping() {
-        let mut voice = Voice::new(261.6, 1.0, Waveform::Sine);
-        voice.set_target(1046.5, 1.0);
+        let mut voice = Voice::idle();
+        voice.set_target(261.6, 1.0, Waveform::Sine);
+        // Five time constants: long enough for the voice to settle on the note it
+        // is already playing, which is the state a key change starts from.
+        for _ in 0..(44100.0 * GLIDE_SECONDS * 5.0) as usize {
+            voice.next_sample(44100.0);
+        }
+        let held = voice.frequency;
+        voice.set_target(1046.5, 1.0, Waveform::Sine);
+
         // One sample at 44.1 kHz is a 1/44100 s step against a 15 ms time
         // constant, so the pitch has barely moved - it certainly has not arrived.
         voice.next_sample(44100.0);
+        assert!(voice.frequency > held, "the pitch moves towards the target");
         assert!(
-            voice.frequency > 261.6,
-            "the pitch moves towards the target"
-        );
-        assert!(
-            voice.frequency < 300.0,
+            voice.frequency < held + 40.0,
             "the pitch must not snap: it moved to {}",
             voice.frequency
         );
@@ -336,12 +440,13 @@ mod tests {
     #[test]
     fn the_oscillator_stays_inside_the_output_range() {
         for waveform in Waveform::all() {
-            let mut voice = Voice::new(440.0, 1.0, waveform);
+            let mut voice = Voice::idle();
+            voice.set_target(440.0, 1.0, waveform);
             for _ in 0..2000 {
                 let sample = voice.next_sample(44100.0);
                 assert!(
                     sample.abs() <= 1.0,
-                    "{} produced {} at sample {}",
+                    "{} produced {} at phase {}",
                     waveform.name(),
                     sample,
                     voice.phase
@@ -352,7 +457,8 @@ mod tests {
 
     #[test]
     fn band_limiting_keeps_the_square_close_to_a_square() {
-        let mut voice = Voice::new(100.0, 1.0, Waveform::Square);
+        let mut voice = Voice::idle();
+        voice.set_target(100.0, 1.0, Waveform::Square);
         let mut extremes: f32 = 0.0;
         let mut total: f32 = 0.0;
         for _ in 0..4410 {

@@ -8,7 +8,7 @@
 
 use crate::core::grid::GridLayout;
 use crate::core::scale::{preset, root_class, Scale};
-use crate::core::types::GestureEvent;
+use crate::core::types::Performance;
 use crate::gesture::band_position;
 use crate::gesture::estimator::HandState;
 use crate::gesture::Strategy;
@@ -49,7 +49,7 @@ impl Strategy for FingerPositionStrategy {
         self.set_grid(layout);
     }
 
-    fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+    fn process(&mut self, state: &HandState) -> Option<Performance> {
         if !state.present {
             return None;
         }
@@ -61,18 +61,16 @@ impl Strategy for FingerPositionStrategy {
 
         // 2. Thumb <-> index distance to velocity / volume (0.0 to 1.0): fingers
         // far apart -> loud, pinched together -> silent.
-        Some(GestureEvent::new_note(
+        Some(Performance::Note {
             note,
-            state.volume,
-            "Finger Position",
-        ))
+            velocity: state.volume,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::GesturePayload;
     use crate::core::Landmark;
 
     /// A `HandState` with the index tip at `(x, y)` in a 640x480 frame. The
@@ -99,10 +97,9 @@ mod tests {
     }
 
     fn note_at(strategy: &mut FingerPositionStrategy, x: f32, y: f32) -> u8 {
-        let event = strategy.process(&state(x, y)).unwrap();
-        match event.payload {
-            GesturePayload::Note { note, .. } => note,
-            _ => panic!("expected a note payload"),
+        match strategy.process(&state(x, y)).unwrap() {
+            Performance::Note { note, .. } => note,
+            _ => panic!("expected a note performance"),
         }
     }
 

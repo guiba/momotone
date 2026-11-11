@@ -58,7 +58,6 @@ pub fn fade_trail(trail: &mut [f32], dt_secs: f32, tau_secs: f32) {
 #[derive(Debug, Clone)]
 pub struct EventLogEntry {
     pub uptime_ms: u64,
-    pub text: String,
     pub detail: String,
 }
 

@@ -1,4 +1,4 @@
-use crate::core::types::{GestureEvent, GesturePayload};
+use crate::core::types::Performance;
 use crate::core::Sink;
 use anyhow::{anyhow, Result};
 use midir::{MidiOutput, MidiOutputConnection};
@@ -47,10 +47,10 @@ impl NoteGate {
         }
     }
 
-    /// Messages to send for one frame's worth of gesture. `note == 0` or a zero
-    /// velocity is the pipeline's release event.
+    /// Messages to send for one frame's worth of performance. A release is passed
+    /// in explicitly, not encoded as note 0.
     pub fn attack(&mut self, note: u8, velocity: f32, now: Instant) -> Vec<[u8; 3]> {
-        if note == 0 || velocity <= 0.0 {
+        if velocity <= 0.0 {
             return self.release();
         }
         let volume = volume_cc(velocity);
@@ -171,20 +171,21 @@ impl Sink for MidiOutputEngine {
         Ok(())
     }
 
-    fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
+    fn handle(&mut self, performance: &Performance) -> Result<()> {
         if self.connection.is_none() {
-            return Ok(()); // not started, ignore events
+            return Ok(()); // not started, ignore performances
         }
 
-        let messages = match &event.payload {
-            GesturePayload::Note { note, velocity } => {
+        let messages = match performance {
+            Performance::Note { note, velocity } => {
                 // `FingerPositionStrategy` already emits MIDI numbers (36-84);
                 // the old +60 offset pushed values past 127 and wrapped them.
                 self.gate.attack(*note, *velocity, Instant::now())
             }
+            Performance::Release => self.gate.release(),
             // A theremin has no MIDI equivalent: there is no note to attack and
-            // no continuous pitch to send, so the event is simply dropped.
-            GesturePayload::Signal { .. } => Vec::new(),
+            // no continuous pitch to send, so it is simply dropped.
+            Performance::Signal { .. } => Vec::new(),
         };
 
         for message in messages {
@@ -299,10 +300,10 @@ mod tests {
         let mut gate = NoteGate::new(DEFAULT_MIN_NOTE_MS);
 
         gate.attack(60, 0.8, clock.at(0));
-        assert_eq!(gate.attack(0, 0.0, clock.at(1)), vec![[NOTE_OFF, 60, 0]]);
+        assert_eq!(gate.release(), vec![[NOTE_OFF, 60, 0]]);
         // The pipeline keeps running after the hand leaves; a second release must
         // not send an orphan note-off.
-        assert!(gate.attack(0, 0.0, clock.at(2)).is_empty());
+        assert!(gate.release().is_empty());
         assert_eq!(gate.held, None);
     }
 
@@ -324,11 +325,15 @@ mod tests {
 
     #[test]
     fn events_are_ignored_until_the_engine_is_connected() {
-        // No port attached: handle_event must be a no-op, not an error, so a
+        // No port attached: `handle` must be a no-op, not an error, so a
         // missing synth never spams the sink thread.
         let mut engine = MidiOutputEngine::new("OP-1", DEFAULT_MIN_NOTE_MS);
-        let event = GestureEvent::new_note(60, 1.0, "Finger Position");
-        assert!(engine.handle_event(&event).is_ok());
+        assert!(engine
+            .handle(&Performance::Note {
+                note: 60,
+                velocity: 1.0,
+            })
+            .is_ok());
         assert_eq!(engine.gate.held, None);
     }
 }

@@ -25,7 +25,7 @@ use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
-use crate::core::types::{GestureEvent, GesturePayload};
+use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Landmark, Sink};
 use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
 use crate::gesture::{HandEstimator, HandState, Strategy};
@@ -427,7 +427,7 @@ impl Pipeline {
                     if let Ok(mut samples) = dispatch.lock() {
                         samples.push(age_ms);
                     }
-                    apply_to_sinks(&sinks, &queued.event, debug);
+                    apply_to_sinks(&sinks, &queued.performance, debug);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
                     for sink in sinks.iter_mut() {
@@ -520,7 +520,7 @@ impl Pipeline {
     fn pause(&mut self) {
         if self.gesture_active {
             self.gesture_active = false;
-            self.event_bus.dispatch(GestureEvent::no_gesture());
+            self.event_bus.dispatch(Performance::Release);
         }
         if let Some(rx) = &self.event_rx {
             drain_events(rx, &self.sinks, self.run.debug);
@@ -768,40 +768,51 @@ impl Pipeline {
         }
     }
 
-    /// Gesture -> metrics -> event bus. A sink that never receives anything keeps
-    /// whatever it was last told, so the *absence* of a gesture has to be announced
-    /// too: without the release event the synthesizer keeps oscillating forever.
+    /// Gesture -> metrics -> event bus.
+    ///
+    /// A sink that never receives anything keeps whatever it was last told, so the
+    /// *absence* of a gesture has to be announced too: without the release the
+    /// synthesizer keeps oscillating forever. It is announced exactly once, not on
+    /// every silent frame.
     fn dispatch_gesture(&mut self, state: &HandState) {
-        if let Some(event) = self.strategy.process(state) {
-            match &event.payload {
-                GesturePayload::Note { note, velocity } => {
-                    self.metrics.note = Some(*note);
-                    self.metrics.volume = *velocity;
-                    self.metrics.frequency = None;
-                }
-                GesturePayload::Signal {
-                    frequency,
-                    amplitude,
-                } => {
-                    self.metrics.frequency = Some(*frequency);
-                    self.metrics.volume = *amplitude;
-                    self.metrics.note = None;
-                }
-            }
-            self.gesture_active = true;
-            self.push_log(&event);
-            self.event_bus.dispatch(event);
-        } else {
-            self.metrics.note = None;
-            self.metrics.volume = 0.0;
-            self.metrics.frequency = None;
+        let Some(performance) = self.strategy.process(state) else {
+            return self.release();
+        };
+        if matches!(performance, Performance::Release) {
+            return self.release();
+        }
 
-            if self.gesture_active {
-                let release = GestureEvent::no_gesture();
-                self.gesture_active = false;
-                self.push_log(&release);
-                self.event_bus.dispatch(release);
+        match &performance {
+            Performance::Note { note, velocity } => {
+                self.metrics.note = Some(*note);
+                self.metrics.volume = *velocity;
+                self.metrics.frequency = None;
             }
+            Performance::Signal {
+                frequency,
+                amplitude,
+            } => {
+                self.metrics.frequency = Some(*frequency);
+                self.metrics.volume = *amplitude;
+                self.metrics.note = None;
+            }
+            Performance::Release => unreachable!("handled above"),
+        }
+        self.gesture_active = true;
+        self.push_log(&performance);
+        self.event_bus.dispatch(performance);
+    }
+
+    /// Silence the outputs, but only if something is actually sounding - a sink that
+    /// is already silent should not be told to be silent 30 times a second.
+    fn release(&mut self) {
+        self.metrics.note = None;
+        self.metrics.volume = 0.0;
+        self.metrics.frequency = None;
+        if self.gesture_active {
+            self.gesture_active = false;
+            self.push_log(&Performance::Release);
+            self.event_bus.dispatch(Performance::Release);
         }
     }
 
@@ -835,18 +846,20 @@ impl Pipeline {
         }
     }
 
-    fn push_log(&mut self, event: &GestureEvent) {
-        let detail = match &event.payload {
-            GesturePayload::Note { note: 0, .. } => "release".to_string(),
-            GesturePayload::Note { note, velocity } => {
+    /// One line in the dashboard's event log. The strategy name used to come along
+    /// on the event; the performance describes itself well enough.
+    fn push_log(&mut self, performance: &Performance) {
+        let detail = match performance {
+            Performance::Note { note, velocity } => {
                 format!("note {} ({}) vel {:.2}", note, note_name(*note), velocity)
             }
-            GesturePayload::Signal {
+            Performance::Signal {
                 frequency,
                 amplitude,
             } => {
                 format!("{:.0} Hz amp {:.2}", frequency, amplitude)
             }
+            Performance::Release => "release".to_string(),
         };
 
         if self.metrics.log.len() >= LOG_CAPACITY {
@@ -854,7 +867,6 @@ impl Pipeline {
         }
         self.metrics.log.push_back(EventLogEntry {
             uptime_ms: self.metrics.uptime_ms,
-            text: event.text.clone(),
             detail,
         });
     }
@@ -892,12 +904,12 @@ fn capture_frames(
     Ok(())
 }
 
-fn apply_to_sinks(sinks: &SinkList, event: &GestureEvent, debug: bool) {
+fn apply_to_sinks(sinks: &SinkList, performance: &Performance, debug: bool) {
     let Ok(mut sinks) = sinks.lock() else {
         return;
     };
     for sink in sinks.iter_mut() {
-        if let Err(e) = sink.handle_event(event) {
+        if let Err(e) = sink.handle(performance) {
             if debug {
                 eprintln!("[Sink] {e}");
             }
@@ -908,7 +920,7 @@ fn apply_to_sinks(sinks: &SinkList, event: &GestureEvent, debug: bool) {
 fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList, debug: bool) {
     while let Ok(message) = rx.try_recv() {
         match message {
-            BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.event, debug),
+            BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.performance, debug),
             BusMessage::Shutdown => break,
         }
     }
@@ -1085,7 +1097,7 @@ mod tests {
     /// what the pipeline actually dispatched.
     #[derive(Clone)]
     struct RecordingSink {
-        events: Arc<Mutex<Vec<GestureEvent>>>,
+        events: Arc<Mutex<Vec<Performance>>>,
         /// Timbres the pipeline pushed into the sinks, in order. Without this the
         /// picker wiring is only audible, not testable.
         waveforms: Arc<Mutex<Vec<String>>>,
@@ -1098,8 +1110,8 @@ mod tests {
         fn stop(&mut self) -> Result<()> {
             Ok(())
         }
-        fn handle_event(&mut self, event: &GestureEvent) -> Result<()> {
-            self.events.lock().unwrap().push(event.clone());
+        fn handle(&mut self, performance: &Performance) -> Result<()> {
+            self.events.lock().unwrap().push(performance.clone());
             Ok(())
         }
         fn set_waveform(&mut self, waveform: Waveform) {
@@ -1114,10 +1126,11 @@ mod tests {
     struct AlwaysOn;
 
     impl Strategy for AlwaysOn {
-        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
-            state
-                .present
-                .then(|| GestureEvent::new_note(60, 0.8, "Finger Position"))
+        fn process(&mut self, state: &HandState) -> Option<Performance> {
+            state.present.then_some(Performance::Note {
+                note: 60,
+                velocity: 0.8,
+            })
         }
     }
 
@@ -1126,10 +1139,11 @@ mod tests {
     struct AlwaysSignal;
 
     impl Strategy for AlwaysSignal {
-        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
-            state
-                .present
-                .then(|| GestureEvent::new_signal(220.0, 0.5, "Theremin"))
+        fn process(&mut self, state: &HandState) -> Option<Performance> {
+            state.present.then_some(Performance::Signal {
+                frequency: 220.0,
+                amplitude: 0.5,
+            })
         }
     }
 
@@ -1139,12 +1153,15 @@ mod tests {
     }
 
     impl Strategy for FirstFrameOnly {
-        fn process(&mut self, state: &HandState) -> Option<GestureEvent> {
+        fn process(&mut self, state: &HandState) -> Option<Performance> {
             if !state.present || !self.armed.load(Ordering::Relaxed) {
                 return None;
             }
             self.armed.store(false, Ordering::Relaxed);
-            Some(GestureEvent::new_note(60, 0.8, "Finger Position"))
+            Some(Performance::Note {
+                note: 60,
+                velocity: 0.8,
+            })
         }
     }
 
@@ -1152,7 +1169,7 @@ mod tests {
     /// than a four-tuple: the call sites read as names instead of positional slots.
     struct TestHarness {
         pipeline: Pipeline,
-        events: Arc<Mutex<Vec<GestureEvent>>>,
+        events: Arc<Mutex<Vec<Performance>>>,
         /// The dashboard's half of the control channel: a test "clicks" a button by
         /// sending the same command the UI sends.
         control: Sender<UiCommand>,
@@ -1295,8 +1312,8 @@ mod tests {
 
         let recorded = events.lock().unwrap();
         assert!(matches!(
-            recorded.last().unwrap().payload,
-            GesturePayload::Signal { .. }
+            recorded.last().unwrap(),
+            Performance::Signal { .. }
         ));
     }
 
@@ -1328,12 +1345,12 @@ mod tests {
         // the old one: the layout was pushed into the strategy, not merely into
         // the dashboard's copy of it.
         let recorded = events.lock().unwrap();
-        let note = match recorded.last().unwrap().payload {
-            GesturePayload::Note { note, .. } => note,
-            _ => panic!("expected a note event"),
+        let note = match recorded.last().unwrap() {
+            Performance::Note { note, .. } => note,
+            _ => panic!("expected a note performance"),
         };
         assert!(
-            pipeline.metrics.layout.notes.contains(&note),
+            pipeline.metrics.layout.notes.contains(note),
             "{note} is not in the new grid"
         );
     }
@@ -1622,7 +1639,7 @@ mod tests {
         assert!(
             recorded
                 .iter()
-                .any(|e| matches!(e.payload, GesturePayload::Note { note: 0, .. })),
+                .any(|performance| matches!(performance, Performance::Release)),
             "stopping must release the held note"
         );
         assert!(pipeline.metrics.paused);
@@ -1649,20 +1666,17 @@ mod tests {
 
         let sent = events.lock().unwrap();
         assert_eq!(sent.len(), 2, "exactly one note and one release");
-        match sent[0].payload {
-            GesturePayload::Note { note, velocity } => {
+        match sent[0] {
+            Performance::Note { note, velocity } => {
                 assert_eq!(note, 60);
                 assert!((velocity - 0.8).abs() < 1e-6);
             }
             _ => panic!("expected the gesture note first"),
         }
-        match sent[1].payload {
-            GesturePayload::Note { note, velocity } => {
-                assert_eq!(note, 0, "release must silence the sink");
-                assert_eq!(velocity, 0.0);
-            }
-            _ => panic!("expected the release event second"),
-        }
+        assert!(
+            matches!(sent[1], Performance::Release),
+            "the second message must be the release"
+        );
     }
 
     #[test]
@@ -1733,7 +1747,7 @@ mod tests {
         let sent = events.lock().unwrap();
         assert!(
             sent.iter()
-                .any(|e| matches!(e.payload, GesturePayload::Note { note: 0, .. })),
+                .any(|performance| matches!(performance, Performance::Release)),
             "the release is emitted once the grace window expires"
         );
     }

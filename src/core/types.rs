@@ -1,58 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-/// The data a gesture carries.
+/// What the instrument should do this frame.
 ///
-/// `Note` is the quantised keyboard mapping; `Signal` is the continuous
-/// theremin mapping. Both round-trip through every sink: the synthesizer can
-/// oscillate at an arbitrary frequency, and the MIDI sink simply ignores a
-/// signal because MIDI has no continuous pitch to send.
+/// `Note` is the quantised keyboard mapping; `Signal` is the continuous theremin
+/// mapping, which the synthesizer can render and the MIDI sink cannot (MIDI has no
+/// continuous pitch to send).
+///
+/// `Release` is explicit rather than implied: a sink that is never told the gesture
+/// stopped keeps playing whatever it was last told. The old code encoded "no
+/// gesture" as `Note { note: 0 }`, a magic value every sink had to recognise by
+/// convention.
+///
+/// UI-only fields - a label and a colour - used to ride through every sink on this
+/// type. They belong in the published snapshot, not in the performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GesturePayload {
-    // For Continuous gestures (e.g. frequency modulation)
-    Signal { frequency: f32, amplitude: f32 },
-    // For Discrete gestures (e.g. note on/off)
+pub enum Performance {
     Note { note: u8, velocity: f32 },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GestureEvent {
-    pub payload: GesturePayload,
-    pub text: String,
-    // Color as RGB components for visualizer
-    pub color: (u8, u8, u8),
-}
-
-impl GestureEvent {
-    /// Helper to create a discrete note event
-    pub fn new_note(note: u8, velocity: f32, text: &str) -> Self {
-        Self {
-            payload: GesturePayload::Note { note, velocity },
-            text: text.to_string(),
-            color: (0, 255, 255), // Cyan for notes
-        }
-    }
-
-    /// Helper for a continuous theremin gesture: a frequency and a loudness.
-    pub fn new_signal(frequency: f32, amplitude: f32, text: &str) -> Self {
-        Self {
-            payload: GesturePayload::Signal {
-                frequency,
-                amplitude,
-            },
-            text: text.to_string(),
-            color: (255, 200, 80), // Amber for the theremin
-        }
-    }
-
-    /// Helper for "No Hand" state
-    pub fn no_gesture() -> Self {
-        Self {
-            payload: GesturePayload::Note {
-                note: 0,
-                velocity: 0.0,
-            }, // Dummy payload
-            text: "No Hand Detected".to_string(),
-            color: (255, 0, 0), // Red for empty/error
-        }
-    }
+    Signal { frequency: f32, amplitude: f32 },
+    Release,
 }

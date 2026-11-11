@@ -1,15 +1,15 @@
-use crate::core::types::GestureEvent;
+use crate::core::types::Performance;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::time::Instant;
 
-/// An event plus the wall clock it was dispatched on.
+/// A performance plus the wall clock it was dispatched on.
 ///
-/// The sink thread measures `dispatched_at.elapsed()` when it picks the event up,
-/// which is the slice of the latency budget nothing else sees: how long a gesture
-/// sat in the queue before reaching an output.
+/// The sink thread measures `dispatched_at.elapsed()` when it picks the message up,
+/// which is the slice of the latency budget nothing else sees: how long a gesture sat
+/// in the queue before reaching an output.
 #[derive(Debug, Clone)]
 pub struct QueuedEvent {
-    pub event: GestureEvent,
+    pub performance: Performance,
     pub dispatched_at: Instant,
 }
 
@@ -36,10 +36,10 @@ impl EventBus {
         (Self { sender: tx }, rx)
     }
 
-    /// Send an event to all subscribers.
-    pub fn dispatch(&self, event: GestureEvent) {
+    /// Send a performance to the sinks.
+    pub fn dispatch(&self, performance: Performance) {
         let _ = self.sender.send(BusMessage::Event(QueuedEvent {
-            event,
+            performance,
             dispatched_at: Instant::now(),
         }));
     }

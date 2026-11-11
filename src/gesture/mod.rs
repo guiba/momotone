@@ -10,7 +10,7 @@ pub mod keyboard;
 pub mod theremin;
 
 use crate::core::grid::GridLayout;
-use crate::core::types::GestureEvent;
+use crate::core::types::Performance;
 use crate::core::Landmark;
 use crate::core::NOTE_MARGIN;
 
@@ -22,7 +22,7 @@ pub use estimator::{HandEstimator, HandState};
 /// frame thread is the only one that ever calls it. The *gesture* state - presence,
 /// smoothing, geometry - lives in `HandEstimator`, not in the strategy.
 pub trait Strategy: Send {
-    fn process(&mut self, state: &HandState) -> Option<GestureEvent>;
+    fn process(&mut self, state: &HandState) -> Option<Performance>;
     /// Swap the keyboard out from under the strategy without rebuilding it.
     fn apply_layout(&mut self, _layout: GridLayout) {}
 }

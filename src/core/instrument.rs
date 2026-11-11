@@ -31,6 +31,26 @@ impl Waveform {
         ]
     }
 
+    /// The audio callback's shared target is a handful of atomics, which cannot
+    /// hold an enum, so the timbre travels as its position in `all()`.
+    pub fn index(self) -> u8 {
+        match self {
+            Waveform::Sine => 0,
+            Waveform::Triangle => 1,
+            Waveform::Square => 2,
+            Waveform::Saw => 3,
+        }
+    }
+
+    pub fn from_index(index: u8) -> Waveform {
+        match index {
+            1 => Waveform::Triangle,
+            2 => Waveform::Square,
+            3 => Waveform::Saw,
+            _ => Waveform::Sine,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Waveform::Sine => "sine",
