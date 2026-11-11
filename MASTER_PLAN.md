@@ -401,7 +401,7 @@ Branch `phase3-instrument` carries Phase 3 and the first two Phase 4 tasks. Curr
    exercised only by hand.
 4. Then Phase 5: `tracing`, `--video` fixture source, tracker fixture test, golden trace.
 
-Current shape: `src/` is 9,850 lines of Rust across 24 files. `pipeline.rs` is 1,668 of
+Current shape: `src/` is 9,850 lines of Rust across 33 files. `pipeline.rs` is 1,668 of
 them and owns capture, tracking, gesture dispatch, sinks and telemetry; the presenter is
 443 lines and owns everything a human sees; the estimator is 304. The iced layer
 (`dashboard/`) is 1,843 lines and is still the least-tested part of the app.

@@ -162,3 +162,43 @@ hand in view the two-stage pipeline costs ~11 ms, and the loop is still paced by
 camera read. **Net effect of Phase 2 on performance: none, by design** — the win is one
 frame path (`next_frame` → `advance`) and six named stages instead of `run`/`tick` and a
 210-line `advance`.
+
+---
+
+# After Phase 3 + Phase 4a (`phase3-instrument`, same machine, release build)
+
+Live camera, MediaPipe, 300 frames, `--no-ui`:
+
+```
+[Pipeline] 300 frames in 9.99 s: 29.9 fps, 33.29 ms/frame end to end (capture 33.05 ms, inference 11.50 ms, 0 frames dropped)
+[Stages] p50/p95/p99/max ms - capture 33.4/36.2/37.3/37.3  inference 10.2/12.5/13.2/15.0  camera->publish 0.0/0.0/0.0/0.0  dispatch->sink 0.0/0.0/0.0/0.0  (128 samples)
+```
+
+Live camera **with the ASCII backdrop on** (`--ascii --ascii-cols 70 --max-frames 300`):
+
+```
+[Pipeline] 300 frames in 9.99 s: 29.4 fps, 33.31 ms/frame end to end (capture 35.40 ms, inference 14.48 ms, 0 frames dropped)
+[Stages] p50/p95/p99/max ms - capture 33.3/38.4/39.8/40.6  inference 11.7/12.9/13.8/14.5  camera->publish 0.0/0.0/0.0/0.0  dispatch->sink 0.0/0.0/0.0/0.0  (128 samples)
+```
+
+Mock mode: 300 frames in 9.87 s = **30.2 fps**, 32.91 ms/frame.
+
+| Metric | Phase 2 | Phase 3 + 4a |
+| :-- | :-- | :-- |
+| fps (live, no UI) | 29.9 | 29.9 |
+| capture p50 | 33.5 | 33.4 |
+| inference p50 | 11.3 | 10.2 |
+| dropped frames, UI + ASCII on | 2 | 0 (headless ASCII) |
+| tests | 127 | **135** |
+
+Two things to note:
+
+1. Adding the ASCII render to a headless run costs ~1.5 ms of inference p50 (10.2 → 11.7)
+   because the presenter still shares the process, but it no longer *delays a frame*: the
+   frame thread only moves the `Mat` into a capacity-1 channel and drops it if the presenter
+   is still drawing. Phase 2's UI+ASCII run dropped 2 frames from that same work.
+2. The hand-to-sound budget is unchanged and still dominated by the camera read:
+   capture 33.4 ms + inference 10.2 ms ≈ **43 ms** before the audio block and the DAC.
+
+Still unmeasured: the audio callback's own block latency (cpal does not expose buffer size),
+and capture resolution (T1.8).
