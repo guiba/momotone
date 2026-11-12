@@ -28,6 +28,7 @@ use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
 use crate::presentation::presenter::DEFAULT_FEED_FPS;
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
+use crate::vision::video::VideoSource;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -84,6 +85,11 @@ struct Args {
     /// Run the detector on a single still image instead of the webcam.
     #[arg(long)]
     image: Option<String>,
+
+    /// Run against a recorded clip instead of a webcam. Every run over the same
+    /// file sees the same frames, which is what makes a regression measurable.
+    #[arg(long)]
+    video: Option<String>,
 
     /// Stop after this many frames.
     #[arg(long)]
@@ -167,6 +173,15 @@ struct Args {
     /// disabling the reuse fast path (useful for A/B testing the stage timings).
     #[arg(long, default_value_t = false)]
     landmarker_always: bool,
+
+    /// Write the frame-by-frame sounding trace (note, frequency, volume, detected)
+    /// to this JSON file. Pair with `--video` for a reproducible fixture run.
+    #[arg(long)]
+    trace: Option<String>,
+
+    /// Compare the run against a recorded trace file and print the differing frames.
+    #[arg(long)]
+    expect: Option<String>,
 
     /// Scale the pitch is quantised to. Quantising means every reachable key is
     /// consonant with every other one, so sweeping the hand cannot clash. Use
@@ -334,10 +349,14 @@ fn main() -> Result<()> {
     } else {
         Some(build_tracker(&args).context("Failed to initialize hand tracker")?)
     };
-    let camera = if args.mode == Mode::Mock {
+    let source = if args.mode == Mode::Mock {
         None
+    } else if let Some(path) = &args.video {
+        Some(pipeline::FrameSource::Video(
+            VideoSource::new(path, !args.no_mirror).context("Failed to open video")?,
+        ))
     } else {
-        Some(
+        Some(pipeline::FrameSource::Camera(
             WebcamSource::new(
                 args.camera,
                 args.camera_width,
@@ -346,18 +365,22 @@ fn main() -> Result<()> {
                 !args.no_mirror,
             )
             .context("Failed to open webcam")?,
-        )
+        ))
     };
 
     if args.debug {
-        if let Some(camera) = &camera {
-            println!(
+        match &source {
+            Some(pipeline::FrameSource::Camera(camera)) => println!(
                 "[Camera] requested {}x{} @ {} fps, driver reports {} fps",
                 args.camera_width,
                 args.camera_height,
                 camera.requested_fps(),
                 camera.reported_fps()
-            );
+            ),
+            Some(pipeline::FrameSource::Video(video)) => {
+                println!("[Video] paced at {:.1} fps", video.fps());
+            }
+            None => println!("[Source] synthetic mock hand"),
         }
     }
 
@@ -409,7 +432,7 @@ fn main() -> Result<()> {
     )));
 
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
-        camera,
+        source,
         tracker,
         strategy,
         sinks: Arc::new(Mutex::new(sinks)),
@@ -422,6 +445,8 @@ fn main() -> Result<()> {
         ascii_cols: args.ascii_cols,
         ascii_dump: args.ascii_dump.clone(),
         fade_ms: args.fade_ms,
+        trace_out: args.trace.clone(),
+        trace_expect: args.expect.clone(),
         // With no window there is no stage to look at, so `--ascii` means the
         // art goes to stdout instead.
         ascii_stdout: args.no_ui && args.ascii,

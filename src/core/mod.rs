@@ -6,6 +6,7 @@ pub mod instrument;
 pub mod runtime;
 pub mod scale;
 pub mod telemetry;
+pub mod trace;
 pub mod types;
 
 use crate::core::instrument::Waveform;

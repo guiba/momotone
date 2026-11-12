@@ -25,6 +25,7 @@ use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
+use crate::core::trace::Trace;
 use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Landmark, Sink};
 use crate::dashboard::metrics::{
@@ -36,6 +37,46 @@ use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
 use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
 use crate::vision::camera::WebcamSource;
 use crate::vision::tracker::HandTracker;
+use crate::vision::video::VideoSource;
+
+/// Where the pixels come from. Mock mode has neither: `next_frame` synthesises the
+/// hand instead of reading a frame.
+///
+/// A recorded clip is the reproducible option - the same frames every run, which is
+/// what makes a golden trace test possible.
+pub enum FrameSource {
+    Camera(WebcamSource),
+    Video(VideoSource),
+}
+
+/// Anything the capture stage can pull frames from.
+///
+/// `wait_for_next` is separated from `read` on purpose: pacing a source is a
+/// property of the source, not a cost of decoding a frame, and folding the two
+/// together is what makes a fixture run look slower than it is.
+trait FrameReader {
+    fn wait_for_next(&mut self) {}
+    fn read(&mut self) -> Result<Mat>;
+}
+
+impl FrameReader for FrameSource {
+    /// Pace the source. A webcam arrives at its own rate, so there is nothing to
+    /// do; a clip can be decoded far faster than it was recorded, and un-paced
+    /// fixture runs would report a frame rate that bears no relation to reality.
+    fn wait_for_next(&mut self) {
+        match self {
+            FrameSource::Camera(_) => {}
+            FrameSource::Video(video) => video.wait_for_next(),
+        }
+    }
+
+    fn read(&mut self) -> Result<Mat> {
+        match self {
+            FrameSource::Camera(camera) => camera.get_frame(),
+            FrameSource::Video(video) => video.read(),
+        }
+    }
+}
 
 /// Mock mode emulates a 30 fps camera so the telemetry looks real. The loop uses a
 /// deadline rather than a flat sleep: macOS `thread::sleep(33 ms)` actually returns
@@ -98,7 +139,7 @@ type SinkList = Arc<Mutex<Vec<Box<dyn Sink>>>>;
 
 pub struct Pipeline {
     // --- the stages -----------------------------------------------------------
-    camera: Option<WebcamSource>,
+    source: Option<FrameSource>,
     tracker: Option<HandTracker>,
     strategy: Box<dyn Strategy>,
     /// Shared with the sink thread, which is the only thing that writes to the
@@ -130,6 +171,11 @@ pub struct Pipeline {
     /// stage draws a fact about the run instead of maintaining its own history.
     trail: KeyboardTrail,
     metrics: FrameMetrics,
+    /// The run recorded frame by frame, when the run was asked to record one or
+    /// check itself against one.
+    trace: Trace,
+    trace_out: Option<String>,
+    trace_expect: Option<String>,
 
     // --- run state -------------------------------------------------------------
     run: RunFlags,
@@ -189,7 +235,7 @@ struct Presentation {
 /// Everything the loop needs to run, grouped so `Pipeline::new` is not a
 /// thirteen-argument call.
 pub struct PipelineConfig {
-    pub camera: Option<WebcamSource>,
+    pub source: Option<FrameSource>,
     pub tracker: Option<HandTracker>,
     pub strategy: Box<dyn Strategy>,
     pub sinks: Arc<Mutex<Vec<Box<dyn Sink>>>>,
@@ -205,6 +251,10 @@ pub struct PipelineConfig {
     pub ascii_stdout: bool,
     /// How long a released key keeps glowing on the stage.
     pub fade_ms: f32,
+    /// Write the frame-by-frame sounding trace to this file.
+    pub trace_out: Option<String>,
+    /// Compare the run against a recorded trace and fail on a difference.
+    pub trace_expect: Option<String>,
     pub max_frames: Option<u32>,
     pub debug: bool,
     pub emit_frames: bool,
@@ -213,7 +263,7 @@ pub struct PipelineConfig {
 impl Pipeline {
     pub fn new(config: PipelineConfig) -> Self {
         let PipelineConfig {
-            camera,
+            source,
             tracker,
             strategy,
             sinks,
@@ -227,6 +277,8 @@ impl Pipeline {
             ascii_dump,
             ascii_stdout,
             fade_ms,
+            trace_out,
+            trace_expect,
             max_frames,
             debug,
             emit_frames,
@@ -257,7 +309,7 @@ impl Pipeline {
         // frame, and never converts a pixel itself.
         let (jobs_tx, jobs_rx) = crossbeam_channel::bounded(1);
         let mut pipeline = Pipeline {
-            camera,
+            source,
             tracker,
             strategy,
             sinks,
@@ -270,6 +322,9 @@ impl Pipeline {
             estimator: HandEstimator::new(),
             gesture_active: false,
             trail: KeyboardTrail::new(fade_ms),
+            trace: Trace::default(),
+            trace_out,
+            trace_expect,
             counters: Arc::new(CaptureCounters::default()),
             run: RunFlags {
                 max_frames,
@@ -420,23 +475,17 @@ impl Pipeline {
     /// `active` flag in the runtime config (the dashboard's Stop button) pauses the
     /// loop without tearing down the camera or the sinks.
     pub fn run(&mut self, running: &Arc<AtomicBool>) -> Result<()> {
-        // Stage 1: the camera, on its own thread. The channel holds a single frame,
-        // so inference always takes the newest one instead of queueing up behind
-        // its own latency and drifting away from the live view.
+        // Stage 1: the frame source, on its own thread. The channel holds a single
+        // frame, so inference always takes the newest one instead of queueing up
+        // behind its own latency and drifting away from the live view.
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(1);
-        let capture_handle = self.camera.take().map(|mut camera| {
+        let capture_handle = self.source.take().map(|mut source| {
             let tx = frame_tx.clone();
             let running = running.clone();
             let control = self.control.clone();
             let counters = self.counters.clone();
             std::thread::spawn(move || {
-                if let Err(e) = capture_frames(
-                    &mut || camera.get_frame(),
-                    &tx,
-                    &control,
-                    &running,
-                    &counters,
-                ) {
+                if let Err(e) = capture_frames(&mut source, &tx, &control, &running, &counters) {
                     eprintln!("[Capture] {e}");
                 }
             })
@@ -537,6 +586,34 @@ impl Pipeline {
             );
         }
 
+        if let Some(path) = &self.trace_out {
+            if let Err(error) = crate::core::trace::write(path, &self.trace) {
+                eprintln!("[Trace] could not write {path}: {error}");
+            } else {
+                println!("[Trace] {} frames written to {path}", self.trace.len());
+            }
+        }
+        if let Some(path) = &self.trace_expect {
+            match crate::core::trace::read(path) {
+                Ok(expected) => {
+                    let differences = crate::core::trace::diff(&expected, &self.trace);
+                    if differences.is_empty() {
+                        println!("[Trace] matches {path} ({} frames)", self.trace.len());
+                    } else {
+                        for line in differences.iter().take(20) {
+                            println!("[Trace] {line}");
+                        }
+                        if differences.len() > 20 {
+                            println!("[Trace] ... and {} more", differences.len() - 20);
+                        }
+                        // Non-zero, so `make trace-check` is a gate and not a note.
+                        anyhow::bail!("[Trace] {path}: {} frames differ", differences.len());
+                    }
+                }
+                Err(error) => eprintln!("[Trace] {error}"),
+            }
+        }
+
         running.store(false, Ordering::Relaxed);
         // Unblock the sink thread: everything dispatched before this arrives first,
         // because the channel is FIFO.
@@ -614,9 +691,12 @@ impl Pipeline {
                 std::thread::sleep(self.telemetry.next_mock - now);
             }
             self.telemetry.next_mock += MOCK_CADENCE;
-            return Ok(FrameRead::Frame(synthetic_frame(
-                self.telemetry.started.elapsed().as_secs_f64(),
-            )));
+            // The hand is driven by the *frame index*, not the wall clock: a mock
+            // run of N frames always shows the same hand at the same place, which
+            // is what makes a golden trace test possible. The deadline clock above
+            // still paces the loop, so the telemetry stays honest.
+            let nominal_seconds = self.metrics.perf.frames as f64 * MOCK_CADENCE.as_secs_f64();
+            return Ok(FrameRead::Frame(synthetic_frame(nominal_seconds)));
         };
 
         match frames.recv_timeout(Duration::from_millis(FRAME_POLL_MS)) {
@@ -672,6 +752,9 @@ impl Pipeline {
             drain_events(rx, &self.sinks, self.run.debug);
         }
         self.publish();
+        // The trace is the smallest thing a run produces, so recording it costs
+        // nothing worth naming and makes a regression visible without a screenshot.
+        self.trace.push(&self.metrics);
         self.report_frame();
         Ok(())
     }
@@ -884,7 +967,7 @@ impl Pipeline {
 /// the new frame is dropped and counted rather than letting the pipeline drift
 /// behind the camera, working on pixels that are already stale.
 fn capture_frames(
-    mut read: impl FnMut() -> Result<Mat>,
+    source: &mut dyn FrameReader,
     tx: &Sender<CapturedFrame>,
     control: &Arc<Mutex<RuntimeConfig>>,
     running: &AtomicBool,
@@ -895,8 +978,11 @@ fn capture_frames(
             std::thread::sleep(Duration::from_millis(PAUSE_POLL_MS));
             continue;
         }
+        // Deliberately outside the timed region: waiting for the next frame is a
+        // property of the source, not a cost of reading it.
+        source.wait_for_next();
         let start = Instant::now();
-        let frame = read()?;
+        let frame = source.read()?;
         counters.captured.fetch_add(1, Ordering::Relaxed);
         let captured = CapturedFrame {
             frame,
@@ -1148,7 +1234,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let waveforms = Arc::new(Mutex::new(Vec::new()));
         let pipeline = Pipeline::new(PipelineConfig {
-            camera: None,
+            source: None,
             tracker: None,
             strategy,
             sinks: Arc::new(Mutex::new(vec![Box::new(RecordingSink {
@@ -1165,6 +1251,8 @@ mod tests {
             ascii_dump: None,
             ascii_stdout: false,
             fade_ms: DEFAULT_FADE_MS,
+            trace_out: None,
+            trace_expect: None,
             max_frames,
             debug: false,
             emit_frames,
@@ -1217,6 +1305,53 @@ mod tests {
         );
         assert_eq!(carried, 200 * FRAME, "the clone really carried the pixels");
         assert_eq!(carried_empty, 0);
+    }
+
+    #[test]
+    #[ignore]
+    /// Print the first 60 notes the mock hand plays, so the golden trace in
+    /// `the_mock_hand_walks_up_the_keyboard_in_a_stable_order` can be regenerated
+    /// after a change to the grid or the synthetic hand. Run with
+    /// `cargo test -- --include-ignored print_mock_trace --nocapture`.
+    fn print_mock_trace() {
+        let harness = test_pipeline(Box::new(FingerPositionStrategy::default()), Some(60));
+        let mut pipeline = harness.pipeline;
+        pipeline.run(&Arc::new(AtomicBool::new(true))).unwrap();
+        let events = harness.events.lock().unwrap();
+        println!("[trace] {:?}", runs(&events));
+    }
+
+    /// Collapse a trace into the notes held and how long each one lasted. Sixty
+    /// frames of the same note is one fact, not sixty.
+    fn runs(events: &[Performance]) -> Vec<(u8, usize)> {
+        let mut out: Vec<(u8, usize)> = Vec::new();
+        for event in events {
+            let Performance::Note { note, .. } = *event else {
+                continue;
+            };
+            match out.last_mut() {
+                Some((last, length)) if *last == note => *length += 1,
+                _ => out.push((note, 1)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_mock_hand_walks_up_the_keyboard_in_a_stable_order() {
+        // The mock hand is driven by the frame index, so this trace is exactly the
+        // same run to run: it is a golden reference, not a flaky sample. A change
+        // to the grid, the fingertip smoothing or the synthetic hand that moves a
+        // note or a transition shows up here as a diff.
+        let harness = test_pipeline(Box::new(FingerPositionStrategy::default()), Some(60));
+        let mut pipeline = harness.pipeline;
+        pipeline.run(&Arc::new(AtomicBool::new(true))).unwrap();
+        let events = harness.events.lock().unwrap();
+
+        // E4 (64) -> G4 (67) -> A4 (69): the sweep crosses two cell boundaries on
+        // its way right, and each is held long enough to be a real note rather than
+        // a flicker.
+        assert_eq!(runs(&events), vec![(64, 13), (67, 18), (69, 28)]);
     }
 
     #[test]
@@ -1585,6 +1720,47 @@ mod tests {
         );
     }
 
+    /// A source that produces a fixed number of frames, then switches the run off
+    /// the way the Stop button does.
+    struct ScriptedSource {
+        produced: usize,
+        stop_at: usize,
+        running: Arc<AtomicBool>,
+    }
+
+    impl FrameReader for ScriptedSource {
+        fn read(&mut self) -> Result<Mat> {
+            self.produced += 1;
+            if self.produced >= self.stop_at {
+                self.running.store(false, Ordering::Relaxed);
+            }
+            Ok(Mat::new_rows_cols_with_default(
+                4,
+                4,
+                opencv::core::CV_8UC3,
+                opencv::core::Scalar::all(7.0),
+            )
+            .unwrap())
+        }
+    }
+
+    struct CountingSource {
+        produced: usize,
+    }
+
+    impl FrameReader for CountingSource {
+        fn read(&mut self) -> Result<Mat> {
+            self.produced += 1;
+            Ok(Mat::new_rows_cols_with_default(
+                2,
+                2,
+                opencv::core::CV_8UC3,
+                opencv::core::Scalar::all(0.0),
+            )
+            .unwrap())
+        }
+    }
+
     #[test]
     fn the_capture_stage_keeps_only_the_newest_frame() {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1597,22 +1773,13 @@ mod tests {
             Ramp::Blocks,
         )));
 
-        let mut produced = 0;
-        let mut read = || -> Result<Mat> {
-            produced += 1;
-            if produced >= 5 {
-                running.store(false, Ordering::Relaxed);
-            }
-            Ok(Mat::new_rows_cols_with_default(
-                4,
-                4,
-                opencv::core::CV_8UC3,
-                opencv::core::Scalar::all(7.0),
-            )
-            .unwrap())
+        let mut source = ScriptedSource {
+            produced: 0,
+            stop_at: 5,
+            running: running.clone(),
         };
 
-        capture_frames(&mut read, &tx, &control, &running, &counters).unwrap();
+        capture_frames(&mut source, &tx, &control, &running, &counters).unwrap();
 
         assert_eq!(counters.captured.load(Ordering::Relaxed), 5);
         assert_eq!(
@@ -1644,20 +1811,13 @@ mod tests {
             stop.store(false, Ordering::Relaxed);
         });
 
-        let mut produced = 0;
-        let mut read = || -> Result<Mat> {
-            produced += 1;
-            Ok(Mat::new_rows_cols_with_default(
-                2,
-                2,
-                opencv::core::CV_8UC3,
-                opencv::core::Scalar::all(0.0),
-            )
-            .unwrap())
-        };
+        let mut source = CountingSource { produced: 0 };
 
-        capture_frames(&mut read, &tx, &paused, &running, &counters).unwrap();
-        assert_eq!(produced, 0, "Stop means the camera is not read at all");
+        capture_frames(&mut source, &tx, &paused, &running, &counters).unwrap();
+        assert_eq!(
+            source.produced, 0,
+            "Stop means the camera is not read at all"
+        );
         assert_eq!(counters.captured.load(Ordering::Relaxed), 0);
     }
 

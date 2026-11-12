@@ -10,7 +10,7 @@ use opencv::videoio::{self, VideoCaptureTrait, VideoCaptureTraitConst};
 /// that already exists does the same job for less: OpenCV keeps the scratch
 /// allocation when the size matches, so after the first frame the mirror is one
 /// row swap and no allocator traffic.
-fn flip_horizontal(frame: &mut Mat, scratch: &mut Mat) -> Result<()> {
+pub(crate) fn flip_horizontal(frame: &mut Mat, scratch: &mut Mat) -> Result<()> {
     // flip_code 1 is cv::FLIP_HORIZONTAL; the bindings expose no constant.
     core::flip(frame, scratch, 1)?;
     // The caller keeps the flipped pixels, and `scratch` is left holding the raw
