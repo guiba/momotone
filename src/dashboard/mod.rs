@@ -132,20 +132,20 @@ impl Dashboard {
                     // a 640x480 RGBA frame is 1.2 MB per tick otherwise. Take
                     // ownership of the pixels so the clone below carries an empty
                     // buffer either way.
-                    if self.show_feed && !shared.frame_pixels.is_empty() {
-                        let (width, height) = shared.frame_size;
+                    if self.show_feed && !shared.scene.pixels.is_empty() {
+                        let (width, height) = shared.hand.frame_size;
                         self.frame_image = Some(Handle::from_rgba(
                             width as u32,
                             height as u32,
-                            std::mem::take(&mut shared.frame_pixels),
+                            std::mem::take(&mut shared.scene.pixels),
                         ));
                     } else {
-                        shared.frame_pixels.clear();
+                        shared.scene.pixels.clear();
                     }
                     self.metrics = shared.clone();
                 }
-                push(&mut self.volume_history, self.metrics.volume);
-                push(&mut self.confidence_history, self.metrics.confidence);
+                push(&mut self.volume_history, self.metrics.sound.volume);
+                push(&mut self.confidence_history, self.metrics.hand.confidence);
             }
             Message::ToggleRun => {
                 self.active = !self.active;
@@ -209,20 +209,20 @@ impl Dashboard {
             text("Hand Gesture HUD").size(20),
             text(format!(
                 "{} · {} · {} {} · {}x{} · {} · trail {:.0} ms{}",
-                self.metrics.mode,
-                self.metrics.sink,
-                self.metrics.scale,
-                self.metrics.root,
-                self.metrics.layout.rows,
-                self.metrics.layout.cols,
-                self.metrics.waveform,
-                self.metrics.fade_ms,
+                self.metrics.status.mode,
+                self.metrics.status.sink,
+                self.metrics.status.scale,
+                self.metrics.status.root,
+                self.metrics.scene.layout.rows,
+                self.metrics.scene.layout.cols,
+                self.metrics.status.waveform,
+                self.metrics.sound.fade_ms,
                 if self.show_ascii {
                     format!(
                         " · ascii {} {}x{}",
                         self.ramp.name(),
-                        self.metrics.ascii.cols,
-                        self.metrics.ascii.rows
+                        self.metrics.scene.ascii.cols,
+                        self.metrics.scene.ascii.rows
                     )
                 } else {
                     String::new()
@@ -262,21 +262,21 @@ impl Dashboard {
             canvas(Skeleton {
                 image: self.frame_image.clone(),
                 show_feed: self.show_feed,
-                ascii: self.metrics.ascii.clone(),
+                ascii: self.metrics.scene.ascii.clone(),
                 show_ascii: self.show_ascii,
                 ramp: self.ramp,
-                frequency: self.metrics.frequency,
-                landmarks: self.metrics.landmarks.clone(),
-                frame_size: self.metrics.frame_size,
-                hand_box: self.metrics.hand_box,
+                frequency: self.metrics.sound.frequency,
+                landmarks: self.metrics.hand.landmarks.clone(),
+                frame_size: self.metrics.hand.frame_size,
+                hand_box: self.metrics.hand.hand_box,
                 show_box: self.show_box,
                 show_labels: self.show_labels,
-                detected: self.metrics.detected,
-                lost_ms: self.metrics.lost_ms,
-                trail: self.metrics.trail.clone(),
-                layout: self.metrics.layout.clone(),
-                current_note: self.metrics.note,
-                volume: self.metrics.volume,
+                detected: self.metrics.hand.detected,
+                lost_ms: self.metrics.hand.lost_ms,
+                trail: self.metrics.sound.trail.clone(),
+                layout: self.metrics.scene.layout.clone(),
+                current_note: self.metrics.sound.note,
+                volume: self.metrics.sound.volume,
             })
             .width(Length::Fill)
             .height(Length::Fill),
@@ -307,8 +307,8 @@ impl Dashboard {
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
                 render_card(self.ramp, self.show_ascii),
-                meter_card("Volume", self.metrics.volume, VOLUME),
-                meter_card("Confidence", self.metrics.confidence, CONFIDENCE),
+                meter_card("Volume", self.metrics.sound.volume, VOLUME),
+                meter_card("Confidence", self.metrics.hand.confidence, CONFIDENCE),
                 status_card(&self.metrics),
             ]
             .spacing(10),
@@ -538,10 +538,10 @@ fn render_card<'a>(ramp: Ramp, show_ascii: bool) -> Element<'a, Message> {
 }
 
 fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {
-    let head: Element<'_, Message> = if metrics.paused {
+    let head: Element<'_, Message> = if metrics.status.paused {
         text("stopped").size(22).color(MUTED).into()
     } else {
-        match metrics.note {
+        match metrics.sound.note {
             Some(note) => row![
                 text(note_name(note)).size(30).color(NOTE),
                 space::horizontal(),
@@ -550,7 +550,7 @@ fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {
             .spacing(10)
             .align_y(alignment::Vertical::Center)
             .into(),
-            None => match metrics.frequency {
+            None => match metrics.sound.frequency {
                 Some(freq) => row![
                     text(format!("{freq:.0} Hz")).size(24).color(NOTE),
                     space::horizontal(),
@@ -568,7 +568,7 @@ fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {
         "OUTPUT",
         column![
             head,
-            kv("volume", format!("{:.0}%", metrics.volume * 100.0)),
+            kv("volume", format!("{:.0}%", metrics.sound.volume * 100.0)),
         ]
         .spacing(6),
     )
@@ -590,30 +590,36 @@ fn perf_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     card(
         "PERFORMANCE",
         column![
-            kv("fps", format!("{:.1}", metrics.fps)),
-            kv("inference", format!("{:.2} ms", metrics.frame_ms)),
-            kv("capture", format!("{:.2} ms", metrics.capture_ms)),
-            kv("latency", format!("{:.2} ms", metrics.latency_ms)),
-            kv("detector", format!("{:.0} µs", metrics.detector_us)),
-            kv("landmarker", format!("{:.0} µs", metrics.landmarker_us)),
-            kv("frames", format!("{}", metrics.frames)),
+            kv("fps", format!("{:.1}", metrics.perf.fps)),
+            kv("inference", format!("{:.2} ms", metrics.perf.frame_ms)),
+            kv("capture", format!("{:.2} ms", metrics.perf.capture_ms)),
+            kv("latency", format!("{:.2} ms", metrics.perf.latency_ms)),
+            kv("detector", format!("{:.0} µs", metrics.perf.detector_us)),
+            kv(
+                "landmarker",
+                format!("{:.0} µs", metrics.perf.landmarker_us)
+            ),
+            kv("frames", format!("{}", metrics.perf.frames)),
             kv(
                 "dropped",
-                format!("{} of {} frames", metrics.dropped, metrics.captured),
+                format!(
+                    "{} of {} frames",
+                    metrics.perf.dropped, metrics.perf.captured
+                ),
             ),
-            kv("uptime", format!("{} s", metrics.uptime_ms / 1000)),
+            kv("uptime", format!("{} s", metrics.perf.uptime_ms / 1000)),
         ]
         .spacing(4),
     )
 }
 
 fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
-    let status = if metrics.paused {
+    let status = if metrics.status.paused {
         "paused".to_string()
-    } else if metrics.detected {
+    } else if metrics.hand.detected {
         "tracking".to_string()
     } else {
-        format!("lost {} ms", metrics.lost_ms)
+        format!("lost {} ms", metrics.hand.lost_ms)
     };
 
     card(
@@ -624,22 +630,26 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
                 "pitch anchor",
                 format!(
                     "tip {:.0}, {:.0} / {:.0} x {:.0} px",
-                    metrics.tip_x, metrics.tip_y, metrics.frame_size.0, metrics.frame_size.1
+                    metrics.hand.tip_x,
+                    metrics.hand.tip_y,
+                    metrics.hand.frame_size.0,
+                    metrics.hand.frame_size.1
                 ),
             ),
             kv(
                 "cell",
                 format!(
                     "deg {} · octave {}",
-                    metrics.grid_col,
+                    metrics.hand.grid_col,
                     metrics
+                        .scene
                         .layout
                         .octaves
-                        .get(metrics.grid_row)
+                        .get(metrics.hand.grid_row)
                         .map_or(0, |o| o - 1)
                 ),
             ),
-            kv("landmarks", format!("{}", metrics.landmark_count)),
+            kv("landmarks", format!("{}", metrics.hand.landmark_count)),
         ]
         .spacing(4),
     )
@@ -647,6 +657,8 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
 
 fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     let fingers: Vec<Element<'a, Message>> = metrics
+        .hand
+        .geometry
         .extension
         .iter()
         .enumerate()
@@ -669,10 +681,13 @@ fn geometry_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     card(
         "HAND GEOMETRY",
         column![
-            kv("spread", format!("{:.2}", metrics.spread)),
-            kv("tilt", format!("{:.0}°", metrics.tilt_deg)),
-            kv("jitter", format!("{:.1} px", metrics.jitter_px)),
-            kv("palm", format!("{:.0} px", metrics.palm_length)),
+            kv("spread", format!("{:.2}", metrics.hand.geometry.spread)),
+            kv("tilt", format!("{:.0}°", metrics.hand.geometry.tilt_deg)),
+            kv("jitter", format!("{:.1} px", metrics.hand.jitter_px)),
+            kv(
+                "palm",
+                format!("{:.0} px", metrics.hand.geometry.palm_length)
+            ),
             Column::with_children(fingers),
         ]
         .spacing(4),
@@ -699,6 +714,7 @@ fn sparkline_card<'a>(
 
 fn log_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     let lines: Vec<Element<'a, Message>> = metrics
+        .status
         .log
         .iter()
         .rev()

@@ -115,7 +115,7 @@ impl Presenter {
         let art_wanted = settings.ascii || self.stdout || self.dump.is_some();
         if art_wanted && feed_due(self.next_ascii, now) {
             self.next_ascii = now + feed_interval(settings.ascii_fps);
-            metrics.ascii = match &job.frame {
+            metrics.scene.ascii = match &job.frame {
                 Some(frame) => self.ascii.render(frame, self.cols).unwrap_or_else(|error| {
                     if self.debug {
                         eprintln!("[Ascii] {error}");
@@ -131,16 +131,16 @@ impl Presenter {
                 None => AsciiGrid::default(),
             };
 
-            if !metrics.ascii.is_empty() {
+            if !metrics.scene.ascii.is_empty() {
                 let ramp = settings.ramp;
                 if self.stdout {
                     // Home the cursor rather than clearing the screen, so
                     // consecutive frames overwrite in place and the art animates
                     // instead of scrolling.
-                    print!("\x1B[H{}", metrics.ascii.text(ramp));
+                    print!("\x1B[H{}", metrics.scene.ascii.text(ramp));
                 }
                 if let Some(path) = &self.dump {
-                    std::fs::write(path, metrics.ascii.text(ramp))?;
+                    std::fs::write(path, metrics.scene.ascii.text(ramp))?;
                 }
             }
         }
@@ -148,11 +148,11 @@ impl Presenter {
         if settings.feed && feed_due(self.next_feed, now) {
             if let Some(frame) = &job.frame {
                 self.next_feed = now + feed_interval(settings.feed_fps);
-                metrics.frame_pixels = frame_to_rgba(frame);
+                metrics.scene.pixels = frame_to_rgba(frame);
             }
         } else {
             // Keep the snapshot free of pixels the UI would discard.
-            metrics.frame_pixels.clear();
+            metrics.scene.pixels.clear();
         }
         Ok(())
     }
@@ -250,7 +250,7 @@ mod tests {
                 &mut metrics,
             )
             .unwrap();
-        assert!(metrics.frame_pixels.is_empty(), "feed off, no pixels");
+        assert!(metrics.scene.pixels.is_empty(), "feed off, no pixels");
 
         presenter
             .present(
@@ -260,9 +260,9 @@ mod tests {
                 &mut metrics,
             )
             .unwrap();
-        assert_eq!(metrics.frame_pixels.len(), 640 * 480 * 4);
+        assert_eq!(metrics.scene.pixels.len(), 640 * 480 * 4);
         assert_eq!(
-            &metrics.frame_pixels[..4],
+            &metrics.scene.pixels[..4],
             &[10, 10, 10, 255],
             "BGR became RGBA"
         );
@@ -279,7 +279,7 @@ mod tests {
             .present(&job(10), &settings, now, &mut metrics)
             .unwrap();
         assert_eq!(
-            metrics.frame_pixels.len(),
+            metrics.scene.pixels.len(),
             640 * 480 * 4,
             "the first frame uploads"
         );
@@ -296,7 +296,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            metrics.frame_pixels.is_empty(),
+            metrics.scene.pixels.is_empty(),
             "a frame inside the feed interval carries no pixels"
         );
 
@@ -309,7 +309,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            &metrics.frame_pixels[..4],
+            &metrics.scene.pixels[..4],
             &[255, 255, 255, 255],
             "the second is due"
         );
@@ -351,13 +351,17 @@ mod tests {
 
         // 640x480 at 32 columns is 24 rows, and the frame is one flat grey, so every
         // cell has to land in the same bucket.
-        assert_eq!((metrics.ascii.cols, metrics.ascii.rows), (32, 24));
+        assert_eq!(
+            (metrics.scene.ascii.cols, metrics.scene.ascii.rows),
+            (32, 24)
+        );
         assert!(
             metrics
+                .scene
                 .ascii
                 .cells
                 .iter()
-                .all(|&level| level == metrics.ascii.cells[0]),
+                .all(|&level| level == metrics.scene.ascii.cells[0]),
             "a flat frame must produce a flat grid"
         );
     }
@@ -384,13 +388,16 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!((metrics.ascii.cols, metrics.ascii.rows), (40, 30));
+        assert_eq!(
+            (metrics.scene.ascii.cols, metrics.scene.ascii.rows),
+            (40, 30)
+        );
         assert!(
-            metrics.ascii.cells.iter().any(|&level| level > 0),
+            metrics.scene.ascii.cells.iter().any(|&level| level > 0),
             "the mock hand lights up cells"
         );
         assert!(
-            metrics.ascii.cells.contains(&0),
+            metrics.scene.ascii.cells.contains(&0),
             "and the background stays dark"
         );
     }
@@ -405,7 +412,7 @@ mod tests {
         presenter
             .present(&job(255), &settings, now, &mut metrics)
             .unwrap();
-        let lit = metrics.ascii.cells.iter().all(|&level| level > 0);
+        let lit = metrics.scene.ascii.cells.iter().all(|&level| level > 0);
 
         // A second frame inside the interval must not rebuild the art.
         presenter
@@ -418,7 +425,7 @@ mod tests {
             .unwrap();
         assert!(lit, "the first render lit the whole grid");
         assert!(
-            metrics.ascii.cells.iter().all(|&level| level > 0),
+            metrics.scene.ascii.cells.iter().all(|&level| level > 0),
             "the grid keeps the previous render until its cadence is due"
         );
     }

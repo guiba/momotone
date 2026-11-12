@@ -17,7 +17,7 @@ use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::runtime::{control_channel, RuntimeConfig};
 use crate::core::Sink;
-use crate::dashboard::metrics::{FrameMetrics, DEFAULT_FADE_MS};
+use crate::dashboard::metrics::{FrameMetrics, SceneView, SoundView, StatusView, DEFAULT_FADE_MS};
 use crate::gesture::keyboard::FingerPositionStrategy;
 use crate::gesture::theremin::ThereminStrategy;
 use crate::gesture::Strategy;
@@ -379,12 +379,21 @@ fn main() -> Result<()> {
     let root_name = instrument.root_name.clone();
 
     let shared = Arc::new(Mutex::new(FrameMetrics {
-        mode: format!("{:?} / {:?}", args.mode, args.gesture),
-        sink: sink_label.to_string(),
-        scale: scale_name,
-        root: root_name,
-        layout,
-        fade_ms: args.fade_ms,
+        status: StatusView {
+            mode: format!("{:?} / {:?}", args.mode, args.gesture),
+            sink: sink_label.to_string(),
+            scale: scale_name,
+            root: root_name,
+            ..StatusView::default()
+        },
+        scene: SceneView {
+            layout,
+            ..SceneView::default()
+        },
+        sound: SoundView {
+            fade_ms: args.fade_ms,
+            ..SoundView::default()
+        },
         ..FrameMetrics::default()
     }));
 

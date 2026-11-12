@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::core::geometry::HandGeometry;
 use crate::core::grid::GridLayout;
 use crate::core::telemetry::StageProfile;
 use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
@@ -124,11 +125,10 @@ pub struct EventLogEntry {
     pub detail: String,
 }
 
+/// Where the hand is and how steady it looks. Written by the frame loop out of the
+/// estimator's `HandState`.
 #[derive(Debug, Clone, Default)]
-pub struct FrameMetrics {
-    // --- tracking ---
-    /// True when the dashboard's Stop button has paused the pipeline.
-    pub paused: bool,
+pub struct HandView {
     pub detected: bool,
     pub confidence: f32,
     pub landmark_count: usize,
@@ -146,36 +146,28 @@ pub struct FrameMetrics {
     pub lost_ms: u64,
     /// Mean landmark displacement between consecutive frames, in pixels.
     pub jitter_px: f32,
+    /// Resolution-independent hand shape: spread, per-finger extension, tilt, palm.
+    pub geometry: HandGeometry,
+}
 
-    /// The camera frame as RGBA pixels, handed to the dashboard so it can draw
-    /// the video and the skeleton in the same canvas. Only produced when the UI
-    /// is running.
-    pub frame_pixels: Vec<u8>,
-    /// Quantised luminance grid behind the skeleton: the ASCII art backdrop.
-    /// Published only while the `ascii` toggle is on (or a dump/terminal output
-    /// is requested), at `--ascii-fps`.
-    pub ascii: AsciiGrid,
-    /// Per-semitone keyboard brightness, index = note - NOTE_LOW. Computed by
-    /// the frame loop so the stage needs no state of its own.
-    pub trail: Vec<f32>,
-    /// The trail's decay time constant, in milliseconds, for the header readout.
-    pub fade_ms: f32,
-
-    // --- gesture output ---
+/// What is sounding, including the keyboard glow. Owned by the frame loop.
+#[derive(Debug, Clone, Default)]
+pub struct SoundView {
     pub note: Option<u8>,
     pub volume: f32,
     pub frequency: Option<f32>,
-    pub spread: f32,
-    pub extension: [f32; 5],
-    pub tilt_deg: f32,
-    pub palm_length: f32,
+    /// Per-semitone keyboard brightness, index = note - NOTE_LOW.
+    pub trail: Vec<f32>,
+    /// The trail's decay time constant, in milliseconds, for the header readout.
+    pub fade_ms: f32,
+}
 
-    // --- performance ---
+/// How fast the run is going: instantaneous numbers plus the tail of each stage,
+/// refreshed once a second.
+#[derive(Debug, Clone, Default)]
+pub struct PerfView {
     pub fps: f32,
-    /// Tail behaviour of each stage, refreshed once a second. The instantaneous
-    /// fields below are the last frame; this is what a regression actually looks
-    /// like.
-    pub perf: StageProfile,
+    pub profile: StageProfile,
     /// Time inference spent on the frame that produced this snapshot.
     pub frame_ms: f64,
     /// Time the capture stage spent reading that frame from the camera.
@@ -189,8 +181,29 @@ pub struct FrameMetrics {
     pub captured: u64,
     pub dropped: u64,
     pub uptime_ms: u64,
+}
 
-    // --- context ---
+/// The picture the stage draws. Only the presenter thread writes the pixel and
+/// ASCII buffers, so refreshing the telemetry never wipes them.
+#[derive(Debug, Clone, Default)]
+pub struct SceneView {
+    /// The camera frame as RGBA pixels, handed to the dashboard so it can draw the
+    /// video and the skeleton in the same canvas. Only produced when the UI is
+    /// running.
+    pub pixels: Vec<u8>,
+    /// Quantised luminance grid behind the skeleton: the ASCII art backdrop.
+    /// Published only while the `ascii` toggle is on (or a dump/terminal output is
+    /// requested), at `--ascii-fps`.
+    pub ascii: AsciiGrid,
+    /// The degree x octave keyboard the hand plays on.
+    pub layout: GridLayout,
+}
+
+/// What the run *is*: mode, output, instrument, and the event log.
+#[derive(Debug, Clone, Default)]
+pub struct StatusView {
+    /// True when the dashboard's Stop button has paused the pipeline.
+    pub paused: bool,
     pub mode: String,
     pub sink: String,
     /// The scale the pitch is quantised to, e.g. "major pentatonic".
@@ -199,9 +212,18 @@ pub struct FrameMetrics {
     pub root: String,
     /// Timbre of the oscillator, e.g. "saw".
     pub waveform: String,
-    /// The degree x octave keyboard the hand plays on.
-    pub layout: GridLayout,
     pub log: VecDeque<EventLogEntry>,
+}
+
+/// The whole snapshot. Each field is a view with one owner, so the UI reads a
+/// named group instead of digging through a flat bag of thirty-odd fields.
+#[derive(Debug, Clone, Default)]
+pub struct FrameMetrics {
+    pub hand: HandView,
+    pub sound: SoundView,
+    pub perf: PerfView,
+    pub scene: SceneView,
+    pub status: StatusView,
 }
 
 const NOTE_NAMES: [&str; 12] = [
