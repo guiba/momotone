@@ -18,7 +18,7 @@ pub mod metrics;
 pub mod skeleton;
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use iced::widget::image::Handle;
@@ -31,9 +31,8 @@ use iced::{time, Subscription};
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, Waveform};
 use crate::core::runtime::UiCommand;
-use crate::core::NOTE_COUNT;
 use crate::dashboard::gauges::{Meter, Sparkline};
-use crate::dashboard::metrics::{fade_trail, note_index, note_name, FrameMetrics};
+use crate::dashboard::metrics::{note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
 use crate::presentation::ascii::Ramp;
 
@@ -98,12 +97,6 @@ pub struct Dashboard {
     show_feed: bool,
     /// ASCII art behind the skeleton, off by default.
     show_ascii: bool,
-    /// Per-semitone brightness of the on-screen keyboard. Set to 1.0 when a
-    /// note is played, exponentially faded on every UI tick.
-    note_trail: [f32; NOTE_COUNT],
-    /// Time constant of that fade, in seconds (`--fade-ms`).
-    fade_tau: f32,
-    last_tick: Instant,
 }
 
 impl Dashboard {
@@ -112,7 +105,6 @@ impl Dashboard {
         control: Sender<UiCommand>,
         instrument: InstrumentConfig,
         ramp: Ramp,
-        fade_ms: f32,
     ) -> Self {
         Dashboard {
             shared,
@@ -129,21 +121,12 @@ impl Dashboard {
             show_labels: false,
             show_feed: false,
             show_ascii: false,
-            note_trail: [0.0; NOTE_COUNT],
-            fade_tau: fade_ms.max(1.0) / 1000.0,
-            last_tick: Instant::now(),
         }
     }
 
     fn update(&mut self, message: Message) {
         match message {
             Message::Tick => {
-                // Fade the keyboard trail against the wall clock, so the decay
-                // rate is independent of the tick interval.
-                let dt = self.last_tick.elapsed().as_secs_f32();
-                self.last_tick = Instant::now();
-                fade_trail(&mut self.note_trail, dt, self.fade_tau);
-
                 if let Ok(mut shared) = self.shared.lock() {
                     // Only build an image handle when the feed is actually shown:
                     // a 640x480 RGBA frame is 1.2 MB per tick otherwise. Take
@@ -163,10 +146,6 @@ impl Dashboard {
                 }
                 push(&mut self.volume_history, self.metrics.volume);
                 push(&mut self.confidence_history, self.metrics.confidence);
-                // Lighting a key restarts its fade from full brightness.
-                if let Some(note) = self.metrics.note {
-                    self.note_trail[note_index(note)] = 1.0;
-                }
             }
             Message::ToggleRun => {
                 self.active = !self.active;
@@ -237,7 +216,7 @@ impl Dashboard {
                 self.metrics.layout.rows,
                 self.metrics.layout.cols,
                 self.metrics.waveform,
-                self.fade_tau * 1000.0,
+                self.metrics.fade_ms,
                 if self.show_ascii {
                     format!(
                         " · ascii {} {}x{}",
@@ -294,7 +273,7 @@ impl Dashboard {
                 show_labels: self.show_labels,
                 detected: self.metrics.detected,
                 lost_ms: self.metrics.lost_ms,
-                note_trail: self.note_trail,
+                trail: self.metrics.trail.clone(),
                 layout: self.metrics.layout.clone(),
                 current_note: self.metrics.note,
                 volume: self.metrics.volume,
@@ -433,18 +412,9 @@ pub fn run(
     control: Sender<UiCommand>,
     instrument: InstrumentConfig,
     ramp: Ramp,
-    fade_ms: f32,
 ) -> iced::Result {
     iced::application(
-        move || {
-            Dashboard::new(
-                shared.clone(),
-                control.clone(),
-                instrument.clone(),
-                ramp,
-                fade_ms,
-            )
-        },
+        move || Dashboard::new(shared.clone(), control.clone(), instrument.clone(), ramp),
         Dashboard::update,
         Dashboard::view,
     )

@@ -384,6 +384,7 @@ fn main() -> Result<()> {
         scale: scale_name,
         root: root_name,
         layout,
+        fade_ms: args.fade_ms,
         ..FrameMetrics::default()
     }));
 
@@ -411,6 +412,7 @@ fn main() -> Result<()> {
         instrument: instrument.clone(),
         ascii_cols: args.ascii_cols,
         ascii_dump: args.ascii_dump.clone(),
+        fade_ms: args.fade_ms,
         // With no window there is no stage to look at, so `--ascii` means the
         // art goes to stdout instead.
         ascii_stdout: args.no_ui && args.ascii,
@@ -434,7 +436,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let ui_result = dashboard::run(shared, control_tx, instrument, ascii_ramp, args.fade_ms);
+    let ui_result = dashboard::run(shared, control_tx, instrument, ascii_ramp);
 
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();

@@ -16,7 +16,7 @@ use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::grid::GridLayout;
 use crate::core::Landmark;
-use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
+use crate::core::{NOTE_LOW, NOTE_MARGIN};
 use crate::dashboard::metrics::{note_for_frequency, note_frequency, note_index, note_name};
 use crate::presentation::ascii::{AsciiGrid, Ramp};
 
@@ -157,11 +157,7 @@ fn cell_grid(grid: &AsciiGrid, bounds: Rectangle) -> Option<(usize, usize, f32)>
 /// another cross-fades over the trail's time constant instead of snapping.
 /// With nothing sounding (or in theremin mode, where there is no note) it falls
 /// back to the nearest key the frequency implies, and finally to neutral grey.
-fn backdrop_colour(
-    trail: &[f32; NOTE_COUNT],
-    current: Option<u8>,
-    frequency: Option<f32>,
-) -> Color {
+fn backdrop_colour(trail: &[f32], current: Option<u8>, frequency: Option<f32>) -> Color {
     let (mut r, mut g, mut b, mut weight) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for (index, &level) in trail.iter().enumerate() {
         if level < TRAIL_EPS {
@@ -298,7 +294,7 @@ fn keyboard(
     frame: &mut Frame,
     stage: Rectangle,
     layout: &GridLayout,
-    trail: &[f32; NOTE_COUNT],
+    trail: &[f32],
     current: Option<u8>,
     volume: f32,
 ) {
@@ -464,8 +460,9 @@ pub struct Skeleton {
     pub detected: bool,
     /// Milliseconds since the tracker last saw a hand.
     pub lost_ms: u64,
-    /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW.
-    pub note_trail: [f32; NOTE_COUNT],
+    /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW, as
+    /// published by the frame loop.
+    pub trail: Vec<f32>,
     /// The degree x octave keyboard the hand plays on.
     pub layout: GridLayout,
     pub current_note: Option<u8>,
@@ -495,14 +492,14 @@ impl<Message> Program<Message> for Skeleton {
         };
         backdrop(&mut frame, bounds, stage);
         if self.show_ascii {
-            let colour = backdrop_colour(&self.note_trail, self.current_note, self.frequency);
+            let colour = backdrop_colour(&self.trail, self.current_note, self.frequency);
             ascii_art(&mut frame, bounds, &self.ascii, self.ramp, colour);
         }
         keyboard(
             &mut frame,
             stage,
             &self.layout,
-            &self.note_trail,
+            &self.trail,
             self.current_note,
             self.volume,
         );
@@ -645,6 +642,7 @@ impl<Message> Program<Message> for Skeleton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NOTE_COUNT;
 
     fn grid(cols: usize, rows: usize) -> AsciiGrid {
         AsciiGrid {
@@ -707,14 +705,15 @@ mod tests {
 
     #[test]
     fn the_backdrop_takes_the_colour_of_the_held_key() {
-        let mut trail = [0.0; NOTE_COUNT];
+        use crate::core::NOTE_COUNT;
+        let mut trail = vec![0.0; NOTE_COUNT];
         trail[note_index(60)] = 1.0; // C4 -> pitch class C
         assert_eq!(backdrop_colour(&trail, Some(60), None), PITCH_COLORS[0]);
     }
 
     #[test]
     fn a_fading_trail_cross_fades_towards_the_held_key() {
-        let mut trail = [0.0; NOTE_COUNT];
+        let mut trail = vec![0.0; NOTE_COUNT];
         trail[note_index(64)] = 1.0; // E, still held
         trail[note_index(60)] = 0.1; // C, nearly gone
         let colour = backdrop_colour(&trail, Some(64), None);
@@ -733,7 +732,7 @@ mod tests {
 
     #[test]
     fn a_silent_backdrop_uses_the_theremin_key_or_neutral_grey() {
-        let trail = [0.0; NOTE_COUNT];
+        let trail = vec![0.0; NOTE_COUNT];
         // 440 Hz is A4, pitch class A.
         assert_eq!(backdrop_colour(&trail, None, Some(440.0)), PITCH_COLORS[9]);
         assert_eq!(backdrop_colour(&trail, None, None), MUTED);

@@ -27,7 +27,9 @@ use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
 use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Landmark, Sink};
-use crate::dashboard::metrics::{cell_index, note_name, EventLogEntry, FrameMetrics, LOG_CAPACITY};
+use crate::dashboard::metrics::{
+    cell_index, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, LOG_CAPACITY,
+};
 use crate::gesture::{HandEstimator, HandState, Strategy};
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
 use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
@@ -123,6 +125,9 @@ pub struct Pipeline {
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
     gesture_active: bool,
+    /// The keyboard glow. Derived from the gesture, not from the window, so the
+    /// stage draws a fact about the run instead of maintaining its own history.
+    trail: KeyboardTrail,
     metrics: FrameMetrics,
 
     // --- run state -------------------------------------------------------------
@@ -197,6 +202,8 @@ pub struct PipelineConfig {
     pub ascii_cols: usize,
     pub ascii_dump: Option<String>,
     pub ascii_stdout: bool,
+    /// How long a released key keeps glowing on the stage.
+    pub fade_ms: f32,
     pub max_frames: Option<u32>,
     pub debug: bool,
     pub emit_frames: bool,
@@ -218,6 +225,7 @@ impl Pipeline {
             ascii_cols,
             ascii_dump,
             ascii_stdout,
+            fade_ms,
             max_frames,
             debug,
             emit_frames,
@@ -234,6 +242,7 @@ impl Pipeline {
                 scale: snapshot.scale.clone(),
                 root: snapshot.root.clone(),
                 layout: snapshot.layout.clone(),
+                fade_ms: snapshot.fade_ms,
                 ..FrameMetrics::default()
             })
             .unwrap_or_default();
@@ -256,6 +265,7 @@ impl Pipeline {
             metrics: context,
             estimator: HandEstimator::new(),
             gesture_active: false,
+            trail: KeyboardTrail::new(fade_ms),
             counters: Arc::new(CaptureCounters::default()),
             run: RunFlags {
                 max_frames,
@@ -582,6 +592,8 @@ impl Pipeline {
         self.metrics.hand_box = None;
         self.metrics.tip_x = 0.0;
         self.metrics.tip_y = 0.0;
+        self.trail.clear();
+        self.metrics.trail.clear();
         self.publish();
     }
 
@@ -645,6 +657,8 @@ impl Pipeline {
         self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
         self.update_tracking(&state);
         self.dispatch_gesture(&state);
+        // The keyboard glow follows the gesture, on the frame loop's clock.
+        self.update_trail();
         // Last, and off this thread: nothing a human looks at can delay a frame.
         self.hand_over(frame, &state, &settings);
 
@@ -738,6 +752,17 @@ impl Pipeline {
         self.metrics.extension = state.geometry.extension;
         self.metrics.tilt_deg = state.geometry.tilt_deg;
         self.metrics.palm_length = state.geometry.palm_length;
+    }
+
+    /// Fade the keyboard trail and light the key that is sounding. The trail is
+    /// part of the snapshot rather than the window, so pausing the run also puts
+    /// the keyboard dark and a resumed run starts from a clean grid.
+    fn update_trail(&mut self) {
+        self.trail.advance(Instant::now(), self.metrics.note);
+        // Reuse the snapshot's buffer instead of allocating 49 floats a frame.
+        self.metrics.trail.clear();
+        self.metrics.trail.extend(self.trail.levels());
+        self.metrics.fade_ms = self.trail.fade_ms();
     }
 
     /// Gesture -> metrics -> event bus.
@@ -984,6 +1009,7 @@ mod tests {
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
+    use crate::dashboard::metrics::{note_index, DEFAULT_FADE_MS};
     use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
 
@@ -1129,6 +1155,7 @@ mod tests {
             ascii_cols,
             ascii_dump: None,
             ascii_stdout: false,
+            fade_ms: DEFAULT_FADE_MS,
             max_frames,
             debug: false,
             emit_frames,
@@ -1371,6 +1398,24 @@ mod tests {
         assert_eq!(snapshot.layout.len(), 15);
         assert_eq!(snapshot.mode, "Signal");
         assert!(snapshot.detected, "the mock hand should register");
+    }
+
+    #[test]
+    fn the_keyboard_trail_is_part_of_the_snapshot_not_the_window() {
+        let harness = test_pipeline(Box::new(AlwaysOn), Some(5));
+        let mut pipeline = harness.pipeline;
+        pipeline.run(&Arc::new(AtomicBool::new(true))).unwrap();
+
+        // The held key is lit, and the glow is published so the stage needs no
+        // state of its own.
+        assert_eq!(pipeline.metrics.trail[note_index(60)], 1.0);
+        assert_eq!(pipeline.metrics.fade_ms, DEFAULT_FADE_MS);
+
+        pipeline.pause();
+        assert!(
+            pipeline.metrics.trail.iter().all(|&level| level == 0.0),
+            "a stopped player has no glowing key"
+        );
     }
 
     #[test]

@@ -5,10 +5,11 @@
 //! into the tracker or the sinks.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::core::grid::GridLayout;
 use crate::core::telemetry::StageProfile;
-use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
+use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
 use crate::presentation::ascii::AsciiGrid;
 
 /// Maximum number of events kept in the on-screen log.
@@ -55,6 +56,68 @@ pub fn fade_trail(trail: &mut [f32], dt_secs: f32, tau_secs: f32) {
     }
 }
 
+/// The keyboard's fading glow. Owned by the frame loop, published in the
+/// snapshot, and drawn by the stage without any UI-side state of its own.
+#[derive(Debug, Clone)]
+pub struct KeyboardTrail {
+    /// Decay time constant in seconds (`--fade-ms`).
+    tau_secs: f32,
+    /// Wall clock of the last decay step.
+    last: Instant,
+    /// Per-semitone brightness, index = note - NOTE_LOW.
+    levels: Vec<f32>,
+}
+
+impl Default for KeyboardTrail {
+    fn default() -> Self {
+        KeyboardTrail {
+            tau_secs: DEFAULT_FADE_MS / 1000.0,
+            last: Instant::now(),
+            levels: vec![0.0; NOTE_COUNT],
+        }
+    }
+}
+
+impl KeyboardTrail {
+    pub fn new(fade_ms: f32) -> Self {
+        KeyboardTrail {
+            tau_secs: fade_ms.max(1.0) / 1000.0,
+            ..KeyboardTrail::default()
+        }
+    }
+
+    /// Fade everything by the time since the last frame, then light the key that
+    /// is being played. Called once per frame by the pipeline, so the trail is a
+    /// fact about the run rather than a fact about the window.
+    pub fn advance(&mut self, now: Instant, playing: Option<u8>) {
+        // `Instant` cannot go backwards: a clock jump or a re-used trail would
+        // otherwise hand `exp()` a negative age and brighten every key.
+        let dt = if now > self.last {
+            now.duration_since(self.last).as_secs_f32()
+        } else {
+            0.0
+        };
+        self.last = now;
+        fade_trail(&mut self.levels, dt, self.tau_secs);
+        if let Some(note) = playing {
+            self.levels[note_index(note)] = 1.0;
+        }
+    }
+
+    /// Go silent: a stopped player has no key glowing.
+    pub fn clear(&mut self) {
+        self.levels.fill(0.0);
+    }
+
+    pub fn levels(&self) -> &[f32] {
+        &self.levels
+    }
+
+    pub fn fade_ms(&self) -> f32 {
+        self.tau_secs * 1000.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventLogEntry {
     pub uptime_ms: u64,
@@ -92,6 +155,11 @@ pub struct FrameMetrics {
     /// Published only while the `ascii` toggle is on (or a dump/terminal output
     /// is requested), at `--ascii-fps`.
     pub ascii: AsciiGrid,
+    /// Per-semitone keyboard brightness, index = note - NOTE_LOW. Computed by
+    /// the frame loop so the stage needs no state of its own.
+    pub trail: Vec<f32>,
+    /// The trail's decay time constant, in milliseconds, for the header readout.
+    pub fade_ms: f32,
 
     // --- gesture output ---
     pub note: Option<u8>,
@@ -149,6 +217,7 @@ pub fn note_name(midi: u8) -> String {
 mod tests {
     use super::*;
     use crate::core::NOTE_COUNT;
+    use std::time::Duration;
 
     #[test]
     fn middle_c_is_c4() {
@@ -187,6 +256,21 @@ mod tests {
         assert!(trail[note_index(60)] < 0.02);
         // Untouched cells stay at zero.
         assert_eq!(trail[note_index(36)], 0.0);
+    }
+
+    #[test]
+    fn a_held_key_stays_lit_while_the_trail_behind_it_fades() {
+        let mut trail = KeyboardTrail::new(450.0);
+        let start = Instant::now();
+        trail.advance(start, Some(60));
+        // A key that is still being played is always at full brightness...
+        assert_eq!(trail.levels()[note_index(60)], 1.0);
+        // ...but the note it replaced decays away over its own time constant.
+        trail.advance(start + Duration::from_millis(450), None);
+        let held_again = trail.levels()[note_index(60)];
+        assert!((held_again - 0.367879).abs() < 1e-3);
+        trail.clear();
+        assert!(trail.levels().iter().all(|&level| level == 0.0));
     }
 
     #[test]
