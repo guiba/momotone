@@ -10,13 +10,15 @@
 //! the optional feed image is drawn into exactly the same letterboxed
 //! rectangle, so the overlay always lines up with the image.
 
-use iced::widget::canvas::{Frame, Geometry, Image, Path, Program, Stroke, Text};
+use std::cell::RefCell;
+
+use iced::widget::canvas::{Cache, Frame, Geometry, Image, Path, Program, Stroke, Text};
 use iced::widget::image::Handle;
 use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::core::grid::GridLayout;
 use crate::core::Landmark;
-use crate::core::{NOTE_COUNT, NOTE_LOW, NOTE_MARGIN};
+use crate::core::{NOTE_LOW, NOTE_MARGIN};
 use crate::dashboard::metrics::{note_for_frequency, note_frequency, note_index, note_name};
 use crate::presentation::ascii::{AsciiGrid, Ramp};
 
@@ -102,6 +104,53 @@ const MIN_GLYPH_SIZE: f32 = 6.0;
 /// A row darker than this is skipped entirely - an empty row costs a text run.
 const ROW_SILENT: f32 = 0.02;
 
+/// The keyboard's playable band and the size of one cell, derived from the stage
+/// and the layout only. `NOTE_MARGIN` is inset on both axes so a cell lines up
+/// with the position the strategy reads - the lit cell is the one the hand is
+/// actually over. Because this is computed separately from the drawing, the
+/// tests can check that alignment without a window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Keyboard {
+    stage: Rectangle,
+    band: Rectangle,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+impl Keyboard {
+    fn new(stage: Rectangle, layout: &GridLayout) -> Option<Keyboard> {
+        if layout.is_empty() {
+            return None;
+        }
+        let inset_x = NOTE_MARGIN * stage.width;
+        let inset_y = NOTE_MARGIN * stage.height;
+        let band = Rectangle {
+            x: stage.x + inset_x,
+            y: stage.y + inset_y,
+            width: stage.width - 2.0 * inset_x,
+            height: stage.height - 2.0 * inset_y,
+        };
+        Some(Keyboard {
+            stage,
+            band,
+            cell_w: band.width / layout.cols as f32,
+            cell_h: band.height / layout.rows as f32,
+        })
+    }
+
+    /// The rectangle of cell `index` (row-major, top row first).
+    fn cell(&self, index: usize, layout: &GridLayout) -> Rectangle {
+        let row = index / layout.cols;
+        let col = index % layout.cols;
+        Rectangle {
+            x: self.band.x + self.cell_w * col as f32,
+            y: self.band.y + self.cell_h * row as f32,
+            width: self.cell_w,
+            height: self.cell_h,
+        }
+    }
+}
+
 fn tint(color: Color, alpha: f32) -> Color {
     Color {
         r: color.r,
@@ -157,11 +206,7 @@ fn cell_grid(grid: &AsciiGrid, bounds: Rectangle) -> Option<(usize, usize, f32)>
 /// another cross-fades over the trail's time constant instead of snapping.
 /// With nothing sounding (or in theremin mode, where there is no note) it falls
 /// back to the nearest key the frequency implies, and finally to neutral grey.
-fn backdrop_colour(
-    trail: &[f32; NOTE_COUNT],
-    current: Option<u8>,
-    frequency: Option<f32>,
-) -> Color {
+fn backdrop_colour(trail: &[f32], current: Option<u8>, frequency: Option<f32>) -> Color {
     let (mut r, mut g, mut b, mut weight) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for (index, &level) in trail.iter().enumerate() {
         if level < TRAIL_EPS {
@@ -289,64 +334,39 @@ fn backdrop(frame: &mut Frame, bounds: Rectangle, stage: Rectangle) {
     );
 }
 
-/// The playable range as a degree x octave grid: columns are scale degrees (low
-/// to high, left to right), rows are octaves (top row is the highest). The band
-/// is inset by `NOTE_MARGIN` on both axes so a cell lines up with the position
-/// the strategy reads - the lit cell is the one the hand is actually over.
-/// `trail[note - NOTE_LOW]` is that note's current brightness (already faded).
-fn keyboard(
-    frame: &mut Frame,
-    stage: Rectangle,
-    layout: &GridLayout,
-    trail: &[f32; NOTE_COUNT],
-    current: Option<u8>,
-    volume: f32,
-) {
-    if layout.is_empty() {
-        return;
-    }
-
-    let inset_x = NOTE_MARGIN * stage.width;
-    let inset_y = NOTE_MARGIN * stage.height;
-    let band_x = stage.x + inset_x;
-    let band_y = stage.y + inset_y;
-    let band_w = stage.width - 2.0 * inset_x;
-    let band_h = stage.height - 2.0 * inset_y;
-    let cell_w = band_w / layout.cols as f32;
-    let cell_h = band_h / layout.rows as f32;
+/// The part of the keyboard that never changes between frames: the pitch-class
+/// tint of every cell, the separators, the octave labels and - when the cells
+/// are big enough - the note names. Cached, so it is built once per window size
+/// and instrument rather than once per frame.
+fn keyboard_grid(frame: &mut Frame, keyboard: &Keyboard, layout: &GridLayout) {
+    let band = keyboard.band;
 
     // 1. Every cell, faintly tinted with its pitch class. Row 0 is the highest
     // octave, so the keyboard reads upward like a staff.
-    for row in 0..layout.rows {
-        for col in 0..layout.cols {
-            let note = layout.notes[row * layout.cols + col];
-            frame.fill(
-                &Path::rectangle(
-                    Point::new(band_x + cell_w * col as f32, band_y + cell_h * row as f32),
-                    Size::new(cell_w, cell_h),
-                ),
-                tint(pitch_color(note), 0.10),
-            );
-        }
+    for (index, &note) in layout.notes.iter().enumerate() {
+        let cell = keyboard.cell(index, layout);
+        frame.fill(
+            &Path::rectangle(
+                Point::new(cell.x, cell.y),
+                Size::new(cell.width, cell.height),
+            ),
+            tint(pitch_color(note), 0.10),
+        );
     }
 
     // 2. Cell separators. Octave rows get the heavier line so the ladder of
     // octaves is visible at a glance.
     for col in 0..=layout.cols {
+        let x = band.x + keyboard.cell_w * col as f32;
         frame.stroke(
-            &Path::line(
-                Point::new(band_x + cell_w * col as f32, band_y),
-                Point::new(band_x + cell_w * col as f32, band_y + band_h),
-            ),
+            &Path::line(Point::new(x, band.y), Point::new(x, band.y + band.height)),
             Stroke::default().with_color(GRID).with_width(1.0),
         );
     }
     for row in 0..=layout.rows {
+        let y = band.y + keyboard.cell_h * row as f32;
         frame.stroke(
-            &Path::line(
-                Point::new(band_x, band_y + cell_h * row as f32),
-                Point::new(band_x + band_w, band_y + cell_h * row as f32),
-            ),
+            &Path::line(Point::new(band.x, y), Point::new(band.x + band.width, y)),
             Stroke::default().with_color(GRID_MAJOR).with_width(1.5),
         );
     }
@@ -356,92 +376,125 @@ fn keyboard(
         frame.fill_text(Text {
             content: note_name(layout.root + layout.octaves[row] * 12),
             position: Point::new(
-                stage.x + 8.0,
-                band_y + cell_h * row as f32 + cell_h / 2.0 - 6.0,
+                keyboard.stage.x + 8.0,
+                band.y + keyboard.cell_h * row as f32 + keyboard.cell_h / 2.0 - 6.0,
             ),
-            max_width: stage.width,
+            max_width: keyboard.stage.width,
             color: MUTED,
             size: 11.0.into(),
             ..Default::default()
         });
     }
 
-    // 3. The trail: cells you have just played, glowing and fading out.
-    for row in 0..layout.rows {
-        for col in 0..layout.cols {
-            let note = layout.notes[row * layout.cols + col];
-            let level = trail[note_index(note)];
-            if level < TRAIL_EPS {
-                continue;
-            }
-            let x = band_x + cell_w * col as f32;
-            let y = band_y + cell_h * row as f32;
-            let color = pitch_color(note);
+    // 4. Note names inside the cells, when the cells are big enough to hold them.
+    if keyboard.cell_w > 34.0 && keyboard.cell_h > 20.0 {
+        for (index, &note) in layout.notes.iter().enumerate() {
+            let cell = keyboard.cell(index, layout);
+            frame.fill_text(Text {
+                content: note_name(note),
+                position: Point::new(cell.x + 6.0, cell.y + 6.0),
+                max_width: keyboard.stage.width,
+                color: MUTED,
+                size: 11.0.into(),
+                ..Default::default()
+            });
+        }
+    }
+}
 
-            frame.fill(
-                &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
-                tint(color, 0.42 * level),
-            );
-            // Bright cap at the top of every lit cell, so the fade reads even when
-            // the cell itself is nearly transparent.
-            frame.fill(
-                &Path::rectangle(Point::new(x, y), Size::new(cell_w, 5.0)),
-                tint(color, 0.85 * level),
-            );
+/// The part that changes every frame: the fading trail and the cell being played.
+/// `trail[note - NOTE_LOW]` is that note's current brightness (already faded).
+fn keyboard_trail(
+    frame: &mut Frame,
+    keyboard: &Keyboard,
+    layout: &GridLayout,
+    trail: &[f32],
+    current: Option<u8>,
+    volume: f32,
+) {
+    // 1. The trail: cells you have just played, glowing and fading out.
+    for (index, &note) in layout.notes.iter().enumerate() {
+        let level = trail[note_index(note)];
+        if level < TRAIL_EPS {
+            continue;
+        }
+        let cell = keyboard.cell(index, layout);
+        let color = pitch_color(note);
 
-            // The held cell additionally carries a loudness bar rising from its floor.
-            if current == Some(note) {
-                let bar = cell_h * volume.clamp(0.0, 1.0);
-                frame.fill(
-                    &Path::rectangle(Point::new(x, y + cell_h - bar), Size::new(cell_w, bar)),
-                    tint(color, 0.55),
-                );
-            }
+        frame.fill(
+            &Path::rectangle(
+                Point::new(cell.x, cell.y),
+                Size::new(cell.width, cell.height),
+            ),
+            tint(color, 0.42 * level),
+        );
+        // Bright cap at the top of every lit cell, so the fade reads even when the
+        // cell itself is nearly transparent.
+        frame.fill(
+            &Path::rectangle(Point::new(cell.x, cell.y), Size::new(cell.width, 5.0)),
+            tint(color, 0.85 * level),
+        );
+
+        // The held cell additionally carries a loudness bar rising from its floor.
+        if current == Some(note) {
+            let bar = cell.height * volume.clamp(0.0, 1.0);
+            frame.fill(
+                &Path::rectangle(
+                    Point::new(cell.x, cell.y + cell.height - bar),
+                    Size::new(cell.width, bar),
+                ),
+                tint(color, 0.55),
+            );
         }
     }
 
-    // 4. Outline the cell being played and label it.
+    // 2. Outline the cell being played and label it.
     if let Some(note) = current {
-        let cell = layout.notes.iter().position(|&n| n == note).unwrap_or(0);
-        let row = cell / layout.cols;
-        let col = cell % layout.cols;
-        let x = band_x + cell_w * col as f32;
-        let y = band_y + cell_h * row as f32;
+        let index = layout.notes.iter().position(|&n| n == note).unwrap_or(0);
+        let cell = keyboard.cell(index, layout);
         let color = pitch_color(note);
         frame.stroke(
-            &Path::rectangle(Point::new(x, y), Size::new(cell_w, cell_h)),
+            &Path::rectangle(
+                Point::new(cell.x, cell.y),
+                Size::new(cell.width, cell.height),
+            ),
             Stroke::default().with_color(color).with_width(2.0),
         );
         frame.fill_text(Text {
             content: format!("{}  {:.0} Hz", note_name(note), note_frequency(note)),
-            position: Point::new(x, y - 16.0),
-            max_width: stage.width,
+            position: Point::new(cell.x, cell.y - 16.0),
+            max_width: keyboard.stage.width,
             color,
             size: 13.0.into(),
             ..Default::default()
         });
     }
+}
+/// Geometry that is identical from frame to frame: the gradient backdrop and the
+/// keyboard's static grid. iced's canvas `Cache` only re-runs the closure when the
+/// layer's size changes, so the two keys below are what tell us when an *input*
+/// changed - the camera resolution (which moves the letterboxed stage) or the
+/// instrument (which changes the grid).
+pub struct StageCache {
+    backdrop: Cache,
+    grid: Cache,
+    // `draw` takes the state immutably, so the invalidation keys live behind a
+    // RefCell - the caches themselves already have interior mutability.
+    backdrop_key: RefCell<(usize, usize)>,
+    grid_key: RefCell<(f32, f32, Vec<u8>)>,
+}
 
-    // 5. Note names inside the cells, when the cells are big enough to hold them.
-    if cell_w > 34.0 && cell_h > 20.0 {
-        for row in 0..layout.rows {
-            for col in 0..layout.cols {
-                let note = layout.notes[row * layout.cols + col];
-                frame.fill_text(Text {
-                    content: note_name(note),
-                    position: Point::new(
-                        band_x + cell_w * col as f32 + 6.0,
-                        band_y + cell_h * row as f32 + 6.0,
-                    ),
-                    max_width: stage.width,
-                    color: MUTED,
-                    size: 11.0.into(),
-                    ..Default::default()
-                });
-            }
+impl Default for StageCache {
+    fn default() -> Self {
+        StageCache {
+            backdrop: Cache::new(),
+            grid: Cache::new(),
+            backdrop_key: RefCell::new((0, 0)),
+            grid_key: RefCell::new((0.0, 0.0, Vec::new())),
         }
     }
 }
+
 pub struct Skeleton {
     /// The camera frame as RGBA pixels. Only drawn when `show_feed` is true.
     pub image: Option<Handle>,
@@ -464,8 +517,9 @@ pub struct Skeleton {
     pub detected: bool,
     /// Milliseconds since the tracker last saw a hand.
     pub lost_ms: u64,
-    /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW.
-    pub note_trail: [f32; NOTE_COUNT],
+    /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW, as
+    /// published by the frame loop.
+    pub trail: Vec<f32>,
     /// The degree x octave keyboard the hand plays on.
     pub layout: GridLayout,
     pub current_note: Option<u8>,
@@ -473,17 +527,16 @@ pub struct Skeleton {
 }
 
 impl<Message> Program<Message> for Skeleton {
-    type State = ();
+    type State = StageCache;
 
     fn draw(
         &self,
-        _state: &(),
+        state: &StageCache,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry<Renderer>> {
-        let mut frame = Frame::new(renderer, bounds.size());
         let map = Mapping::new(self.frame_size, bounds);
 
         // The panel itself, so the letterbox bars are part of the stage.
@@ -493,19 +546,55 @@ impl<Message> Program<Message> for Skeleton {
             width: bounds.width - 2.0 * map.offset_x,
             height: bounds.height - 2.0 * map.offset_y,
         };
-        backdrop(&mut frame, bounds, stage);
-        if self.show_ascii {
-            let colour = backdrop_colour(&self.note_trail, self.current_note, self.frequency);
-            ascii_art(&mut frame, bounds, &self.ascii, self.ramp, colour);
+
+        // Layer 1: the backdrop, rebuilt only when the window or the capture
+        // resolution changes the letterbox.
+        let backdrop_key = (self.frame_size.0, self.frame_size.1);
+        if *state.backdrop_key.borrow() != backdrop_key {
+            state.backdrop.clear();
+            *state.backdrop_key.borrow_mut() = backdrop_key;
         }
-        keyboard(
-            &mut frame,
-            stage,
-            &self.layout,
-            &self.note_trail,
-            self.current_note,
-            self.volume,
-        );
+        let mut geometry = vec![state.backdrop.draw(renderer, bounds.size(), |frame| {
+            backdrop(frame, bounds, stage)
+        })];
+
+        // Layer 2: the camera rendered as block glyphs, tinted with the note that
+        // is sounding. The grid itself is produced by the presenter thread; this
+        // is only the text runs.
+        if self.show_ascii {
+            let colour = backdrop_colour(&self.trail, self.current_note, self.frequency);
+            let mut layer = Frame::new(renderer, bounds.size());
+            ascii_art(&mut layer, bounds, &self.ascii, self.ramp, colour);
+            geometry.push(layer.into_geometry());
+        }
+
+        let keyboard = Keyboard::new(stage, &self.layout);
+
+        // Layer 3: the instrument - cells, separators, octave and note labels.
+        if let Some(keyboard) = keyboard {
+            let grid_key = (stage.width, stage.height, self.layout.notes.clone());
+            if *state.grid_key.borrow() != grid_key {
+                state.grid.clear();
+                *state.grid_key.borrow_mut() = grid_key;
+            }
+            geometry.push(state.grid.draw_with_bounds(renderer, stage, |frame| {
+                keyboard_grid(frame, &keyboard, &self.layout)
+            }));
+        }
+
+        // Layer 4: everything that moves - the trail, the play head, the feed and
+        // the hand.
+        let mut frame = Frame::new(renderer, bounds.size());
+        if let Some(keyboard) = keyboard {
+            keyboard_trail(
+                &mut frame,
+                &keyboard,
+                &self.layout,
+                &self.trail,
+                self.current_note,
+                self.volume,
+            );
+        }
 
         // Play head: the note comes from the x position of the index tip, so a
         // vertical line through that fingertip ties the gesture to the key.
@@ -552,7 +641,8 @@ impl<Message> Program<Message> for Skeleton {
                 size: 11.0.into(),
                 ..Default::default()
             });
-            return vec![frame.into_geometry()];
+            geometry.push(frame.into_geometry());
+            return geometry;
         }
 
         // Detector box, when asked for.
@@ -645,12 +735,89 @@ impl<Message> Program<Message> for Skeleton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::NOTE_COUNT;
+    use crate::gesture::band_position;
 
     fn grid(cols: usize, rows: usize) -> AsciiGrid {
         AsciiGrid {
             cols,
             rows,
             cells: vec![0u8; cols * rows],
+        }
+    }
+
+    #[test]
+    fn the_band_the_canvas_draws_is_the_band_the_strategy_reads() {
+        let stage = Rectangle {
+            x: 12.0,
+            y: 30.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        let layout = GridLayout::new(
+            0,
+            &crate::core::scale::preset("major pentatonic").unwrap(),
+            3,
+        );
+        let keyboard = Keyboard::new(stage, &layout).unwrap();
+        let band = keyboard.band;
+
+        assert!((band.x - (stage.x + NOTE_MARGIN * stage.width)).abs() < 1e-6);
+        assert!((band.y - (stage.y + NOTE_MARGIN * stage.height)).abs() < 1e-6);
+        assert!((band.width - stage.width * (1.0 - 2.0 * NOTE_MARGIN)).abs() < 1e-6);
+        assert!((band.height - stage.height * (1.0 - 2.0 * NOTE_MARGIN)).abs() < 1e-6);
+        // An empty layout draws nothing rather than dividing by zero.
+        assert!(Keyboard::new(stage, &GridLayout::default()).is_none());
+    }
+
+    #[test]
+    fn the_cell_that_lights_is_the_cell_the_fingertip_is_over() {
+        // A 640x480 frame filling the panel, so frame pixels and stage pixels match.
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        let map = Mapping::new((640, 480), bounds);
+        let stage = Rectangle {
+            x: map.offset_x,
+            y: map.offset_y,
+            width: bounds.width - 2.0 * map.offset_x,
+            height: bounds.height - 2.0 * map.offset_y,
+        };
+        let layout = GridLayout::new(
+            0,
+            &crate::core::scale::preset("major pentatonic").unwrap(),
+            3,
+        );
+        let keyboard = Keyboard::new(stage, &layout).unwrap();
+
+        // Sample inside the playable band; outside it the strategy clamps to the
+        // nearest cell, so the tip is no longer inside the cell it plays.
+        for x in (64..=576).step_by(32) {
+            for y in (48..=432).step_by(24) {
+                // What the strategy plays at this fingertip...
+                let (nx, ny) = band_position(x as f32, y as f32, (640, 480));
+                let index = layout.cell_at(nx, ny);
+                // ...must be the cell the stage glows.
+                let cell = keyboard.cell(index, &layout);
+                let tip = map.point(&Landmark {
+                    x: x as f32,
+                    y: y as f32,
+                    z: 0.0,
+                });
+                assert!(
+                    cell.x - 1e-3 <= tip.x && tip.x <= cell.x + cell.width + 1e-3,
+                    "({x},{y}) played cell {index} but the tip drew at {}",
+                    tip.x
+                );
+                assert!(
+                    cell.y - 1e-3 <= tip.y && tip.y <= cell.y + cell.height + 1e-3,
+                    "({x},{y}) played cell {index} but the tip drew at {}",
+                    tip.y
+                );
+            }
         }
     }
 
@@ -707,14 +874,15 @@ mod tests {
 
     #[test]
     fn the_backdrop_takes_the_colour_of_the_held_key() {
-        let mut trail = [0.0; NOTE_COUNT];
+        use crate::core::NOTE_COUNT;
+        let mut trail = vec![0.0; NOTE_COUNT];
         trail[note_index(60)] = 1.0; // C4 -> pitch class C
         assert_eq!(backdrop_colour(&trail, Some(60), None), PITCH_COLORS[0]);
     }
 
     #[test]
     fn a_fading_trail_cross_fades_towards_the_held_key() {
-        let mut trail = [0.0; NOTE_COUNT];
+        let mut trail = vec![0.0; NOTE_COUNT];
         trail[note_index(64)] = 1.0; // E, still held
         trail[note_index(60)] = 0.1; // C, nearly gone
         let colour = backdrop_colour(&trail, Some(64), None);
@@ -733,7 +901,7 @@ mod tests {
 
     #[test]
     fn a_silent_backdrop_uses_the_theremin_key_or_neutral_grey() {
-        let trail = [0.0; NOTE_COUNT];
+        let trail = vec![0.0; NOTE_COUNT];
         // 440 Hz is A4, pitch class A.
         assert_eq!(backdrop_colour(&trail, None, Some(440.0)), PITCH_COLORS[9]);
         assert_eq!(backdrop_colour(&trail, None, None), MUTED);

@@ -202,3 +202,43 @@ Two things to note:
 
 Still unmeasured: the audio callback's own block latency (cpal does not expose buffer size),
 and capture resolution (T1.8).
+---
+
+# After Phase 5 infrastructure (`phase4-snapshot`, same machine, release build)
+
+## Fixture clip run (`make fixture`, 300 frames, MediaPipe, no UI)
+
+```
+[Pipeline] 300 frames in 10.00 s: 29.7 fps, 33.34 ms/frame end to end (capture 0.23 ms, inference 12.82 ms, 0 frames dropped)
+[Stages] p50/p95/p99/max ms - capture 0.2/0.2/0.3/0.3  inference 11.1/13.8/14.3/14.6  camera->publish 0.0/0.0/0.0/0.0  dispatch->sink 0.0/0.0/0.0/0.0  (128 samples)
+```
+
+Two things this run establishes:
+
+1. **Decoding is not a cost.** A clip read from disk costs 0.2 ms per frame against the
+   camera's 33 ms. The pacing is a deadline clock inside `VideoSource`, deliberately kept
+   *outside* the timed capture region, so `capture_ms` measures the decode and not the wait.
+   A fixture run therefore reports the same 33.34 ms/frame cadence as a live camera without
+   pretending it did 33 ms of work.
+2. **Inference is identical on the fixture.** 11.1 ms p50 vs 10.2–11.7 ms live, same
+   detector/landmarker split, 0 dropped. The clip is a valid stand-in for a live run, which
+   is what makes the golden trace meaningful.
+
+## Golden trace (`make trace-check`)
+
+```
+[Trace] matches fixtures/clip_trace.json (120 frames)
+```
+
+Re-running the same clip against the recorded trace produces no diff, and the target exits
+non-zero when a frame differs. `--trace <path>` writes a trace, `--expect <path>` compares
+against one — so a change to the grid, the smoothing, the gate or the model that moves a
+note shows up as a readable frame-by-frame diff instead of a screenshot.
+
+## Tracker fixture test (`cargo test --release -- --include-ignored tracker_finds_the_hand_in_the_clip`)
+
+120 frames of the clip, 106 detections (88 %), every detection carrying all 21 landmarks,
+every reported box square with a palm centre inside the frame. This is the only test that
+loads the real ONNX graphs; it is `#[ignore]`d because it needs the gitignored assets.
+
+Tests: **146 passing** (6 ignored), gate green.

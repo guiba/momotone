@@ -5,10 +5,12 @@
 //! into the tracker or the sinks.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
+use crate::core::geometry::HandGeometry;
 use crate::core::grid::GridLayout;
 use crate::core::telemetry::StageProfile;
-use crate::core::{Landmark, NOTE_HIGH, NOTE_LOW};
+use crate::core::{Landmark, NOTE_COUNT, NOTE_HIGH, NOTE_LOW};
 use crate::presentation::ascii::AsciiGrid;
 
 /// Maximum number of events kept in the on-screen log.
@@ -55,17 +57,78 @@ pub fn fade_trail(trail: &mut [f32], dt_secs: f32, tau_secs: f32) {
     }
 }
 
+/// The keyboard's fading glow. Owned by the frame loop, published in the
+/// snapshot, and drawn by the stage without any UI-side state of its own.
+#[derive(Debug, Clone)]
+pub struct KeyboardTrail {
+    /// Decay time constant in seconds (`--fade-ms`).
+    tau_secs: f32,
+    /// Wall clock of the last decay step.
+    last: Instant,
+    /// Per-semitone brightness, index = note - NOTE_LOW.
+    levels: Vec<f32>,
+}
+
+impl Default for KeyboardTrail {
+    fn default() -> Self {
+        KeyboardTrail {
+            tau_secs: DEFAULT_FADE_MS / 1000.0,
+            last: Instant::now(),
+            levels: vec![0.0; NOTE_COUNT],
+        }
+    }
+}
+
+impl KeyboardTrail {
+    pub fn new(fade_ms: f32) -> Self {
+        KeyboardTrail {
+            tau_secs: fade_ms.max(1.0) / 1000.0,
+            ..KeyboardTrail::default()
+        }
+    }
+
+    /// Fade everything by the time since the last frame, then light the key that
+    /// is being played. Called once per frame by the pipeline, so the trail is a
+    /// fact about the run rather than a fact about the window.
+    pub fn advance(&mut self, now: Instant, playing: Option<u8>) {
+        // `Instant` cannot go backwards: a clock jump or a re-used trail would
+        // otherwise hand `exp()` a negative age and brighten every key.
+        let dt = if now > self.last {
+            now.duration_since(self.last).as_secs_f32()
+        } else {
+            0.0
+        };
+        self.last = now;
+        fade_trail(&mut self.levels, dt, self.tau_secs);
+        if let Some(note) = playing {
+            self.levels[note_index(note)] = 1.0;
+        }
+    }
+
+    /// Go silent: a stopped player has no key glowing.
+    pub fn clear(&mut self) {
+        self.levels.fill(0.0);
+    }
+
+    pub fn levels(&self) -> &[f32] {
+        &self.levels
+    }
+
+    pub fn fade_ms(&self) -> f32 {
+        self.tau_secs * 1000.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventLogEntry {
     pub uptime_ms: u64,
     pub detail: String,
 }
 
+/// Where the hand is and how steady it looks. Written by the frame loop out of the
+/// estimator's `HandState`.
 #[derive(Debug, Clone, Default)]
-pub struct FrameMetrics {
-    // --- tracking ---
-    /// True when the dashboard's Stop button has paused the pipeline.
-    pub paused: bool,
+pub struct HandView {
     pub detected: bool,
     pub confidence: f32,
     pub landmark_count: usize,
@@ -83,31 +146,28 @@ pub struct FrameMetrics {
     pub lost_ms: u64,
     /// Mean landmark displacement between consecutive frames, in pixels.
     pub jitter_px: f32,
+    /// Resolution-independent hand shape: spread, per-finger extension, tilt, palm.
+    pub geometry: HandGeometry,
+}
 
-    /// The camera frame as RGBA pixels, handed to the dashboard so it can draw
-    /// the video and the skeleton in the same canvas. Only produced when the UI
-    /// is running.
-    pub frame_pixels: Vec<u8>,
-    /// Quantised luminance grid behind the skeleton: the ASCII art backdrop.
-    /// Published only while the `ascii` toggle is on (or a dump/terminal output
-    /// is requested), at `--ascii-fps`.
-    pub ascii: AsciiGrid,
-
-    // --- gesture output ---
+/// What is sounding, including the keyboard glow. Owned by the frame loop.
+#[derive(Debug, Clone, Default)]
+pub struct SoundView {
     pub note: Option<u8>,
     pub volume: f32,
     pub frequency: Option<f32>,
-    pub spread: f32,
-    pub extension: [f32; 5],
-    pub tilt_deg: f32,
-    pub palm_length: f32,
+    /// Per-semitone keyboard brightness, index = note - NOTE_LOW.
+    pub trail: Vec<f32>,
+    /// The trail's decay time constant, in milliseconds, for the header readout.
+    pub fade_ms: f32,
+}
 
-    // --- performance ---
+/// How fast the run is going: instantaneous numbers plus the tail of each stage,
+/// refreshed once a second.
+#[derive(Debug, Clone, Default)]
+pub struct PerfView {
     pub fps: f32,
-    /// Tail behaviour of each stage, refreshed once a second. The instantaneous
-    /// fields below are the last frame; this is what a regression actually looks
-    /// like.
-    pub perf: StageProfile,
+    pub profile: StageProfile,
     /// Time inference spent on the frame that produced this snapshot.
     pub frame_ms: f64,
     /// Time the capture stage spent reading that frame from the camera.
@@ -121,8 +181,29 @@ pub struct FrameMetrics {
     pub captured: u64,
     pub dropped: u64,
     pub uptime_ms: u64,
+}
 
-    // --- context ---
+/// The picture the stage draws. Only the presenter thread writes the pixel and
+/// ASCII buffers, so refreshing the telemetry never wipes them.
+#[derive(Debug, Clone, Default)]
+pub struct SceneView {
+    /// The camera frame as RGBA pixels, handed to the dashboard so it can draw the
+    /// video and the skeleton in the same canvas. Only produced when the UI is
+    /// running.
+    pub pixels: Vec<u8>,
+    /// Quantised luminance grid behind the skeleton: the ASCII art backdrop.
+    /// Published only while the `ascii` toggle is on (or a dump/terminal output is
+    /// requested), at `--ascii-fps`.
+    pub ascii: AsciiGrid,
+    /// The degree x octave keyboard the hand plays on.
+    pub layout: GridLayout,
+}
+
+/// What the run *is*: mode, output, instrument, and the event log.
+#[derive(Debug, Clone, Default)]
+pub struct StatusView {
+    /// True when the dashboard's Stop button has paused the pipeline.
+    pub paused: bool,
     pub mode: String,
     pub sink: String,
     /// The scale the pitch is quantised to, e.g. "major pentatonic".
@@ -131,9 +212,18 @@ pub struct FrameMetrics {
     pub root: String,
     /// Timbre of the oscillator, e.g. "saw".
     pub waveform: String,
-    /// The degree x octave keyboard the hand plays on.
-    pub layout: GridLayout,
     pub log: VecDeque<EventLogEntry>,
+}
+
+/// The whole snapshot. Each field is a view with one owner, so the UI reads a
+/// named group instead of digging through a flat bag of thirty-odd fields.
+#[derive(Debug, Clone, Default)]
+pub struct FrameMetrics {
+    pub hand: HandView,
+    pub sound: SoundView,
+    pub perf: PerfView,
+    pub scene: SceneView,
+    pub status: StatusView,
 }
 
 const NOTE_NAMES: [&str; 12] = [
@@ -149,6 +239,7 @@ pub fn note_name(midi: u8) -> String {
 mod tests {
     use super::*;
     use crate::core::NOTE_COUNT;
+    use std::time::Duration;
 
     #[test]
     fn middle_c_is_c4() {
@@ -187,6 +278,21 @@ mod tests {
         assert!(trail[note_index(60)] < 0.02);
         // Untouched cells stay at zero.
         assert_eq!(trail[note_index(36)], 0.0);
+    }
+
+    #[test]
+    fn a_held_key_stays_lit_while_the_trail_behind_it_fades() {
+        let mut trail = KeyboardTrail::new(450.0);
+        let start = Instant::now();
+        trail.advance(start, Some(60));
+        // A key that is still being played is always at full brightness...
+        assert_eq!(trail.levels()[note_index(60)], 1.0);
+        // ...but the note it replaced decays away over its own time constant.
+        trail.advance(start + Duration::from_millis(450), None);
+        let held_again = trail.levels()[note_index(60)];
+        assert!((held_again - 0.367879).abs() < 1e-3);
+        trail.clear();
+        assert!(trail.levels().iter().all(|&level| level == 0.0));
     }
 
     #[test]

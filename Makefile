@@ -21,11 +21,15 @@ IMG        ?= output_frame.png
 OUT        ?= out.png
 CAMERA     ?= 0
 COLS       ?= 70
+CLIP       ?= fixtures/hand_clip.mp4
+TRACE      ?= fixtures/clip_trace.json
+CLIP_FRAMES ?= 120
 
 .DEFAULT_GOAL := help
 
 .PHONY: help verify lint check clippy clippy-fix fmt fmt-check test bench build run \
-        run-release mock ascii headless yolo image stats clean
+        run-release mock ascii headless yolo image fixture trace-check record trace \
+        stats clean
 
 ## The gate: run this before every commit.
 verify: check test fmt-check clippy
@@ -40,6 +44,7 @@ help:
 	@echo "  tests    test | bench"
 	@echo "  builds   build | check"
 	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
+	@echo "  fixture  fixture | trace-check | record | trace"
 	@echo "  misc     stats | clean"
 
 fmt:
@@ -98,6 +103,26 @@ yolo:
 ## Offline detection check on a still photo (no webcam needed).
 image:
 	$(CARGO) run --release -- --image $(IMG) --dump-frame $(OUT) --max-frames 1 --debug
+
+## --- fixture runs ---------------------------------------------------------
+
+## Record a 20 s webcam clip into fixtures/hand_clip.mp4. Needs ffmpeg and a
+## free camera; run once, then use `make trace-check` from then on.
+record:
+	ffmpeg -y -f avfoundation -framerate 30 -video_size 640x480 -i "0:none" -t 20 $(CLIP)
+
+## Run the recorded clip headlessly with per-stage timing.
+fixture:
+	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --debug
+
+## Re-run the clip and compare against the golden trace.
+trace-check:
+	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --expect $(TRACE)
+
+## Rewrite the golden trace from the current build. Only after an intentional
+## change, and read the diff it produces first.
+trace:
+	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --trace $(TRACE)
 
 ## --- misc ---------------------------------------------------------------
 

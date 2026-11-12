@@ -770,4 +770,75 @@ mod tests {
             );
         }
     }
+
+    /// The only test that runs the real ONNX graphs. It needs the model assets and
+    /// the recorded clip, so it is `#[ignore]`d rather than part of `make verify`:
+    /// `cargo test --release -- --include-ignored tracker_finds_the_hand_in_the_clip`.
+    #[test]
+    #[ignore]
+    fn tracker_finds_the_hand_in_the_clip() {
+        use crate::vision::video::VideoSource;
+
+        const CLIP: &str = "fixtures/hand_clip.mp4";
+        let mut source =
+            VideoSource::new(CLIP, false).expect("record a clip with `make record` first");
+        let mut tracker = HandTracker::mediapipe(
+            "assets/hand_detector.onnx",
+            "assets/hand_landmarks_detector.onnx",
+            "assets/anchors.csv",
+            0.6,
+            false,
+            true,
+            0,
+        )
+        .expect("the model assets must be present");
+
+        let mut seen = 0;
+        let mut frames = 0;
+        let mut landmark_counts = Vec::new();
+        let mut boxes = Vec::new();
+        for _ in 0..120 {
+            let frame = match source.read() {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            frames += 1;
+            let result = tracker.process_frame(&frame).unwrap();
+            if let Some(landmarks) = &result.hand_landmarks {
+                seen += 1;
+                landmark_counts.push(landmarks.len());
+                if let Some(b) = result.r#box {
+                    boxes.push((b, result.frame_size));
+                }
+            }
+        }
+
+        assert!(frames > 0, "the clip should yield frames");
+        // A hand is in front of the camera for most of the clip; a detector that
+        // finds it in a minority of frames is not working, however it scores.
+        assert!(seen * 2 > frames, "detected {seen} of {frames} frames");
+        for count in &landmark_counts {
+            assert_eq!(*count, 21, "a detection must carry all 21 landmarks");
+        }
+        // A box is (x, y, w, h) around the palm, reported unclamped so it can leave
+        // the frame when the hand is clipped by the edge. It must still be a real
+        // square whose centre is a plausible palm.
+        for ((x, y, w, h), (fw, fh)) in &boxes {
+            let (x, y, w, h) = (*x, *y, *w, *h);
+            let (fw, fh) = (*fw as f32, *fh as f32);
+            assert!(
+                w > 0.0 && h > 0.0,
+                "a box must have positive extent, got {w}x{h}"
+            );
+            assert!(near(w, h), "the hand box is square, got {w}x{h}");
+            let cx = x + w / 2.0;
+            let cy = y + h / 2.0;
+            assert!(cx > -w && cx < fw + w, "palm centre {cx} is off the frame");
+            assert!(cy > -h && cy < fh + h, "palm centre {cy} is off the frame");
+        }
+        println!(
+            "clip: {frames} frames, {seen} detections, first box {:?}",
+            boxes.first()
+        );
+    }
 }
