@@ -14,14 +14,15 @@ The rearchitecture is finished when all of these are true and measurable:
 
 | Target | Started at | Done when | Where we are |
 | :-- | :-- | :-- | :-- |
-| One frame path | `run` + `tick` + mock branch | one loop; `InputSource::Camera \| Video \| Synthetic` | ☑ one loop (`next_frame` → `advance`); ☐ no `InputSource` enum yet (nothing needs it until `--video` exists) |
+| One frame path | `run` + `tick` + mock branch | one loop; `FrameSource::Camera \| Video` | ☑ one loop (`next_frame` → `advance`); ☑ `FrameSource` enum now has its second member (`--video`) |
 | One source of truth for "what is sounding" | 4 places | an `InstrumentState` owned by the simulation layer; sinks translate it | ☑ `HandState` owns the hand, `Performance` owns what is sounding, `Voice` owns what is audible |
 | `unsafe impl` count | 2 | 0 | ◑ 1 left: `StreamWrapper` (`cpal::Stream` is `!Send`), documented |
 | File I/O / GPU upload on the inference thread | yes (`--ascii-dump`, RGBA conversion) | none; presenter thread owns it | ☑ moved to the presenter thread (Phase 4, T4.2) |
 | Locks in the audio callback | 1 per block | 0 (atomics / double buffer) | ☑ 0: the callback reads four atomics, the voice is owned by the closure |
 | Longest function | `Pipeline::advance`, 212 lines, CC 29 | no function > ~60 lines, CC ≤ 12 | ☑ `advance` is 27 lines calling six named stages |
-| `pipeline.rs` | 1707 lines | < 700 lines | ◑ 1668 lines; presentation (T4.3) is the next cut |
-| Untested presentation code | ~1.65k lines | stage view testable from a snapshot | ◑ the presenter is now pure-function testable; the iced stage is not |
+| `pipeline.rs` | 1707 lines | < 700 lines | ◑ 1905 lines total, **1099 excluding the test module**; the next cut is moving telemetry out |
+| Untested presentation code | ~1.65k lines | stage view testable from a snapshot | ◑ the presenter and the keyboard geometry are testable; the iced rail is not |
+| Reproducible runs | impossible (a webcam is not a fixture) | `--video clip.mp4` + `--expect trace.json` | ☑ both exist; `make trace-check` is a gate |
 | CI | none | fmt + clippy `-D warnings` + check + test green | ☑ `make verify`, green |
 | Latency | unmeasured; ~60–90 ms worst case | measured, documented, ≤ 50 ms target | ☑ measured, in `bench/baseline.md`; the loop is paced by the 33 ms camera read |
 
@@ -304,16 +305,41 @@ a snapshot.
 
 ---
 
-## 8. Phase 5 — Observability & test infrastructure
+## 8. Phase 5 — Observability & test infrastructure *(in progress: T5.2–T5.4 done)*
 
-| Task | Detail | Effort |
-| :-- | :-- | :-- |
-| T5.1 | `tracing` replacing `println!`/`eprintln!`; `--debug` = `tracing_subscriber` env filter | S |
-| T5.2 | `--video clip.mp4` source (from T2.3) so runs are reproducible | M |
-| T5.3 | Tracker fixture test: a 640×480 PNG with a hand → assert gold bbox ± tolerance and 21 landmarks within bounds | M |
-| T5.4 | Golden trace: `--max-frames 120 --expect trace.json` asserting the note sequence | M |
-| T5.5 | Percentiles (p50/p95/p99) per stage in the Performance card | S |
-| T5.6 | Optional subsystem budget: if inference > budget, auto-skip ASCII/feed and say so in the log | S |
+| Task | Detail | Effort | Status |
+| :-- | :-- | :-- | :-- |
+| T5.1 | `tracing` replacing `println!`/`eprintln!`; `--debug` = `tracing_subscriber` env filter | S | ☐ |
+| T5.2 | `--video clip.mp4` source (from T2.3) so runs are reproducible | M | ☑ |
+| T5.3 | Tracker fixture test: real ONNX graphs over a recorded clip | M | ☑ |
+| T5.4 | Golden trace: `--max-frames 120 --expect trace.json` asserting the note sequence | M | ☑ |
+| T5.5 | Percentiles (p50/p95/p99) per stage in the Performance card | S | ☐ |
+| T5.6 | Optional subsystem budget: if inference > budget, auto-skip ASCII/feed and say so in the log | S | ☐ |
+
+### Phase 5 result so far
+
+**T5.2 — `VideoSource` (`src/vision/video.rs`).** `next_frame` now dispatches over a
+`FrameSource::{Camera, Video}` enum — the second member finally exists, so the abstraction
+T2.3 deferred is now justified rather than speculative. The clip is paced by a **deadline
+clock at its own reported frame rate**, and that pacing lives in `wait_for_next()`, *outside*
+the timed capture region: `capture_ms` measures the 0.2 ms OpenCV decode, not the 33 ms wait.
+Fold the two together and a fixture run reports a capture cost it never paid.
+
+**T5.4 — `src/core/trace.rs`.** A `Trace` is a `Vec<TraceFrame>` of
+`{ frame, note, frequency, volume, detected }`, volumes rounded to two decimals because the
+last digits of an oscillator's geometry are not reproducible. `--trace <path>` writes one,
+`--expect <path>` diffs one and exits non-zero on a difference. `make trace-check` is the gate.
+The mock hand is driven by the **frame index** rather than the wall clock, which is what makes
+the mock trace a golden reference at all: `the_mock_hand_walks_up_the_keyboard_in_a_stable_order`
+asserts `[(64, 13), (67, 18), (69, 28)]` — three held notes, not sixty identical events.
+
+**T5.3 — tracker fixture test.** `tracker_finds_the_hand_in_the_clip` runs the real
+MediaPipe graphs over 120 frames of `fixtures/hand_clip.mp4`: 106/120 detections, every
+detection carrying 21 landmarks, every box square and plausibly placed. It is `#[ignore]`d
+because the ONNX assets are gitignored; `cargo test --release -- --include-ignored
+tracker_finds_the_hand_in_the_clip` is the way to run it.
+
+**Gate:** `make verify` green, **146 tests passing** (6 ignored), clippy clean.
 
 ---
 
@@ -394,24 +420,29 @@ everything later is judged against them.
 | 1 Hot path & correctness | T1.1–T1.9 | 1–2 d | ☑ done (T1.8 skipped) |
 | 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☑ done |
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☑ done (T3.3 kept the voice in `audio/` on purpose) |
-| 4 Presentation | T4.1–T4.6 | 2 d | ☑ |
-| 5 Observability & test infra | T5.1–T5.6 | 3 d | ☐ |
+| 4 Presentation | T4.1–T4.6 | 2 d | ☑ done |
+| 5 Observability & test infra | T5.1–T5.6 | 3 d | ◑ T5.2–T5.4 done; T5.1, T5.5, T5.6 open |
 | 6 Unlocked features | — | ongoing | ☐ |
 
-Branch `phase3-instrument` carries Phase 3; Phase 4 is on `master`. Current gate:
-`make verify` green, **139 tests passing**, 4 ignored benches, clippy clean.
+Branch `phase4-snapshot` is merged into `master`. Current gate: `make verify` green,
+**146 tests passing**, 6 ignored benches, clippy clean.
 
 ### Where to pick up
 
 1. **T5.1** — `tracing` instead of `println!`/`eprintln!`, with `--debug` as a
-   `tracing_subscriber` filter. Small, and it is the prerequisite for the golden trace.
-2. **T5.2** — `--video clip.mp4` in `next_frame`. A fixture source slots in without touching
-   anything downstream.
-3. **T5.3 / T5.4** — the tracker fixture test and the golden note trace. T4.3 and T4.5 made
-   both cheap: the snapshot is grouped and the keyboard geometry is a plain function.
+   `tracing_subscriber` filter. 43 call sites today, concentrated in `pipeline.rs` (14),
+   `main.rs` (12), `vision/tracker.rs` (9) and `vision/yolo_pose.rs` (6).
+2. **T5.5** — the stage percentiles are already computed in `PerfView`; they just are not on
+   the Performance card yet. Pure UI work, no pipeline change.
+3. **T5.6** — a subsystem budget. The presenter already drops frames when it is busy; making
+   it *say* why, and letting inference pressure turn the feed off, is the remaining piece.
+4. **Shrink `pipeline.rs`** — 1099 non-test lines. `Telemetry` plus the trace is the obvious
+   next extraction into `src/core/`.
+5. **Phase 6** — multi-hand, OSC sink, `--calibrate`, `Landmark.z`. All are now single-file
+   changes; see §9.
 
-Current shape: `src/` is 10,205 lines of Rust across 33 files. `pipeline.rs` is 1,745 of
-them and owns capture, tracking, gesture dispatch, sinks and telemetry; the presenter is
-443 lines and owns everything a human sees; the estimator is 304. The iced layer
-(`dashboard/`) is 1,955 lines and is still the least-tested part of the app - T4.5 closed
-the gap for the keyboard geometry, not for the rail.
+Current shape: `src/` is **10,718 lines of Rust across 35 files**. `pipeline.rs` is 1,905 of
+them (1,099 excluding its test module) and owns capture, tracking, gesture dispatch, sinks,
+trace and telemetry; the presenter is 450 lines and owns everything a human sees; the
+estimator is 304. The iced layer (`dashboard/`) is 1,955 lines and is still the least-tested
+part of the app — T4.5 closed the gap for the keyboard geometry, not for the rail.
