@@ -29,7 +29,7 @@ use crate::core::telemetry::{
 };
 use crate::core::trace::Trace;
 use crate::core::types::Performance;
-use crate::core::{HandDetectionResult, Landmark, Sink};
+use crate::core::{HandDetectionResult, Sink};
 use crate::dashboard::metrics::{
     cell_index, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView, SoundView,
     LOG_CAPACITY,
@@ -38,6 +38,7 @@ use crate::gesture::{HandEstimator, HandState, Strategy};
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
 use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
 use crate::vision::camera::WebcamSource;
+use crate::vision::mock::{synthetic_detection, MOCK_CADENCE};
 use crate::vision::tracker::HandTracker;
 use crate::vision::video::VideoSource;
 
@@ -80,10 +81,6 @@ impl FrameReader for FrameSource {
     }
 }
 
-/// Mock mode emulates a 30 fps camera so the telemetry looks real. The loop uses a
-/// deadline rather than a flat sleep: macOS `thread::sleep(33 ms)` actually returns
-/// after ~41 ms, so a naive sleep makes every mock number 25 % wrong.
-const MOCK_CADENCE: Duration = Duration::from_millis(33);
 /// How long inference waits for the capture stage before re-checking the flags.
 const FRAME_POLL_MS: u64 = 20;
 /// How often the paused loop checks the Start/Stop flag and refreshes the UI.
@@ -1082,89 +1079,12 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
     }
 }
 
-/// A synthetic, moving hand so the dashboard can be exercised without a
-/// webcam or the ONNX models (`--mode mock`).
-pub(crate) fn synthetic_detection(seconds: f64) -> HandDetectionResult {
-    let t = seconds as f32;
-    // The centre sweeps almost the full 640 px view so the mock hand walks the
-    // whole keyboard, low notes on the left and high notes on the right.
-    let cx = 320.0 + 240.0 * (t * 0.7).sin();
-    let cy = 250.0 + 50.0 * (t * 0.45).cos();
-    let curl = 0.45 + 0.45 * (t * 1.1).sin();
-    let thumb_angle = 55.0 + 25.0 * (t * 0.8).cos();
-
-    let wrist = Landmark {
-        x: cx,
-        y: cy + 140.0,
-        z: 0.0,
-    };
-    let thumb_cmc = Landmark {
-        x: cx - 45.0,
-        y: cy + 95.0,
-        z: 0.0,
-    };
-
-    let mut landmarks = vec![wrist, thumb_cmc.clone()];
-    landmarks.extend(finger_chain(thumb_cmc, thumb_angle, 95.0, curl, 3));
-
-    let knuckles = [
-        (cx - 25.0, cy + 90.0, -12.0, 130.0), // index
-        (cx, cy + 90.0, 0.0, 140.0),          // middle
-        (cx + 25.0, cy + 90.0, 12.0, 130.0),  // ring
-        (cx + 48.0, cy + 90.0, 24.0, 110.0),  // pinky
-    ];
-    for (x, y, angle, length) in knuckles {
-        let base = Landmark { x, y, z: 0.0 };
-        landmarks.extend(finger_chain(base, angle, length, curl, 4));
-    }
-
-    let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for landmark in &landmarks {
-        minx = minx.min(landmark.x);
-        maxx = maxx.max(landmark.x);
-        miny = miny.min(landmark.y);
-        maxy = maxy.max(landmark.y);
-    }
-
-    HandDetectionResult {
-        hand_landmarks: Some(landmarks),
-        r#box: Some((minx, miny, maxx - minx, maxy - miny)),
-        frame_size: (640, 480),
-        score: 0.85 + 0.12 * (t * 0.6).sin(),
-        timings: Default::default(),
-    }
-}
-
-/// Builds `joints` landmarks walking away from `base` in the given direction,
-/// bending progressively according to `curl`. 0 degrees points straight up.
-fn finger_chain(
-    base: Landmark,
-    angle_deg: f32,
-    length: f32,
-    curl: f32,
-    joints: usize,
-) -> Vec<Landmark> {
-    let angle = angle_deg * std::f32::consts::PI / 180.0;
-    let segment = length / joints as f32;
-
-    let mut x = base.x;
-    let mut y = base.y;
-    let mut chain = Vec::with_capacity(joints);
-
-    for i in 0..joints {
-        let a = angle + curl * i as f32 * 0.35;
-        x += a.sin() * segment;
-        y -= a.cos() * segment;
-        chain.push(Landmark { x, y, z: 0.0 });
-    }
-
-    chain
-}
-
+/// A synthetic, moving hand so the dashboard can be exercised without a webcam or
+/// the ONNX models (`--mode mock`). The generator itself lives in `vision::mock`;
+/// it is re-exported here so the pipeline tests read it the same way the loop does.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::geometry::hand_geometry;
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
@@ -1172,23 +1092,6 @@ mod tests {
     use crate::dashboard::metrics::{note_index, StatusView, DEFAULT_FADE_MS};
     use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
-
-    #[test]
-    fn synthetic_hand_has_21_landmarks() {
-        let detection = synthetic_detection(1.0);
-        let landmarks = detection.hand_landmarks.unwrap();
-        assert_eq!(landmarks.len(), 21);
-        assert!(detection.r#box.is_some());
-    }
-
-    #[test]
-    fn synthetic_hand_geometry_is_sane() {
-        let landmarks = synthetic_detection(2.0).hand_landmarks.unwrap();
-        let geometry = hand_geometry(&landmarks).unwrap();
-        assert!(geometry.palm_length > 0.0);
-        assert!(geometry.spread > 0.0);
-        assert!(geometry.extension[1] > geometry.extension[0]);
-    }
 
     /// A sink that records every event it is handed, so the tests can inspect
     /// what the pipeline actually dispatched.
