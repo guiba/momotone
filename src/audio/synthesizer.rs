@@ -227,9 +227,10 @@ impl Sink for Synthesizer {
             .default_output_device()
             .ok_or_else(|| anyhow!("No audio output device found"))?;
         let config: cpal::StreamConfig = device.default_output_config()?.into();
-        println!(
-            "[Audio] device stream: {} Hz, {} channels",
-            config.sample_rate, config.channels
+        tracing::info!(
+            "device stream: {} Hz, {} channels",
+            config.sample_rate,
+            config.channels
         );
 
         let target = self.target.clone();
@@ -263,7 +264,7 @@ impl Sink for Synthesizer {
                     }
                 }
             },
-            |err| eprintln!("Audio stream error: {}", err),
+            |err| tracing::error!("audio stream error: {err}"),
             None,
         )?;
 

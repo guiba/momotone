@@ -192,8 +192,9 @@ pub struct Pipeline {
 /// whether to print the per-frame line.
 struct RunFlags {
     max_frames: Option<u32>,
+    /// Whether the presenter is handed frames at all: with no window and no ASCII
+    /// output there is nothing to draw, so the frame is not copied.
     emit_frames: bool,
-    debug: bool,
 }
 
 /// Clocks and the rolling samples of each stage: everything the dashboard and the
@@ -256,7 +257,6 @@ pub struct PipelineConfig {
     /// Compare the run against a recorded trace and fail on a difference.
     pub trace_expect: Option<String>,
     pub max_frames: Option<u32>,
-    pub debug: bool,
     pub emit_frames: bool,
 }
 
@@ -280,7 +280,6 @@ impl Pipeline {
             trace_out,
             trace_expect,
             max_frames,
-            debug,
             emit_frames,
         } = config;
 
@@ -329,7 +328,6 @@ impl Pipeline {
             run: RunFlags {
                 max_frames,
                 emit_frames,
-                debug,
             },
             telemetry: Telemetry {
                 started: now,
@@ -344,12 +342,7 @@ impl Pipeline {
             },
             presentation: Presentation {
                 jobs: Some(jobs_tx),
-                presenter: Some(Presenter::new(
-                    ascii_cols,
-                    ascii_stdout,
-                    ascii_dump.clone(),
-                    debug,
-                )),
+                presenter: Some(Presenter::new(ascii_cols, ascii_stdout, ascii_dump.clone())),
                 stdout: ascii_stdout,
                 dump: ascii_dump,
             },
@@ -459,16 +452,14 @@ impl Pipeline {
         self.metrics.status.waveform = config.waveform.name().to_string();
         self.metrics.scene.layout = config.layout.clone();
 
-        if self.run.debug {
-            println!(
-                "[Instrument] {} {} - {}x{} grid, {} waveform",
-                config.scale.name,
-                config.root_name,
-                config.layout.rows,
-                config.layout.cols,
-                config.waveform,
-            );
-        }
+        tracing::info!(
+            "instrument {} {} - {}x{} grid, {} waveform",
+            config.scale.name,
+            config.root_name,
+            config.layout.rows,
+            config.layout.cols,
+            config.waveform,
+        );
     }
 
     /// Runs until the UI asks for shutdown or `--max-frames` is reached. The
@@ -486,7 +477,7 @@ impl Pipeline {
             let counters = self.counters.clone();
             std::thread::spawn(move || {
                 if let Err(e) = capture_frames(&mut source, &tx, &control, &running, &counters) {
-                    eprintln!("[Capture] {e}");
+                    tracing::warn!("capture stage stopped: {e}");
                 }
             })
         });
@@ -496,7 +487,6 @@ impl Pipeline {
         // longer holds the frame loop hostage.
         let sink_handle = {
             let sinks = self.sinks.clone();
-            let debug = self.run.debug;
             let dispatch = self.telemetry.dispatch.clone();
             let rx = self.event_rx.take();
             std::thread::spawn(move || {
@@ -515,7 +505,7 @@ impl Pipeline {
                     if let Ok(mut samples) = dispatch.lock() {
                         samples.push(age_ms);
                     }
-                    apply_to_sinks(&sinks, &queued.performance, debug);
+                    apply_to_sinks(&sinks, &queued.performance);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
                     for sink in sinks.iter_mut() {
@@ -563,34 +553,32 @@ impl Pipeline {
             }
         }
 
-        if self.run.debug {
-            let frames = self.metrics.perf.frames.max(1);
-            println!(
-                "[Pipeline] {} frames in {:.2} s: {:.1} fps, {:.2} ms/frame end to end (capture {:.2} ms, inference {:.2} ms, {} frames dropped)",
-                self.metrics.perf.frames,
-                self.metrics.perf.uptime_ms as f64 / 1000.0,
-                self.metrics.perf.fps,
-                self.metrics.perf.uptime_ms as f64 / frames as f64,
-                self.metrics.perf.capture_ms,
-                self.metrics.perf.frame_ms,
-                self.metrics.perf.dropped,
-            );
-            let perf = self.stage_profile();
-            println!(
-                "[Stages] p50/p95/p99/max ms - capture {:.1}/{:.1}/{:.1}/{:.1}  inference {:.1}/{:.1}/{:.1}/{:.1}  camera->publish {:.1}/{:.1}/{:.1}/{:.1}  dispatch->sink {:.1}/{:.1}/{:.1}/{:.1}  ({} samples)",
-                perf.capture.p50, perf.capture.p95, perf.capture.p99, perf.capture.max,
-                perf.inference.p50, perf.inference.p95, perf.inference.p99, perf.inference.max,
-                perf.end_to_end.p50, perf.end_to_end.p95, perf.end_to_end.p99, perf.end_to_end.max,
-                perf.dispatch.p50, perf.dispatch.p95, perf.dispatch.p99, perf.dispatch.max,
-                perf.inference.count,
-            );
-        }
+        let frames = self.metrics.perf.frames.max(1);
+        tracing::info!(
+            "{} frames in {:.2} s: {:.1} fps, {:.2} ms/frame end to end (capture {:.2} ms, inference {:.2} ms, {} frames dropped)",
+            self.metrics.perf.frames,
+            self.metrics.perf.uptime_ms as f64 / 1000.0,
+            self.metrics.perf.fps,
+            self.metrics.perf.uptime_ms as f64 / frames as f64,
+            self.metrics.perf.capture_ms,
+            self.metrics.perf.frame_ms,
+            self.metrics.perf.dropped,
+        );
+        let perf = self.stage_profile();
+        tracing::info!(
+            "stage tails p50/p95/p99/max ms - capture {:.1}/{:.1}/{:.1}/{:.1}  inference {:.1}/{:.1}/{:.1}/{:.1}  camera->publish {:.1}/{:.1}/{:.1}/{:.1}  dispatch->sink {:.1}/{:.1}/{:.1}/{:.1}  ({} samples)",
+            perf.capture.p50, perf.capture.p95, perf.capture.p99, perf.capture.max,
+            perf.inference.p50, perf.inference.p95, perf.inference.p99, perf.inference.max,
+            perf.end_to_end.p50, perf.end_to_end.p95, perf.end_to_end.p99, perf.end_to_end.max,
+            perf.dispatch.p50, perf.dispatch.p95, perf.dispatch.p99, perf.dispatch.max,
+            perf.inference.count,
+        );
 
         if let Some(path) = &self.trace_out {
             if let Err(error) = crate::core::trace::write(path, &self.trace) {
-                eprintln!("[Trace] could not write {path}: {error}");
+                tracing::warn!("could not write trace {path}: {error}");
             } else {
-                println!("[Trace] {} frames written to {path}", self.trace.len());
+                tracing::info!("{} frames written to {path}", self.trace.len());
             }
         }
         if let Some(path) = &self.trace_expect {
@@ -598,19 +586,19 @@ impl Pipeline {
                 Ok(expected) => {
                     let differences = crate::core::trace::diff(&expected, &self.trace);
                     if differences.is_empty() {
-                        println!("[Trace] matches {path} ({} frames)", self.trace.len());
+                        tracing::info!("trace matches {path} ({} frames)", self.trace.len());
                     } else {
                         for line in differences.iter().take(20) {
-                            println!("[Trace] {line}");
+                            tracing::warn!("{line}");
                         }
                         if differences.len() > 20 {
-                            println!("[Trace] ... and {} more", differences.len() - 20);
+                            tracing::warn!("... and {} more", differences.len() - 20);
                         }
                         // Non-zero, so `make trace-check` is a gate and not a note.
                         anyhow::bail!("[Trace] {path}: {} frames differ", differences.len());
                     }
                 }
-                Err(error) => eprintln!("[Trace] {error}"),
+                Err(error) => tracing::warn!("{error}"),
             }
         }
 
@@ -655,7 +643,7 @@ impl Pipeline {
             self.event_bus.dispatch(Performance::Release);
         }
         if let Some(rx) = &self.event_rx {
-            drain_events(rx, &self.sinks, self.run.debug);
+            drain_events(rx, &self.sinks);
         }
         // Otherwise the stopped interval shows up as a huge fps dip on resume.
         self.telemetry.last_publish = Instant::now();
@@ -749,7 +737,7 @@ impl Pipeline {
         // Inline mode: this thread still owns the receiver. Once `run` has spawned
         // the sink thread it is gone, and that stage is the only consumer.
         if let Some(rx) = &self.event_rx {
-            drain_events(rx, &self.sinks, self.run.debug);
+            drain_events(rx, &self.sinks);
         }
         self.publish();
         // The trace is the smallest thing a run produces, so recording it costs
@@ -908,7 +896,11 @@ impl Pipeline {
     /// The line `--debug` prints every ten frames: what the player is hearing and
     /// how long the frame took.
     fn report_frame(&self) {
-        if self.run.debug && self.metrics.perf.frames.is_multiple_of(10) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        // Thirty lines a second is noise; every tenth frame is a heartbeat.
+        if self.metrics.perf.frames.is_multiple_of(10) {
             // What the player actually hears this frame: a keyboard note, a
             // theremin frequency, or nothing.
             let sounding = match (self.metrics.sound.note, self.metrics.sound.frequency) {
@@ -916,8 +908,8 @@ impl Pipeline {
                 (None, Some(freq)) => format!("{freq:.0} Hz"),
                 _ => "silent".to_string(),
             };
-            println!(
-                "[Pipeline] fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
+            tracing::debug!(
+                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
                 self.metrics.perf.fps,
                 self.metrics.perf.frame_ms,
                 self.metrics.perf.capture_ms,
@@ -996,23 +988,21 @@ fn capture_frames(
     Ok(())
 }
 
-fn apply_to_sinks(sinks: &SinkList, performance: &Performance, debug: bool) {
+fn apply_to_sinks(sinks: &SinkList, performance: &Performance) {
     let Ok(mut sinks) = sinks.lock() else {
         return;
     };
     for sink in sinks.iter_mut() {
         if let Err(e) = sink.handle(performance) {
-            if debug {
-                eprintln!("[Sink] {e}");
-            }
+            tracing::warn!("sink rejected a performance: {e}");
         }
     }
 }
 
-fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList, debug: bool) {
+fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
     while let Ok(message) = rx.try_recv() {
         match message {
-            BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.performance, debug),
+            BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.performance),
             BusMessage::Shutdown => break,
         }
     }
@@ -1254,7 +1244,6 @@ mod tests {
             trace_out: None,
             trace_expect: None,
             max_frames,
-            debug: false,
             emit_frames,
         });
         TestHarness {
