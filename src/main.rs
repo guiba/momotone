@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::runtime::{control_channel, RuntimeConfig};
+use crate::core::telemetry::FRAME_BUDGET_MS;
 use crate::core::Sink;
 use crate::dashboard::metrics::{FrameMetrics, SceneView, SoundView, StatusView, DEFAULT_FADE_MS};
 use crate::gesture::keyboard::FingerPositionStrategy;
@@ -183,6 +184,13 @@ struct Args {
     /// Compare the run against a recorded trace file and print the differing frames.
     #[arg(long)]
     expect: Option<String>,
+
+    /// Shed the ASCII backdrop and the camera preview when inference's p95 exceeds
+    /// this many milliseconds. The default is the 30 fps frame interval; 0 turns the
+    /// guard off. The picture is the only work in the loop that is not on the sound
+    /// path, so it is what goes when inference runs out of time.
+    #[arg(long, default_value_t = FRAME_BUDGET_MS)]
+    budget_ms: f64,
 
     /// Scale the pitch is quantised to. Quantising means every reachable key is
     /// consonant with every other one, so sweeping the hand cannot clash. Use
@@ -455,6 +463,7 @@ fn main() -> Result<()> {
         fade_ms: args.fade_ms,
         trace_out: args.trace.clone(),
         trace_expect: args.expect.clone(),
+        budget_ms: args.budget_ms,
         // With no window there is no stage to look at, so `--ascii` means the
         // art goes to stdout instead.
         ascii_stdout: args.no_ui && args.ascii,

@@ -24,7 +24,9 @@ use opencv::prelude::*;
 use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
-use crate::core::telemetry::{profile, Samples, StageProfile, PROFILE_REFRESH_FRAMES};
+use crate::core::telemetry::{
+    profile, shed_subsystems, Samples, StageProfile, PROFILE_REFRESH_FRAMES,
+};
 use crate::core::trace::Trace;
 use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Landmark, Sink};
@@ -176,6 +178,7 @@ pub struct Pipeline {
     trace: Trace,
     trace_out: Option<String>,
     trace_expect: Option<String>,
+    budget: Budget,
 
     // --- run state -------------------------------------------------------------
     run: RunFlags,
@@ -195,6 +198,20 @@ struct RunFlags {
     /// Whether the presenter is handed frames at all: with no window and no ASCII
     /// output there is nothing to draw, so the frame is not copied.
     emit_frames: bool,
+}
+
+/// Load shedding. The ASCII art and the camera preview are the only work in the
+/// loop that is not on the sound path, so when inference is running out of time
+/// they are the first things to go.
+///
+/// `limit_ms <= 0` disables the guard entirely: a run that quietly turns off
+/// features the user asked for is worse than one that is a little slow.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    limit_ms: f64,
+    /// Set once the guard has fired, so the log says it once rather than every
+    /// frame after the tail blows.
+    shed: bool,
 }
 
 /// Clocks and the rolling samples of each stage: everything the dashboard and the
@@ -256,6 +273,9 @@ pub struct PipelineConfig {
     pub trace_out: Option<String>,
     /// Compare the run against a recorded trace and fail on a difference.
     pub trace_expect: Option<String>,
+    /// Shed the ASCII backdrop and the camera preview when inference's p95 exceeds
+    /// this many milliseconds. 0 (the default) leaves the guard off.
+    pub budget_ms: f64,
     pub max_frames: Option<u32>,
     pub emit_frames: bool,
 }
@@ -279,6 +299,7 @@ impl Pipeline {
             fade_ms,
             trace_out,
             trace_expect,
+            budget_ms,
             max_frames,
             emit_frames,
         } = config;
@@ -324,6 +345,10 @@ impl Pipeline {
             trace: Trace::default(),
             trace_out,
             trace_expect,
+            budget: Budget {
+                limit_ms: budget_ms,
+                shed: false,
+            },
             counters: Arc::new(CaptureCounters::default()),
             run: RunFlags {
                 max_frames,
@@ -617,6 +642,40 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Load shedding. If inference's tail is blowing the frame budget, the picture
+    /// work - ASCII and the preview upload - is turned off, because it is the only
+    /// thing in the loop that is not on the sound path.
+    ///
+    /// The guard fires once and says so. A run that silently stops drawing what the
+    /// user asked for is worse than one that is a little slow.
+    fn shed_if_over_budget(&mut self) {
+        if self.budget.limit_ms <= 0.0 || self.budget.shed {
+            return;
+        }
+        // Only worth checking once the ring has enough frames for a tail.
+        if !self
+            .metrics
+            .perf
+            .frames
+            .is_multiple_of(PROFILE_REFRESH_FRAMES)
+        {
+            return;
+        }
+        if !shed_subsystems(&self.metrics.perf.profile.inference, self.budget.limit_ms) {
+            return;
+        }
+        self.budget.shed = true;
+        if let Ok(mut config) = self.control.lock() {
+            config.ascii = false;
+            config.feed = false;
+        }
+        tracing::warn!(
+            "inference p95 {:.1} ms exceeds the {:.0} ms budget - ascii and camera preview off",
+            self.metrics.perf.profile.inference.p95,
+            self.budget.limit_ms
+        );
+    }
+
     /// Percentiles of the four stages. Recomputed once a second rather than every
     /// frame: the sort is cheap but repeating it 30 times a second is not needed.
     fn stage_profile(&self) -> StageProfile {
@@ -714,7 +773,6 @@ impl Pipeline {
     /// gesture code can be exercised without a camera or an ONNX model.
     fn advance(&mut self, outcome: FrameOutcome) -> Result<()> {
         self.apply_commands();
-        let settings = self.settings();
         let FrameOutcome {
             detection,
             frame,
@@ -727,6 +785,9 @@ impl Pipeline {
         let state = self.estimator.update(&detection);
 
         self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
+        // Read the UI's wishes *after* the timing, so a shed that fires on this
+        // frame's tail takes effect on this frame's picture rather than the next one.
+        let settings = self.settings();
         self.update_tracking(&state);
         self.dispatch_gesture(&state);
         // The keyboard glow follows the gesture, on the frame loop's clock.
@@ -787,6 +848,9 @@ impl Pipeline {
             .is_multiple_of(PROFILE_REFRESH_FRAMES)
         {
             self.metrics.perf.profile = self.stage_profile();
+            // Load shedding: the picture is the only work in the loop that is not on
+            // the sound path, so it is what goes when inference runs out of time.
+            self.shed_if_over_budget();
         }
         self.metrics.perf.uptime_ms = self.telemetry.started.elapsed().as_millis() as u64;
         self.metrics.status.paused = false;
@@ -1094,6 +1158,7 @@ mod tests {
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
+    use crate::core::telemetry::{Latency, FRAME_BUDGET_MS};
     use crate::dashboard::metrics::{note_index, StatusView, DEFAULT_FADE_MS};
     use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
@@ -1205,6 +1270,7 @@ mod tests {
             RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
             false,
             DEFAULT_COLS,
+            0.0,
             Arc::new(Mutex::new(FrameMetrics::default())),
         )
     }
@@ -1217,6 +1283,7 @@ mod tests {
         config: RuntimeConfig,
         emit_frames: bool,
         ascii_cols: usize,
+        budget_ms: f64,
         shared: Arc<Mutex<FrameMetrics>>,
     ) -> TestHarness {
         let (bus, rx) = EventBus::new();
@@ -1243,6 +1310,7 @@ mod tests {
             fade_ms: DEFAULT_FADE_MS,
             trace_out: None,
             trace_expect: None,
+            budget_ms,
             max_frames,
             emit_frames,
         });
@@ -1456,6 +1524,7 @@ mod tests {
             RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
             true,
             DEFAULT_COLS,
+            0.0,
             Arc::new(Mutex::new(FrameMetrics::default())),
         );
         let jobs = pipeline.jobs_rx.take().unwrap();
@@ -1496,6 +1565,7 @@ mod tests {
             RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
             false,
             DEFAULT_COLS,
+            0.0,
             shared.clone(),
         );
         pipeline.advance(synthetic_frame(0.0)).unwrap();
@@ -1532,6 +1602,7 @@ mod tests {
             RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks),
             false,
             DEFAULT_COLS,
+            0.0,
             shared.clone(),
         );
         pipeline.advance(synthetic_frame(0.0)).unwrap();
@@ -1889,6 +1960,91 @@ mod tests {
         assert!(
             !running.load(Ordering::Relaxed),
             "run clears the flag on exit"
+        );
+    }
+
+    #[test]
+    fn an_over_budget_run_sheds_the_picture_and_says_so() {
+        let config = RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, true, Ramp::Blocks);
+        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+        let TestHarness {
+            mut pipeline,
+            control,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            true,
+            DEFAULT_COLS,
+            FRAME_BUDGET_MS,
+            shared.clone(),
+        );
+        let jobs = pipeline.jobs_rx.take().unwrap();
+
+        // The guard needs a tail, and a tail needs a second of frames: seed the ring
+        // with a stage whose median is fine but whose p95 is not, then run the frame
+        // that crosses the refresh boundary.
+        pipeline.metrics.perf.frames = PROFILE_REFRESH_FRAMES - 1;
+        for _ in 0..PROFILE_REFRESH_FRAMES - 1 {
+            pipeline.telemetry.inference.push(41.0);
+        }
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+
+        let applied = pipeline.control.lock().unwrap().clone();
+        assert!(!applied.ascii, "the backdrop is the first thing to go");
+        assert!(!applied.feed, "and so is the preview upload");
+        assert!(
+            jobs.try_recv().is_err(),
+            "shed work is not handed to the presenter"
+        );
+        // The user can still turn it back on: the guard fires once, not forever.
+        control.send(UiCommand::SetAscii(true)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        assert!(
+            pipeline.control.lock().unwrap().ascii,
+            "a manual toggle beats the guard"
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_budget_keeps_its_picture() {
+        let config = RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, true, Ramp::Blocks);
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        pipeline.metrics.perf.frames = PROFILE_REFRESH_FRAMES;
+        pipeline.metrics.perf.profile = StageProfile {
+            inference: Latency {
+                p50: 8.0,
+                p95: 41.0,
+                p99: 60.0,
+                max: 90.0,
+                count: PROFILE_REFRESH_FRAMES as usize,
+            },
+            ..StageProfile::default()
+        };
+        pipeline.metrics.perf.frames = PROFILE_REFRESH_FRAMES;
+        pipeline.metrics.perf.profile = StageProfile {
+            inference: Latency {
+                p50: 8.0,
+                p95: 41.0,
+                p99: 60.0,
+                max: 90.0,
+                count: PROFILE_REFRESH_FRAMES as usize,
+            },
+            ..StageProfile::default()
+        };
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        assert!(
+            pipeline.control.lock().unwrap().ascii,
+            "no budget means no shedding"
         );
     }
 }

@@ -98,6 +98,21 @@ pub struct StageProfile {
 /// a tail readout, and recomputing four sorts every frame would be wasted work.
 pub const PROFILE_REFRESH_FRAMES: u64 = 30;
 
+/// The frame interval a 30 fps capture implies, in milliseconds.
+pub const FRAME_BUDGET_MS: f64 = 33.0;
+
+/// Should the optional subsystems (ASCII art, camera preview) be shed?
+///
+/// The rule is on the *tail*, not the average: a stage whose median fits but whose
+/// p95 does not is the one that makes a instrument stutter. `budget_ms <= 0` turns
+/// the guard off entirely.
+///
+/// `count` matters: one slow frame in a three-frame run is not a trend, so the ring
+/// needs a few samples before the guard acts.
+pub fn shed_subsystems(inference: &Latency, budget_ms: f64) -> bool {
+    budget_ms > 0.0 && inference.count >= 5 && inference.p95 > budget_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,4 +174,61 @@ mod tests {
         assert!((p.p99 - 120.0).abs() < 1e-9, "the tail must be visible");
         assert!(p.max == 120.0);
     }
+}
+
+#[test]
+fn a_tail_over_the_budget_sheds_the_picture_work() {
+    let steady = Latency {
+        p50: 8.0,
+        p95: 12.0,
+        p99: 14.0,
+        max: 20.0,
+        count: 100,
+    };
+    assert!(
+        !shed_subsystems(&steady, FRAME_BUDGET_MS),
+        "a healthy stage keeps the art"
+    );
+
+    let spiky = Latency {
+        p50: 8.0,
+        p95: 41.0,
+        p99: 60.0,
+        max: 90.0,
+        count: 100,
+    };
+    assert!(
+        shed_subsystems(&spiky, FRAME_BUDGET_MS),
+        "a tail over budget is the signal"
+    );
+}
+
+#[test]
+fn the_guard_is_off_when_no_budget_is_given() {
+    let spiky = Latency {
+        p50: 8.0,
+        p95: 41.0,
+        p99: 60.0,
+        max: 90.0,
+        count: 100,
+    };
+    for limit in [0.0, -1.0] {
+        assert!(
+            !shed_subsystems(&spiky, limit),
+            "limit {limit} means no guard"
+        );
+    }
+}
+
+#[test]
+fn a_stage_is_not_judged_on_three_frames() {
+    // A p95 over budget during a three-frame warm-up is noise, not a trend.
+    let warmup = Latency {
+        p50: 30.0,
+        p95: 40.0,
+        p99: 40.0,
+        max: 40.0,
+        count: 3,
+    };
+    assert!(!shed_subsystems(&warmup, FRAME_BUDGET_MS));
 }
