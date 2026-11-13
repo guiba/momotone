@@ -305,18 +305,18 @@ a snapshot.
 
 ---
 
-## 8. Phase 5 — Observability & test infrastructure *(in progress: T5.2–T5.4 done)*
+## 8. Phase 5 — Observability & test infrastructure *(complete: T5.1–T5.6)*
 
 | Task | Detail | Effort | Status |
 | :-- | :-- | :-- | :-- |
-| T5.1 | `tracing` replacing `println!`/`eprintln!`; `--debug` = `tracing_subscriber` env filter | S | ☐ |
+| T5.1 | `tracing` replacing `println!`/`eprintln!`; `--debug` = `tracing_subscriber` env filter | S | ☑ |
 | T5.2 | `--video clip.mp4` source (from T2.3) so runs are reproducible | M | ☑ |
 | T5.3 | Tracker fixture test: real ONNX graphs over a recorded clip | M | ☑ |
 | T5.4 | Golden trace: `--max-frames 120 --expect trace.json` asserting the note sequence | M | ☑ |
-| T5.5 | Percentiles (p50/p95/p99) per stage in the Performance card | S | ☐ |
-| T5.6 | Optional subsystem budget: if inference > budget, auto-skip ASCII/feed and say so in the log | S | ☐ |
+| T5.5 | Percentiles (p50/p95/p99) per stage in the Performance card | S | ☑ |
+| T5.6 | Optional subsystem budget: if inference > budget, auto-skip ASCII/feed and say so in the log | S | ☑ |
 
-### Phase 5 result so far
+### Phase 5 result
 
 **T5.2 — `VideoSource` (`src/vision/video.rs`).** `next_frame` now dispatches over a
 `FrameSource::{Camera, Video}` enum — the second member finally exists, so the abstraction
@@ -339,7 +339,49 @@ detection carrying 21 landmarks, every box square and plausibly placed. It is `#
 because the ONNX assets are gitignored; `cargo test --release -- --include-ignored
 tracker_finds_the_hand_in_the_clip` is the way to run it.
 
-**Gate:** `make verify` green, **146 tests passing** (6 ignored), clippy clean.
+**T5.1 — `tracing`.** Every production `println!`/`eprintln!` is gone; the six that remain
+are in tests and benches. One `init_logging(debug: bool)` in `main.rs` installs an
+`EnvFilter` — `INFO` by default, `DEBUG` under `--debug`, and `RUST_LOG` wins over both. The
+subscriber also pins `ort::logging` to `warn`, which is what the `debug: bool` threaded
+through four structs was really trying to do.
+
+The point is not the log lines, it is the **parameters that stopped existing**. `debug: bool`
+was a field on `MediaPipeTracker`, `YoloPoseTracker`, `Presenter`, `PipelineConfig` and
+`RunFlags`: five copies of one opinion about verbosity, passed down because the leaf stages
+could not otherwise decide for themselves. A level filter is set once, at the top, and every
+module emits at a level without knowing who is listening. The expensive diagnostics — the
+anchor table, the 21 landmark coordinates — are still only computed when they can be used,
+guarded by `tracing::enabled!(Level::DEBUG)` rather than by a struct field.
+
+**T5.5 — percentiles on the Performance card.** `PerfView` already held a `StageProfile` per
+stage; the card now prints `p50 / p95 / p99 / max` for capture, inference, camera→UI, dispatch
+and the tail window, with a marker when a stage's p95 exceeds 33 ms. No pipeline change — the
+data was computed once a second and thrown away.
+
+**T5.6 — subsystem budget.** `--budget-ms <f64>` defaults to `FRAME_BUDGET_MS` (33.0, the
+interval a 30 fps capture implies). When inference's **p95** exceeds it, the pipeline clears
+`ascii` and `feed` in the `RuntimeConfig` it owns and logs once. The decision is on the tail
+rather than the median: a stage whose median fits but whose p95 does not is the one that makes
+the instrument stutter, and shedding the picture is the cheapest way to buy back the time.
+
+Three things make it honest rather than surprising. The guard fires **once**, not every frame,
+so it does not fight the user; a manual toggle beats it, because `shed` only suppresses the
+automatic decision, not the human one; and `--budget-ms 0` turns the whole thing off. The
+picture is decided *after* the timing is recorded, so a shed that fires on a frame's tail
+takes effect on that frame's picture rather than the next one.
+
+**Gate:** `make verify` green, **151 tests passing** (6 ignored), clippy clean. `make
+trace-check` reproduces the fixture trace exactly across three consecutive runs.
+
+### A caveat on reproducibility
+
+The golden trace matched three times in a row on an idle machine and differed by 36 frames
+when a `cargo build --release` was competing for cores in the same window. The trace records
+what the *model* saw, and the detector's ROI anchor is seeded from the previous frame, so load
+changes the timings, the timings change the anchor, and the anchor changes the detections. The
+fixture clip is reproducible; the *tracker's* response to it is only reproducible when the
+machine is otherwise idle. `make trace-check` is a regression gate for a quiet machine, not a
+CI-grade assertion — which is consistent with there being no CI.
 
 ---
 
@@ -421,28 +463,26 @@ everything later is judged against them.
 | 2 Frame loop & state | T2.1–T2.5 | 2–3 d | ☑ done |
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☑ done (T3.3 kept the voice in `audio/` on purpose) |
 | 4 Presentation | T4.1–T4.6 | 2 d | ☑ done |
-| 5 Observability & test infra | T5.1–T5.6 | 3 d | ◑ T5.2–T5.4 done; T5.1, T5.5, T5.6 open |
+| 5 Observability & test infra | T5.1–T5.6 | 3 d | ☑ done |
 | 6 Unlocked features | — | ongoing | ☐ |
 
-Branch `phase4-snapshot` is merged into `master`. Current gate: `make verify` green,
-**146 tests passing**, 6 ignored benches, clippy clean.
+Branch `phase5-observability` carries T5.1, T5.5 and T5.6; `phase4-snapshot` is already merged
+into `master`. Current gate: `make verify` green, **151 tests passing**, 6 ignored benches,
+clippy clean.
 
 ### Where to pick up
 
-1. **T5.1** — `tracing` instead of `println!`/`eprintln!`, with `--debug` as a
-   `tracing_subscriber` filter. 43 call sites today, concentrated in `pipeline.rs` (14),
-   `main.rs` (12), `vision/tracker.rs` (9) and `vision/yolo_pose.rs` (6).
-2. **T5.5** — the stage percentiles are already computed in `PerfView`; they just are not on
-   the Performance card yet. Pure UI work, no pipeline change.
-3. **T5.6** — a subsystem budget. The presenter already drops frames when it is busy; making
-   it *say* why, and letting inference pressure turn the feed off, is the remaining piece.
-4. **Shrink `pipeline.rs`** — 1099 non-test lines. `Telemetry` plus the trace is the obvious
-   next extraction into `src/core/`.
-5. **Phase 6** — multi-hand, OSC sink, `--calibrate`, `Landmark.z`. All are now single-file
+1. **Shrink `pipeline.rs`** — 2050 lines, 1150 of them tests. `Telemetry` plus the trace is the
+   obvious next extraction into `src/core/`; the frame loop itself is now four stages and a
+   handful of helpers.
+2. **T5.7 — a headless UI test.** `dashboard/` is still 1955 lines with no tests. The keyboard
+   geometry (T4.5) proved the pattern: split the drawing from the widget and the arithmetic
+   becomes testable. `gauges.rs` and `metrics.rs` are next.
+3. **Phase 6** — multi-hand, OSC sink, `--calibrate`, `Landmark.z`. All are now single-file
    changes; see §9.
 
-Current shape: `src/` is **10,718 lines of Rust across 35 files**. `pipeline.rs` is 1,905 of
-them (1,099 excluding its test module) and owns capture, tracking, gesture dispatch, sinks,
+Current shape: `src/` is **10,953 lines of Rust across 35 files**. `pipeline.rs` is 2,050 of
+them (1,150 excluding its test module) and owns capture, tracking, gesture dispatch, sinks,
 trace and telemetry; the presenter is 450 lines and owns everything a human sees; the
 estimator is 304. The iced layer (`dashboard/`) is 1,955 lines and is still the least-tested
 part of the app — T4.5 closed the gap for the keyboard geometry, not for the rail.

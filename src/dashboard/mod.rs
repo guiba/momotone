@@ -93,11 +93,6 @@ pub struct Dashboard {
     confidence_history: Vec<f32>,
     show_box: bool,
     show_labels: bool,
-    /// The stage is a backdrop + skeleton by default; the camera is only
-    /// uploaded when this is on.
-    show_feed: bool,
-    /// ASCII art behind the skeleton, off by default.
-    show_ascii: bool,
 }
 
 impl Dashboard {
@@ -120,8 +115,6 @@ impl Dashboard {
             confidence_history: Vec::new(),
             show_box: true,
             show_labels: false,
-            show_feed: false,
-            show_ascii: false,
         }
     }
 
@@ -133,7 +126,8 @@ impl Dashboard {
                     // a 640x480 RGBA frame is 1.2 MB per tick otherwise. Take
                     // ownership of the pixels so the clone below carries an empty
                     // buffer either way.
-                    if self.show_feed && !shared.scene.pixels.is_empty() {
+                    let feed = shared.status.feed;
+                    if feed && !shared.scene.pixels.is_empty() {
                         let (width, height) = shared.hand.frame_size;
                         self.frame_image = Some(Handle::from_rgba(
                             width as u32,
@@ -161,12 +155,14 @@ impl Dashboard {
             Message::ToggleBox => self.show_box = !self.show_box,
             Message::ToggleLabels => self.show_labels = !self.show_labels,
             Message::ToggleFeed => {
-                self.show_feed = !self.show_feed;
-                let _ = self.control.send(UiCommand::SetFeed(self.show_feed));
+                // Flip the pipeline's state, not a local copy: the budget guard can
+                // clear `feed` without a click, and a mirror here would drift.
+                let next = !self.metrics.status.feed;
+                let _ = self.control.send(UiCommand::SetFeed(next));
             }
             Message::ToggleAscii => {
-                self.show_ascii = !self.show_ascii;
-                let _ = self.control.send(UiCommand::SetAscii(self.show_ascii));
+                let next = !self.metrics.status.ascii;
+                let _ = self.control.send(UiCommand::SetAscii(next));
             }
             Message::PickRamp(name) => {
                 if let Some(ramp) = Ramp::parse(&name) {
@@ -205,6 +201,10 @@ impl Dashboard {
 
     fn view(&self) -> Element<'_, Message> {
         let running = self.active;
+        // The picture subsystems are whatever the pipeline is actually running, which
+        // need not be what the user asked for: the budget guard can shed them.
+        let feed = self.metrics.status.feed;
+        let ascii = self.metrics.status.ascii;
 
         let header = row![
             text("Hand Gesture HUD").size(20),
@@ -218,7 +218,7 @@ impl Dashboard {
                 self.metrics.scene.layout.cols,
                 self.metrics.status.waveform,
                 self.metrics.sound.fade_ms,
-                if self.show_ascii {
+                if ascii {
                     format!(
                         " · ascii {} {}x{}",
                         self.ramp.name(),
@@ -237,16 +237,9 @@ impl Dashboard {
                 Message::ToggleRun,
                 if running { ALARM } else { VOLUME },
             ),
+            small_button(if feed { "hide feed" } else { "feed" }, Message::ToggleFeed,),
             small_button(
-                if self.show_feed { "hide feed" } else { "feed" },
-                Message::ToggleFeed,
-            ),
-            small_button(
-                if self.show_ascii {
-                    "hide ascii"
-                } else {
-                    "ascii"
-                },
+                if ascii { "hide ascii" } else { "ascii" },
                 Message::ToggleAscii,
             ),
             small_button("box", Message::ToggleBox),
@@ -262,9 +255,9 @@ impl Dashboard {
         let stage = container(
             canvas(Skeleton {
                 image: self.frame_image.clone(),
-                show_feed: self.show_feed,
+                show_feed: feed,
                 ascii: self.metrics.scene.ascii.clone(),
-                show_ascii: self.show_ascii,
+                show_ascii: ascii,
                 ramp: self.ramp,
                 frequency: self.metrics.sound.frequency,
                 landmarks: self.metrics.hand.landmarks.clone(),
@@ -307,7 +300,7 @@ impl Dashboard {
             Tab::Basic => column![
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
-                render_card(self.ramp, self.show_ascii),
+                render_card(self.ramp, ascii),
                 meter_card("Volume", self.metrics.sound.volume, VOLUME),
                 meter_card("Confidence", self.metrics.hand.confidence, CONFIDENCE),
                 status_card(&self.metrics),

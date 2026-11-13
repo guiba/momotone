@@ -212,6 +212,11 @@ pub struct StatusView {
     pub root: String,
     /// Timbre of the oscillator, e.g. "saw".
     pub waveform: String,
+    /// The picture subsystems as the pipeline actually ran them. The dashboard used
+    /// to mirror these in its own fields; the budget guard can turn them off without
+    /// a click, so a mirror would lie. One writer (the frame loop), one reader (the UI).
+    pub feed: bool,
+    pub ascii: bool,
     pub log: VecDeque<EventLogEntry>,
 }
 

@@ -423,6 +423,8 @@ fn main() -> Result<()> {
             sink: sink_label.to_string(),
             scale: scale_name,
             root: root_name,
+            feed: false,
+            ascii: args.ascii,
             ..StatusView::default()
         },
         scene: SceneView {

@@ -722,6 +722,11 @@ impl Pipeline {
         self.metrics.hand.tip_y = 0.0;
         self.trail.clear();
         self.metrics.sound.trail.clear();
+        // Keep the published picture state truthful while stopped too, so the header
+        // buttons and the guard's decisions read the same way paused as running.
+        let settings = self.settings();
+        self.metrics.status.feed = settings.feed;
+        self.metrics.status.ascii = settings.ascii;
         self.publish();
     }
 
@@ -788,6 +793,11 @@ impl Pipeline {
         // Read the UI's wishes *after* the timing, so a shed that fires on this
         // frame's tail takes effect on this frame's picture rather than the next one.
         let settings = self.settings();
+        // Publish what the picture subsystems *are*, not what the UI asked for: the
+        // budget guard can switch them off without a click, and a mirror in the
+        // dashboard would then be lying.
+        self.metrics.status.feed = settings.feed;
+        self.metrics.status.ascii = settings.ascii;
         self.update_tracking(&state);
         self.dispatch_gesture(&state);
         // The keyboard glow follows the gesture, on the frame loop's clock.
@@ -2004,6 +2014,36 @@ mod tests {
         assert!(
             pipeline.control.lock().unwrap().ascii,
             "a manual toggle beats the guard"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_picture_state_the_run_actually_has() {
+        // The dashboard's buttons used to keep their own mirror of feed/ascii. The
+        // budget guard can clear those without a click, so the mirror would drift
+        // from reality; the snapshot is the single source of truth.
+        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+        let TestHarness {
+            mut pipeline,
+            control,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, true, Ramp::Blocks),
+            false,
+            DEFAULT_COLS,
+            0.0,
+            shared.clone(),
+        );
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        assert!(shared.lock().unwrap().status.ascii, "asked for, so on");
+
+        control.send(UiCommand::SetAscii(false)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        assert!(
+            !shared.lock().unwrap().status.ascii,
+            "the published state follows the pipeline, not the initial request"
         );
     }
 
