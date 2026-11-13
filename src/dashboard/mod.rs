@@ -31,6 +31,7 @@ use iced::{time, Subscription};
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, Waveform};
 use crate::core::runtime::UiCommand;
+use crate::core::telemetry::Latency;
 use crate::dashboard::gauges::{Meter, Sparkline};
 use crate::dashboard::metrics::{note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
@@ -586,6 +587,30 @@ fn meter_card<'a>(title: &'a str, value: f32, color: Color) -> Element<'a, Messa
     .into()
 }
 
+/// One stage's tail, as a single line: the median, the worst frame in the last
+/// four seconds, and whether the stage is blowing the 33 ms frame budget.
+fn stage_line<'a>(name: &'a str, latency: &Latency) -> Element<'a, Message> {
+    // p95 is the honest test: a stage whose 95th percentile exceeds the frame
+    // interval is dropping frames often enough to hear.
+    let over_budget = latency.p95 > 33.0;
+    row![
+        text(name).size(11).color(MUTED),
+        space::horizontal(),
+        text(format!(
+            "p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1} ms{}",
+            latency.p50,
+            latency.p95,
+            latency.p99,
+            latency.max,
+            if over_budget { "  • over budget" } else { "" }
+        ))
+        .size(12)
+        .color(if over_budget { ALARM } else { TEXT }),
+    ]
+    .spacing(8)
+    .into()
+}
+
 fn perf_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
     card(
         "PERFORMANCE",
@@ -608,6 +633,15 @@ fn perf_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
                 ),
             ),
             kv("uptime", format!("{} s", metrics.perf.uptime_ms / 1000)),
+            // Averages hide the tail; the percentiles are what show a regression.
+            stage_line("capture", &metrics.perf.profile.capture),
+            stage_line("inference", &metrics.perf.profile.inference),
+            stage_line("camera→UI", &metrics.perf.profile.end_to_end),
+            stage_line("dispatch", &metrics.perf.profile.dispatch),
+            kv(
+                "tail window",
+                format!("{} inference samples", metrics.perf.profile.inference.count),
+            ),
         ]
         .spacing(4),
     )
