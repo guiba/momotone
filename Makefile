@@ -8,9 +8,12 @@
 #
 # Notes:
 #   * The first build compiles OpenCV; afterwards `cargo check` is ~4 s warm.
-#   * `make verify` treats clippy warnings as errors on purpose. Today it is red:
-#     8 lints are live (run `make lint-count` to see them, 5 are auto-fixable with
-#     `make clippy-fix`). Clear them rather than lowering the bar.
+#   * `make verify` treats clippy warnings as errors on purpose, and it is green.
+#     Clear a lint rather than lowering the bar; if a suppression is ever needed,
+#     say why in the commit message.
+#   * `make trace-check` is a real regression gate, but only on an idle machine:
+#     the detector's ROI anchor is seeded from the previous frame, so competing
+#     load shifts the timings and therefore the detections.
 #   * The `block v0.1.6` future-incompat notice comes from a transitive dep and is
 #     not ours to fix.
 
@@ -28,7 +31,7 @@ CLIP_FRAMES ?= 120
 .DEFAULT_GOAL := help
 
 .PHONY: help verify lint check clippy clippy-fix fmt fmt-check test bench build run \
-        run-release mock ascii headless yolo image fixture trace-check record trace \
+        run-release mock ascii headless budget yolo image fixture trace-check record trace \
         stats clean
 
 ## The gate: run this before every commit.
@@ -45,7 +48,7 @@ help:
 	@echo "  builds   build | check"
 	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
 	@echo "  fixture  fixture | trace-check | record | trace"
-	@echo "  misc     stats | clean"
+	@echo "  misc     stats | budget | clean"
 
 fmt:
 	$(CARGO) fmt
@@ -96,6 +99,11 @@ ascii:
 ## Headless live run: prints fps / capture / inference / dropped per frame.
 headless:
 	$(CARGO) run --release -- --no-ui --max-frames $(FRAMES) --debug
+
+## Make the subsystem budget guard visible: inference's p95 is nowhere near 5 ms,
+## so this fires the shed and logs why. `--budget-ms 0` turns the guard off.
+budget:
+	$(CARGO) run --release -- --no-ui --ascii --budget-ms 5 --max-frames 60 --debug
 
 yolo:
 	$(CARGO) run --release -- --model yolo --score-threshold 0.3 --no-ui --max-frames $(FRAMES) --debug

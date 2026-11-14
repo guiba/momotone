@@ -242,3 +242,52 @@ every reported box square with a palm centre inside the frame. This is the only 
 loads the real ONNX graphs; it is `#[ignore]`d because it needs the gitignored assets.
 
 Tests: **146 passing** (6 ignored), gate green.
+
+---
+
+# After Phase 5 observability (`phase5-observability`, same machine, release build)
+
+## Percentiles, measured rather than averaged
+
+Three consecutive `make trace-check` runs of the 120-frame fixture on an idle machine,
+showing the end-of-run `INFO` line that `--debug` now prints:
+
+```
+120 frames in 3.99 s: 29.8 fps, 33.25 ms/frame end to end (capture 0.22 ms, inference 11.52 ms, 0 frames dropped)
+120 frames in 3.99 s: 29.8 fps, 33.25 ms/frame end to end (capture 0.22 ms, inference 11.53 ms, 0 frames dropped)
+120 frames in 3.99 s: 29.8 fps, 33.25 ms/frame end to end (capture 0.22 ms, inference 11.78 ms, 0 frames dropped)
+```
+
+Frame-to-frame the run is stable to within 0.26 ms of inference p50, and the trace is
+byte-identical each time. The percentiles the Performance card now shows come from the
+same rings; nothing new is measured, only what was already being thrown away.
+
+Live camera, 60 frames, `make headless`:
+
+```
+capture   p50 33.2  p95 56.7  p99 62.7  max 62.7
+inference p50 12.4  p95 17.6  p99 20.0  max 20.0
+camera->publish 0.0 / 0.1 / 5.9 / 5.9
+dispatch->sink  0.0 / 0.0 / 0.0 / 0.0
+```
+
+**Reading:** capture's p95 (56.7 ms) is 70 % above its median — the camera driver is the
+unreliable stage, not inference. Inference's whole distribution fits inside one frame
+interval with room to spare. This is the number the budget guard keys on, and it is why
+the guard looks at p95 rather than the mean: an average of 12 ms hides a 57 ms tail.
+
+## The subsystem budget (`make budget`)
+
+`--budget-ms 5` against the fixture, where inference p95 is 19.4 ms:
+
+```
+WARN gesture_rust::pipeline: inference p95 19.4 ms exceeds the 5 ms budget - ascii and camera preview off
+```
+
+At the shipped default (`--budget-ms 33`, the 30 fps frame interval) the guard does **not**
+fire on either backend: MediaPipe inference p95 is 11.7–17.6 ms, and even the fixture's
+worst tail is under 33 ms. So the guard is dormant in normal use — it is a load-shedding
+policy that only bites when something else (the pose model, a second process, a 4K
+capture) pushes inference past the interval. `--budget-ms 0` disables it entirely.
+
+Tests: **152 passing** (6 ignored), `make verify` green.

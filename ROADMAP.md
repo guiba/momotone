@@ -1,67 +1,74 @@
 # Roadmap — gesture_rust
 
 Effort tags: **S** (a few hours), **M** (a day-ish), **L** (multi-day). Ordered by value-to-effort.
-Status: measured on `master` after the mirror/ROI/UI/feed work (see "Recently done" at the bottom).
+Status: measured on `master` after Phases 1–5 of `MASTER_PLAN.md`. Items struck through are done;
+the numbers below are from the current tree.
 
 ## Measured baseline
 
 | What | Number | Where |
 | :--- | :--- | :--- |
-| Frame loop (MediaPipe, live camera) | **30.6 fps**, 33.2 ms/frame — capture 32.3 ms, inference 8.0 ms (detector 8.0 ms, landmarker 0 µs when the reuse cache is serving), 0 dropped | `cargo run --release -- --no-ui --max-frames 200 --debug` |
+| Frame loop (MediaPipe, live camera) | **29.9 fps**, 33.4 ms/frame — capture 33.4 ms, inference 10.2 ms p50 (p95 11.7), 0 dropped | `make headless` |
+| Frame loop (fixture clip, headless) | **29.7 fps**, 33.34 ms/frame — capture 0.2 ms, inference 11.1 ms p50, 0 dropped | `make fixture` |
 | Frame loop (pose model) | **21 fps**, 41 ms/frame — capture 29 ms, inference 69 ms, 13 of 73 dropped | same with `--model yolo --score-threshold 0.3` |
-| Camera read | ~31 ms; the loop is paced by the driver, not by inference | `--debug` end-of-run summary |
-| Detector stage (192×192, hand absent) | 9.5 ms | same run, `--debug` |
-| Detector stage (192×192, fixture image) | 7.2 ms | `cargo run --release -- --image output_frame.png --debug --max-frames 40` |
+| Camera read | ~31 ms; the loop is paced by the driver, not by inference | end-of-run `INFO` summary |
+| Detector stage (192×192, hand absent) | 9.5 ms | `--debug` |
 | Detector input sampling (192×192) | 133 µs (reused buffer) vs 247 µs legacy | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
 | Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
-| Frame snapshot copy | 0.44 µs | not worth optimising |
-| RGBA conversion (`frame_to_rgba`) | 0.30 ms/frame — only when the feed is on *and* due | `cargo test --release -- --include-ignored bench_feed_upload --nocapture` |
-| Snapshot publish carrying a full frame | 0.020 ms cloned; 0 once the pixel buffer is moved instead of cloned | `cargo test --release -- --include-ignored bench_publish_snapshot --nocapture` |
+| RGBA conversion (`frame_to_rgba`) | 0.30 ms/frame — only when the feed is on *and* due | presenter benches |
 | Mirroring | **0.018 ms/frame**, no allocation after the first frame | `cargo test --release -- --include-ignored bench_mirror_flip` |
-| Mock-mode clock | **40.8 ms/frame measured** against the 33 ms requested | `--mode mock --no-ui --max-frames 120 --debug` |
+| Mock-mode clock | **33 ms/frame** — a deadline clock, not a flat sleep | `--mode mock --no-ui --max-frames 120 --debug` |
 | rustc warnings | 0 (only the third-party `block v0.1.6` future-incompat notice) | `cargo build` |
-| clippy lints | 1 — `chunks_exact_to_as_chunks`, `src/pipeline.rs:757` | `cargo clippy` |
+| clippy lints | 0 — `make clippy` is `-D warnings` and part of `make verify` | `make verify` |
 | Dead code | 1 flag, `Visualizer::draw_skeleton`, which *is* used by `--image` — a call-graph false positive | `aft_inspect` |
 
 ## Codebase census (this sweep)
 
-- **24 source files, ~6.9k lines.** `pipeline.rs` (1383) and `vision/tracker.rs` (790) are the two big ones; `dashboard/mod.rs` is 663.
-- **91 tests pass, 4 benches are `#[ignore]`d.** Coverage is concentrated in `pipeline.rs` (21 tests), `strategies` (14 across the keyboard and the theremin), `tracker` (7), `yolo_pose` (5), `midi` (9), `grid`/`scale`/`instrument`/`synthesizer` (5 each).
-- **Zero tests** in `dashboard/mod.rs` (663 lines), `dashboard/skeleton.rs` (514), `dashboard/gauges.rs` (139), `main.rs` (357), `visualizer/mod.rs` (101), `core/event_bus.rs`. That is ~1.5k lines of UI and plumbing code with no test at all.
-- **Cyclomatic complexity hotspots:** `Skeleton::draw` 20, `Pipeline::advance` 17, `Pipeline::run` 17, `Dashboard::update` 16, `keyboard()` 16, `sample_affine_to_tensor` 16, `run_detector` 12, `root_class` 11, `main` 10, `decode_pose` 10.
+- **35 source files, 10,953 lines.** `pipeline.rs` (2,050, of which 1,150 is its test module) and
+  `dashboard/skeleton.rs` (909) are the two big ones; the iced layer is 1,955 lines.
+- **151 tests pass, 6 benches are `#[ignore]`d.** Coverage now spans the strategies, the estimator,
+  the detection gate, the resampling helper and the ROI window, both pose-output layouts, the
+  geometry helpers, the mock hand, the release and pause paths, the MIDI note gate, the trail
+  decay, the synthesizer voice lifecycle, the presenter cadence, the keyboard band/cell geometry,
+  the trace differ and the video pacing.
+- **Still zero tests** in `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs`. The keyboard
+  geometry (T4.5) proved the pattern — split the arithmetic from the widget and it becomes testable;
+  `gauges.rs` and `metrics.rs` are next.
 - **Duplicate groups:** three ~20-line pairs in `vision/tracker.rs` — all inside `bench_sampling`, i.e. benchmark scaffolding, not production duplication.
 - **Import cycles:** 0.
 
 ## New findings worth scheduling
 
-1. **Mock mode runs at 25 fps, not 30** — `tick()` sleeps a flat `MOCK_CADENCE_MS`, and macOS `thread::sleep(33 ms)` actually returns after ~40.8 ms. Every mock telemetry number (fps, latency, trail decay) is therefore 23 % off. Fix with a deadline clock: compute `next = start + 33 ms`, sleep only the remainder, and drop the sleep when it is already past. **S**
-2. ~~The MIDI sink re-sends `note-on` every frame for a held note~~ **done** — see "Recently done": the sink now carries a `NoteGate`, so a held note attacks once, volume travels as CC 7, and `--min-note-ms` quantises a fast sweep into an arpeggio.
-3. **The oscillator is not band-limited and frequency changes are not phase-continuous** — `Waveform::Square`/`Saw` are naive `if phase < 0.5` / `2*phase - 1` shapes, which alias badly above a few hundred Hz, and setting `voice.frequency` mid-note jumps the phase, producing clicks when the hand sweeps the keyboard. Proposal: BLIT/synthesised square, and glide the frequency over ~10-30 ms (portamento) instead of snapping it. **M**
-4. **`ort` sessions are created with default settings** — no `intra_op_thread_count`, no provider selection. With capture, inference, sinks and the UI all on their own threads, ORT oversubscribing the cores is a plausible reason the detector alone costs 8 ms of the 33 ms budget. Measure `--debug` timings with the thread count pinned to 1, 2 and 4. **S**
-5. ~~Vestigial payload: nobody emits `GesturePayload::Signal`~~ **done** — it is now real: `--gesture theremin` (`src/strategies/theremin.rs`) maps the index tip's x to a logarithmic C2..C6 band and the thumb-index spread to amplitude. `EventType`/`GestureEvent.event_type`, which nothing ever read, were deleted.
-6. ~~Dead fields in the shared snapshot~~ **done** — `FrameMetrics.frame_id` and `GestureEvent.event_type` are gone. `scale::is_in_scale` stays, deliberately: it is the test-side invariant that every cell `GridLayout` builds really belongs to the scale it was given.
+1. ~~Mock mode runs at 25 fps, not 30~~ **done** — a deadline clock (`Telemetry::next_mock`) aims
+   at the 33 ms interval and sleeps only the remainder, so mock telemetry is honest. The mock hand is
+   also driven by the *frame index*, which is what makes its trace a golden reference.
+2. ~~The MIDI sink re-sends `note-on` every frame for a held note~~ **done** — the sink carries a `NoteGate`, a held note attacks once, volume travels as CC 7, and `--min-note-ms` quantises a fast sweep into an arpeggio.
+3. ~~The oscillator is not band-limited and frequency changes are not phase-continuous~~ **done** — `src/audio/synthesizer.rs` now uses the device sample rate, BLIT-style band-limited square/saw capped at `MAX_HARMONICS = 24`, soft clipping, a 12 ms attack, a 60 ms release and a 15 ms pitch glide.
+4. ~~`ort` sessions are created with default settings~~ **mostly done** — `--ort-threads` pins ORT intra-op threads (0 = runtime default, which measured fastest here). Pinning through the rc API hit trait-bound friction in `ort 2.0.0-rc.13`; the knob exists, the measurement is still open.
+5. ~~Vestigial payload: nobody emits `GesturePayload::Signal`~~ **done** — it is now real: `--gesture theremin` (`src/gesture/theremin.rs`) maps the index tip's x to a logarithmic C2..C6 band and the thumb-index spread to amplitude. `EventType`/`GestureEvent.event_type`, which nothing ever read, were deleted, and `GestureEvent`/`GesturePayload` became the `Performance { Note, Signal, Release }` enum.
+6. ~~Dead fields in the shared snapshot~~ **done** — `FrameMetrics.frame_id` and `GestureEvent.event_type` are gone, and `FrameMetrics` is now four named views (`hand`, `sound`, `perf`, `scene`, `status`) with one writer each.
 7. ~~Doc drift~~ **done** — `AGENTS.md` now says `DEFAULT_SCORE_THRESHOLD = 0.6` (the code's value), drops the phantom `ndarray 0.17` dependency, describes the deleted scaffolding as deleted, and lists `--gesture` / `--theremin-low-hz` / `--theremin-high-hz` / `--min-note-ms`.
-8. **No detector hysteresis** — the argmax anchor crosses the threshold from frame to frame (measured: 0.401 then 0.463 on the same empty scene with `--score-threshold 0.6`), so detection flickers near the gate. Require N consecutive detections before a gesture starts and a short grace window before the release event. **S**
-9. **Camera resolution is larger than the model ever sees** — capture is 640×480 but the detector samples a 192×192 square and the landmarker a 224×224 one. Try `--camera-width 320 --camera-height 240` and compare `capture` in the `--debug` summary; the camera read (32 ms) *is* the loop's pacing, so cheaper pixels are the only remaining lever on end-to-end latency. **S**
-10. **The UI's only unshared state is the trail** — `note_trail`, `volume_history` and `confidence_history` live in `Dashboard` while everything else round-trips through `FrameMetrics`. Making the trail part of the published snapshot would let the pipeline own the decay and would make the keyboard drawable from a pure function (testable). **S**
-11. **No CI, no clippy gate** — ~~no rustfmt~~ **done**: the whole crate is now `cargo fmt --check` clean (the tree predated formatting and got swept as a side effect of the housekeeping commit). Clippy still has one live lint (`chunks_exact_to_as_chunks`, `src/pipeline.rs:757`). A CI job is the cheapest way to keep the warning count at zero. **S**
-12. **Latency is reported as an EMA only** — `fps`, `frame_ms`, `capture_ms` and `latency_ms` are last-frame values; a dropped-frame spike is invisible except in the counter. A rolling p50/p95 of each stage would make regressions obvious from the dashboard. **S**
+8. ~~No detector hysteresis~~ **done** — `src/core/detection_gate.rs` requires 2 confirm frames and grants a 3-frame grace window, so the flickering anchor score no longer clicks the note on and off.
+9. **Camera resolution is larger than the model ever sees** — capture is 640×480 but the detector samples a 192×192 square and the landmarker a 224×224 one. Try `--camera-width 320 --camera-height 240` and compare `capture` in the end-of-run summary; the camera read (32 ms) *is* the loop's pacing, so cheaper pixels are the only remaining lever on end-to-end latency. **S**
+10. ~~The UI's only unshared state is the trail~~ **done** — `KeyboardTrail` is owned by the pipeline and published in `SoundView`, so the stage draws a fact about the run rather than maintaining its own history. The keyboard's cell geometry is a plain `Keyboard` struct, testable without iced.
+11. ~~No CI, no clippy gate~~ **done** — there is no GitHub Actions by design; `make verify` is the gate (`check` + `test` + `fmt --check` + `clippy --all-targets -D warnings`) and clippy is clean.
+12. ~~Latency is reported as an EMA only~~ **done** — `Samples`/`StageProfile` keep rolling p50/p95/p99/max for capture, inference, camera→publish and dispatch→sink, printed at `INFO` at the end of a run and shown on the Performance card with an over-budget marker.
 
 ## Now — highest value next
 
-1. ~~MIDI note-on/off discipline~~ (finding 2) + **retrigger on cell change** — one attack per cell transition, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **done for MIDI; the audio sink still glides** (see finding 3).
-2. **Mock-mode deadline clock** (finding 1) — mock is the only way to exercise the UI without a webcam, so its pacing has to be honest. **S**
-3. **Tracker fixture tests** using `--image` snapshots (gold box + 21 landmarks) so the ONNX stages are tested, not just the geometry helpers. **M**
-4. **CI**: `cargo fmt --check` + `clippy` + `cargo check` (finding 11). **S**
-5. **Audio: band-limited waveforms + ADSR + portamento** (finding 3) — the biggest jump from "theremin" to "instrument". **M**
-6. **Detector hysteresis** (finding 8). **S**
-7. **ORT thread pinning** (finding 4). **S**
-8. **Cache the keyboard backdrop** — `keyboard()` re-fills all 49 base cells plus separators every UI tick; the static part (cells, separators, octave labels) could be drawn once or only when the panel size changes. **S**
+1. ~~MIDI note-on/off discipline~~ (finding 2) + **retrigger on cell change** — one attack per cell transition, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **done for MIDI; the audio sink glides by design** (see finding 3).
+2. ~~Mock-mode deadline clock~~ (finding 1) **done**.
+3. ~~Tracker fixture tests~~ **done** — `tracker_finds_the_hand_in_the_clip` runs the real ONNX graphs over `fixtures/hand_clip.mp4` (106/120 detections, all 21 landmarks).
+4. ~~CI~~ (finding 11) **done** — `make verify`.
+5. ~~Audio: band-limited waveforms + ADSR + portamento~~ (finding 3) **done**.
+6. ~~Detector hysteresis~~ (finding 8) **done**.
+7. ~~ORT thread pinning~~ (finding 4) **partly done** — `--ort-threads` exists; the measurement is still open.
+8. ~~Cache the keyboard backdrop~~ **done** — `StageCache` in `dashboard/skeleton.rs` caches the backdrop and the grid; only the trail, play head, feed and skeleton are redrawn each tick.
 9. ~~Housekeeping sweep~~ (findings 5, 6, 7) **done** — see "Recently done".
-10. ~~Kill the per-frame clones~~ **done, but it was not the bottleneck** — the tracker now moves the landmark Vec into the result instead of cloning it, and `Pipeline::tick` refills `metrics.landmarks` / `previous_landmarks` with `clone_from` so their buffers are reused. Measured: copying the whole `FrameMetrics` snapshot costs **0.44 µs/frame** (0.0015 % of a 33 ms frame), so a hand-written `copy_from` was not worth the maintenance risk of a field-by-field copy drifting out of sync with the struct.
-11. ~~Pitch hysteresis / smoothing~~ **done** — the index-tip x runs through an EMA (`PITCH_EMA_ALPHA = 0.35`) before quantisation, and the smoother resets when the hand is lost. Test `the_smoothing_kills_jitter_but_follows_a_sweep` compares note flapping with and without it.
-12. ~~Release profile + per-stage latency printout~~ **done** — `[profile.release] lto = "fat"`, `codegen-units = 1`, and `--debug` now prints `frame 31.07 ms (detector 9548 us, landmarker 0 us)`.
-13. ~~Clear the 13 dead-code warnings~~ **done** — deleted `sources/mock.rs` (`MockSource`, `MockSourceImpl`, `SourceTrait`), `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, the core `Source`/`Tracker` traits, `GestureEvent::new_signal` and `MidiOutputEngine::control_change`; `StreamWrapper`'s unread field is now `#[allow(dead_code)]` with a comment (holding the stream *is* the point). `cargo build` is warning-free except the third-party `block v0.1.6` future-incompat notice.
+10. ~~Kill the per-frame clones~~ **done, but it was not the bottleneck** — the tracker now moves the landmark Vec into the result instead of cloning it. Measured: copying the whole `FrameMetrics` snapshot costs **0.44 µs/frame** (0.0015 % of a 33 ms frame), so a hand-written `copy_from` was not worth the maintenance risk.
+11. ~~Pitch hysteresis / smoothing~~ **done** — the index tip runs through an EMA in the estimator before quantisation.
+12. ~~Release profile + per-stage latency printout~~ **done** — `lto = "fat"`, `codegen-units = 1`, and the stage tails are p50/p95/p99/max.
+13. ~~Clear the 13 dead-code warnings~~ **done** — deleted `sources/mock.rs`, `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, the core `Source`/`Tracker` traits, `GestureEvent::new_signal` and `MidiOutputEngine::control_change`; `StreamWrapper`'s unread field is now `#[allow(dead_code)]` with a comment (holding the stream *is* the point).
 
 ## Model backends (`feat/yolo-pose`)
 
@@ -86,7 +93,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - ~~Mirror flip in place~~ **done, but it was never a bottleneck** — the bindings take two separate borrows, so `flip(frame, frame, 1)` is not expressible; `WebcamSource` now carries a scratch `Mat` and swaps it with the captured frame, so the destination allocation happens once instead of every frame. Measured 0.0176 ms/frame (fresh Mat) vs 0.0174 ms/frame (reused scratch): the allocator recycles the 920 KB block, so the saving is ~0.0002 ms/frame. Flipping the landmarks' x instead of the pixels would skip the memcpy too, but that is at most 0.018 ms of a 31 ms frame — inference and the camera read are where the time is. Verified by `mirroring_reverses_the_columns` and `a_second_flip_reuses_the_scratch_buffer_instead_of_allocating`.
 - ~~Split capture, inference and sinks onto their own threads~~ **done** — `Pipeline::run` now runs three stages: the capture thread reads the webcam into a capacity-1 channel (a frame inference has not reached yet is dropped and counted, so inference never works on stale pixels), the pipeline thread does tracker → strategy → publish, and a sink thread owns the event receiver and drives the audio/MIDI outputs. `frame_ms` in `FrameMetrics` is now inference time only; `capture_ms`, `latency_ms`, `captured` and `dropped` sit next to it and the Advanced tab's Performance card shows them. `fps` is measured from the gap between published frames rather than the sum of the stages, since the stages now overlap. `Pipeline::tick` remains the single-frame inline path (mock mode and the tests use it). Run with `cargo run --release -- --debug --no-ui` and compare `inference` against `capture`: the loop is paced by whichever stage is slower.
 - ~~Trim `tokio`~~ **done** — `Cargo.toml` now declares `features = ["rt", "time"]` instead of `["full"]`.
-- **Audio callback lock** — the cpal callback takes a `Mutex<SynthesizerState>` per audio block (a callback every few milliseconds, i.e. hundreds of lock/unlock pairs per second). Move to atomics or a double-buffered state so the hot path is lock-free. **M**
+- ~~Audio callback lock~~ **done** — the cpal callback reads four atomics (`Target { sounding, frequency, amplitude, waveform }`) and owns a single `Voice`; it takes no lock, allocates nothing and makes no syscall.
 - **Camera: capture at 320×240** (finding 9) — the detector only ever sees a 192×192 square. **S**
 - **ORT session tuning** (finding 4). **S**
 - **GPU / alternative ONNX Runtime execution provider** for `ort`. **L**
@@ -100,14 +107,14 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - ~~Degree × octave matrix~~ **done** — `src/core/grid.rs` builds a `GridLayout` (columns = scale degree, rows = octave, top row highest) centred inside C2–C6 and shrunk if the requested span cannot fit. `FingerPositionStrategy` EMA-smooths the index tip in **both** axes and maps it to a cell; the canvas draws the same cells with the same `NOTE_MARGIN` inset, labels octave rows, and names each cell when it is big enough. `--octaves` sets the row count (default 3).
 - ~~Dashboard pickers~~ **done** — an `INSTRUMENT` card at the top of the basic rail with pick lists for scale, root, octave span and waveform. They write into one `Arc<Mutex<InstrumentConfig>>` (`src/core/instrument.rs`); the pipeline compares its `version` at the top of every tick and, only when it moved, re-keys the strategy and pushes the new timbre to the sinks. No restart needed.
 - **Retrigger on cell change** — one attack per cell transition instead of a continuous re-tune, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. Pairs with finding 2. **S**
-- **Waveform + ADSR in `Voice`** — sine/triangle/square/saw are in; attack/decay, band-limiting and detuned pairs are still open. **M**
+- ~~Waveform + ADSR in `Voice`~~ **partly done** — sine/triangle/square/saw are band-limited, there is a 12 ms attack and a 60 ms release, and pitch glides over 15 ms. Detuned pairs and a full ADSR are still open. **M**
 - **Vertical band calibration** — learn the y range the user actually occupies from recent landmark bounding boxes, so the top row is not unreachable. **M**
 - **Named instrument presets** — bundle scale + root + octave span + waveform + envelope (e.g. *Kalimba*: C pentatonic, pluck). **S**
 - **Velocity curve** — volume is currently a linear read of thumb↔index spread saturating at 60 % of the hand box. An exponent or a per-user curve (see `--calibrate`) would make the instrument feel less like a gate. **S**
 
 ### Gesture layer
 - **Landmark smoothing (EMA / Kalman-lite)** before any strategy runs — the tip is smoothed, the other 20 joints are not, so `spread`, `extension` and `tilt` are noisier than the pitch. **S**
-- **Detection hysteresis** (finding 8) — debounce the confidence gate instead of a per-frame argmax compare. **S**
+- ~~Detection hysteresis~~ (finding 8) **done** — `DetectionGate` debounces the confidence gate with 2 confirm frames and a 3-frame grace window.
 - **Discrete gesture set**: open hand, fist, pinch, peace, with per-gesture mapping configured rather than hardcoded. **M**
 - **Finger extension as switches** — `hand_geometry()` already computes per-finger extension; turn each into an on/off gate. Concretely: thumb-down = octave up, index+middle = sustain, pinky = mute. **M**
 - **Gesture chords** — combine several gestures into chord/scale selection. **M**
@@ -122,10 +129,10 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - ~~MIDI velocity as CC~~ (finding 2) **done** — a held note's loudness is CC 7; note-on velocity is only sent at the attack.
 
 ### Input & evaluation
-- **`--video <file>` playback source** so runs are reproducible. **M**
-- **Benchmark harness**: recorded clip + FPS/accuracy report. **M**
+- ~~`--video <file>` playback source~~ **done** — `VideoSource` reads a clip paced at its own frame rate, so a run is reproducible and `make trace-check` can diff it against a golden trace.
+- ~~Benchmark harness~~ **done** — `fixtures/hand_clip.mp4` + `bench/baseline.md` + `make fixture`/`make stats`.
 - **`--calibrate`** — sample the user's comfortable hand range and store per-user min/max, replacing the fixed `NOTE_MARGIN`. **M**
-- **Stage latency percentiles** (finding 12) — p50/p95 per stage in the Performance card. **S**
+- ~~Stage latency percentiles~~ (finding 12) **done** — p50/p95/p99/max per stage on the Performance card.
 
 ### Visualisation & UX
 - **Keyboard shortcuts** for Start/Stop and the toggles (iced key events) so the app is operable without hunting for buttons. **S**
@@ -137,12 +144,12 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - **Voice count / MIDI note-on-off state** in the rail. **S**
 
 ### Tooling
-- **CI**: `cargo fmt --check` + `cargo clippy` + `cargo check` (finding 11). **S**
-- **Tracker fixture tests** using `--image` snapshots (gold box + 21 landmarks) so the inference path is tested, not just the geometry helpers. **M**
-- **UI unit tests** — `Mapping`/letterbox math, `cell_index`, `fade_trail` and the note-name tables are pure functions with no test today (finding in the census). **S**
-- **Replace `println!`/`eprintln!` with `tracing`**. **S**
+- ~~CI~~ (finding 11) **done** — `make verify` runs `check`, `test`, `fmt --check` and `clippy --all-targets -D warnings`. No hosted CI by design.
+- ~~Tracker fixture tests~~ **done** — see `tracker_finds_the_hand_in_the_clip`.
+- **UI unit tests** — `Mapping`/letterbox math, `fade_trail` and the note-name tables are pure functions with little test today. The keyboard geometry (T4.5) is the template: a plain struct, no iced. **S**
+- ~~Replace `println!`/`eprintln!` with `tracing`~~ **done** — one `EnvFilter` in `main.rs`; `--debug` sets the level, `RUST_LOG` overrides it, and `ort::logging` is pinned to `warn`. No `debug: bool` field survives in any struct.
 - **TOML config** for model paths, thresholds, note ranges, with CLI overrides. **M**
-- **Split the complexity hotspots** — `Skeleton::draw` (20) and `Pipeline::advance` (17) are the two functions where a change touches five unrelated concerns; extracting `draw_backdrop`/`draw_skeleton`/`draw_labels` and `update_metrics`/`dispatch_gesture` would make each testable in isolation. **M**
+- ~~Split the complexity hotspots~~ **partly done** — `advance()` is five named stages and `Skeleton::draw` is split into cached backdrop/grid plus a mutable layer. `Pipeline::run` is still the biggest function in the crate.
 
 ## Recently done
 
@@ -162,4 +169,5 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 - `--max-frames` still terminates the pipeline even with the UI open, but Stop/Start has no equivalent headless flag.
 - `FrameMetrics.paused` is published but the stage canvas (`Skeleton`) does not use it.
-- Tests cover strategies, geometry, sampling, reuse, the trail, the capture stage, the release path and the MIDI note gate; nothing exercises the ROI window logic beyond `detector_crop`, no test runs the ONNX stages on a fixture image, and the iced dashboard and the visualizer have none at all.
+- The golden trace is only reproducible on an otherwise **idle** machine: the detector's ROI anchor is seeded from the previous frame, so load changes the timings, the timings change the anchor, and the anchor changes the detections. Three consecutive `make trace-check` runs matched exactly on a quiet machine; one differed by 36 frames while a `cargo build --release` was competing for cores. Treat it as a regression gate for a quiet machine, not a CI assertion.
+- `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs` still have no tests.

@@ -46,11 +46,10 @@ pub struct Presenter {
     /// with "now" so the very first frame is uploaded.
     next_feed: Instant,
     next_ascii: Instant,
-    debug: bool,
 }
 
 impl Presenter {
-    pub fn new(cols: usize, stdout: bool, dump: Option<String>, debug: bool) -> Self {
+    pub fn new(cols: usize, stdout: bool, dump: Option<String>) -> Self {
         let now = Instant::now();
         Self {
             ascii: AsciiLayer::new(),
@@ -59,7 +58,6 @@ impl Presenter {
             dump,
             next_feed: now,
             next_ascii: now,
-            debug,
         }
     }
 
@@ -90,9 +88,7 @@ impl Presenter {
                 Err(_) => continue,
             };
             if let Err(error) = self.present(&job, &settings, Instant::now(), &mut shared) {
-                if self.debug {
-                    eprintln!("[Presenter] {error}");
-                }
+                tracing::warn!("presentation failed: {error}");
             }
         }
     }
@@ -117,9 +113,7 @@ impl Presenter {
             self.next_ascii = now + feed_interval(settings.ascii_fps);
             metrics.scene.ascii = match &job.frame {
                 Some(frame) => self.ascii.render(frame, self.cols).unwrap_or_else(|error| {
-                    if self.debug {
-                        eprintln!("[Ascii] {error}");
-                    }
+                    tracing::warn!("ascii render failed: {error}");
                     AsciiGrid::default()
                 }),
                 // Mock mode has no camera pixels, so the art comes from the
@@ -153,6 +147,15 @@ impl Presenter {
         } else {
             // Keep the snapshot free of pixels the UI would discard.
             metrics.scene.pixels.clear();
+        }
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "picture: ascii {}x{} cells, feed {} bytes",
+                metrics.scene.ascii.cols,
+                metrics.scene.ascii.rows,
+                metrics.scene.pixels.len()
+            );
         }
         Ok(())
     }
@@ -238,7 +241,7 @@ mod tests {
 
     #[test]
     fn the_preview_is_only_converted_when_the_stage_shows_it() {
-        let mut presenter = Presenter::new(DEFAULT_COLS, false, None, false);
+        let mut presenter = Presenter::new(DEFAULT_COLS, false, None);
         let mut metrics = FrameMetrics::default();
         let now = Instant::now();
 
@@ -270,7 +273,7 @@ mod tests {
 
     #[test]
     fn the_upload_is_throttled_to_its_cadence() {
-        let mut presenter = Presenter::new(DEFAULT_COLS, false, None, false);
+        let mut presenter = Presenter::new(DEFAULT_COLS, false, None);
         let mut metrics = FrameMetrics::default();
         let settings = settings(true, false, 1.0, 15.0);
         let now = Instant::now();
@@ -337,7 +340,7 @@ mod tests {
 
     #[test]
     fn a_flat_frame_produces_a_flat_grid_at_the_requested_resolution() {
-        let mut presenter = Presenter::new(32, false, None, false);
+        let mut presenter = Presenter::new(32, false, None);
         let mut metrics = FrameMetrics::default();
 
         presenter
@@ -368,9 +371,9 @@ mod tests {
 
     #[test]
     fn mock_mode_draws_ascii_from_the_synthetic_hand() {
-        let mut presenter = Presenter::new(40, false, None, false);
+        let mut presenter = Presenter::new(40, false, None);
         let mut metrics = FrameMetrics::default();
-        let landmarks = crate::pipeline::synthetic_detection(0.0)
+        let landmarks = crate::vision::mock::synthetic_detection(0.0)
             .hand_landmarks
             .unwrap();
         let job = PresentJob {
@@ -404,7 +407,7 @@ mod tests {
 
     #[test]
     fn the_grid_keeps_its_render_until_its_own_cadence_is_due() {
-        let mut presenter = Presenter::new(16, false, None, false);
+        let mut presenter = Presenter::new(16, false, None);
         let mut metrics = FrameMetrics::default();
         let settings = settings(false, true, 15.0, 1.0);
         let now = Instant::now();

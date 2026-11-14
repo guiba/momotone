@@ -154,7 +154,6 @@ pub struct YoloPoseTracker {
     input_size: usize,
     stage: StageInput,
     score_threshold: f32,
-    debug: bool,
     cache: ReuseCache,
     last_score: f32,
 }
@@ -164,7 +163,6 @@ impl YoloPoseTracker {
         path: &str,
         input_size: usize,
         score_threshold: f32,
-        debug: bool,
         reuse_landmarks: bool,
         ort_threads: usize,
     ) -> Result<Self> {
@@ -193,9 +191,9 @@ impl YoloPoseTracker {
                 _ => None,
             });
         if let Some(side) = declared {
-            if side != input_size && debug {
-                println!(
-                    "[Pose] {path} is exported at a fixed {side}x{side} input; --pose-input {input_size} ignored. Re-export with `--dynamic` to change it."
+            if side != input_size {
+                tracing::warn!(
+                    "{path} is exported at a fixed {side}x{side} input; --pose-input {input_size} ignored. Re-export with `--dynamic` to change it."
                 );
             }
             input_size = side;
@@ -209,16 +207,14 @@ impl YoloPoseTracker {
             .map(|input| input.name().to_string())
             .unwrap_or_else(|| "images".to_string());
 
-        if debug {
-            let outputs: Vec<String> = session
-                .outputs()
-                .iter()
-                .map(|out| out.name().to_string())
-                .collect();
-            println!(
-                "[Pose] Loaded {path} (input '{input_name}', {input_size}x{input_size}, outputs {outputs:?})"
-            );
-        }
+        let outputs: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|out| out.name().to_string())
+            .collect();
+        tracing::info!(
+            "loaded {path} (input '{input_name}', {input_size}x{input_size}, outputs {outputs:?})"
+        );
 
         Ok(Self {
             session,
@@ -226,7 +222,6 @@ impl YoloPoseTracker {
             input_size,
             stage: StageInput::new(input_size, input_size),
             score_threshold: score_threshold.clamp(0.0, 1.0),
-            debug,
             cache: ReuseCache::new(reuse_landmarks),
             last_score: 0.0,
         })
@@ -266,11 +261,7 @@ impl YoloPoseTracker {
             let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
             match decode_pose(&dims, data) {
                 Ok(found) => detections.extend(found),
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("[Pose] skipped output {dims:?}: {e}");
-                    }
-                }
+                Err(e) => tracing::debug!("skipped output {dims:?}: {e}"),
             }
         }
 
@@ -282,12 +273,12 @@ impl YoloPoseTracker {
             ));
         }
 
-        if self.debug {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let mut scores: Vec<f32> = detections.iter().map(|d| d.score).collect();
             scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             scores.truncate(5);
-            eprintln!(
-                "[Pose] {} candidate detections, top scores {:?} (threshold {})",
+            tracing::debug!(
+                "{} candidate detections, top scores {:?} (threshold {})",
                 detections.len(),
                 scores,
                 self.score_threshold
@@ -307,17 +298,15 @@ impl YoloPoseTracker {
             return Ok(None);
         };
 
-        if self.debug {
-            eprintln!(
-                "[Pose] conf {:.3} box {:.0},{:.0} .. {:.0},{:.0} mean keypoint visibility {:.2}",
-                best.score,
-                best.x1,
-                best.y1,
-                best.x2,
-                best.y2,
-                best.mean_visibility()
-            );
-        }
+        tracing::debug!(
+            "conf {:.3} box {:.0},{:.0} .. {:.0},{:.0} mean keypoint visibility {:.2}",
+            best.score,
+            best.x1,
+            best.y1,
+            best.x2,
+            best.y2,
+            best.mean_visibility()
+        );
 
         // Map model pixels back to frame pixels through the mapping that was actually
         // applied to the input.
@@ -364,13 +353,11 @@ impl YoloPoseTracker {
                 result.hand_landmarks = Some(landmarks);
                 result.r#box = Some(square_box(anchor));
                 result.score = self.last_score;
-                if self.debug {
-                    eprintln!(
-                        "[Pose] hand steady, reusing the previous pose ({} frame{} in a row)",
-                        self.cache.streak(),
-                        if self.cache.streak() > 1 { "s" } else { "" }
-                    );
-                }
+                tracing::debug!(
+                    "hand steady, reusing the previous pose ({} frame{} in a row)",
+                    self.cache.streak(),
+                    if self.cache.streak() > 1 { "s" } else { "" }
+                );
                 return Ok(result);
             }
         }

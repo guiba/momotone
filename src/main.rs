@@ -9,6 +9,7 @@ mod vision;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
 use crate::core::runtime::{control_channel, RuntimeConfig};
+use crate::core::telemetry::FRAME_BUDGET_MS;
 use crate::core::Sink;
 use crate::dashboard::metrics::{FrameMetrics, SceneView, SoundView, StatusView, DEFAULT_FADE_MS};
 use crate::gesture::keyboard::FingerPositionStrategy;
@@ -183,6 +185,13 @@ struct Args {
     #[arg(long)]
     expect: Option<String>,
 
+    /// Shed the ASCII backdrop and the camera preview when inference's p95 exceeds
+    /// this many milliseconds. The default is the 30 fps frame interval; 0 turns the
+    /// guard off. The picture is the only work in the loop that is not on the sound
+    /// path, so it is what goes when inference runs out of time.
+    #[arg(long, default_value_t = FRAME_BUDGET_MS)]
+    budget_ms: f64,
+
     /// Scale the pitch is quantised to. Quantising means every reachable key is
     /// consonant with every other one, so sweeping the hand cannot clash. Use
     /// `chromatic` for the old every-semitone behaviour.
@@ -247,7 +256,6 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             &args.landmarker_path,
             &args.anchors_path,
             args.score_threshold,
-            args.debug,
             !args.landmarker_always,
             args.ort_threads,
         ),
@@ -255,20 +263,30 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             &args.pose_path,
             args.pose_input,
             args.score_threshold,
-            args.debug,
             !args.landmarker_always,
             args.ort_threads,
         ),
     }
 }
 
+/// One subscriber, one filter. `--debug` used to be a `bool` threaded into the
+/// tracker, the presenter and the pipeline so each could decide whether to print;
+/// a level filter decides that once, at the source, and every module can emit
+/// unconditionally.
+fn init_logging(debug: bool) {
+    // RUST_LOG wins when set, so a run can be tuned without adding a flag.
+    let mut filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(if debug { "debug" } else { "info" }));
+    // ONNX Runtime logs its own allocator chatter at INFO; that is not signal.
+    filter = filter.add_directive("ort::logging=warn".parse().expect("valid directive"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    init_logging(args.debug);
 
-    println!(
-        "Starting Gesture-to-Audio Engine in {:?} mode...",
-        args.mode
-    );
+    tracing::info!("starting gesture_rust in {:?} mode", args.mode);
 
     let waveform = core::instrument::Waveform::parse(&args.waveform).ok_or_else(|| {
         anyhow::anyhow!(
@@ -307,15 +325,15 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "output_frame.png".to_string());
         opencv::imgcodecs::imwrite(&out, &frame, &opencv::core::Vector::new())?;
 
-        println!(
-            "Detection: box={:?} score={:.3} landmarks={} detector={:.0}µs landmarker={:.0}µs",
+        tracing::info!(
+            "detection: box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",
             detection.r#box,
             detection.score,
             detection.hand_landmarks.as_ref().map_or(0, |l| l.len()),
             detection.timings.detector_us,
             detection.timings.landmarker_us,
         );
-        println!("Annotated frame written to {out}");
+        tracing::info!("annotated frame written to {out}");
         return Ok(());
     }
 
@@ -324,21 +342,21 @@ fn main() -> Result<()> {
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
     let sink_label = match args.mode {
         Mode::Signal => {
-            println!("Initializing Audio Engine... (gain {:.2})", args.amplitude);
+            tracing::info!("initialising audio engine (gain {:.2})", args.amplitude);
             let mut synth = Synthesizer::new(args.amplitude);
             synth.start()?;
             sinks.push(Box::new(synth));
             "audio"
         }
         Mode::Midi => {
-            println!("Initializing MIDI Engine (Port: {})...", args.port);
+            tracing::info!("initialising MIDI engine (port {:?})", args.port);
             let mut midi_engine = MidiOutputEngine::new(&args.port, args.min_note_ms);
             midi_engine.start()?;
             sinks.push(Box::new(midi_engine));
             "midi"
         }
         Mode::Mock => {
-            println!("Running in Mock mode (synthetic hand, no camera or models)");
+            tracing::info!("mock mode: synthetic hand, no camera, no models");
             "none"
         }
     };
@@ -368,20 +386,18 @@ fn main() -> Result<()> {
         ))
     };
 
-    if args.debug {
-        match &source {
-            Some(pipeline::FrameSource::Camera(camera)) => println!(
-                "[Camera] requested {}x{} @ {} fps, driver reports {} fps",
-                args.camera_width,
-                args.camera_height,
-                camera.requested_fps(),
-                camera.reported_fps()
-            ),
-            Some(pipeline::FrameSource::Video(video)) => {
-                println!("[Video] paced at {:.1} fps", video.fps());
-            }
-            None => println!("[Source] synthetic mock hand"),
+    match &source {
+        Some(pipeline::FrameSource::Camera(camera)) => tracing::info!(
+            "requested {}x{} @ {} fps, driver reports {} fps",
+            args.camera_width,
+            args.camera_height,
+            camera.requested_fps(),
+            camera.reported_fps()
+        ),
+        Some(pipeline::FrameSource::Video(video)) => {
+            tracing::info!("clip paced at {:.1} fps", video.fps());
         }
+        None => tracing::info!("no frame source: mock mode, no camera, no models"),
     }
 
     let strategy: Box<dyn Strategy> = match args.gesture {
@@ -407,6 +423,8 @@ fn main() -> Result<()> {
             sink: sink_label.to_string(),
             scale: scale_name,
             root: root_name,
+            feed: false,
+            ascii: args.ascii,
             ..StatusView::default()
         },
         scene: SceneView {
@@ -447,11 +465,11 @@ fn main() -> Result<()> {
         fade_ms: args.fade_ms,
         trace_out: args.trace.clone(),
         trace_expect: args.expect.clone(),
+        budget_ms: args.budget_ms,
         // With no window there is no stage to look at, so `--ascii` means the
         // art goes to stdout instead.
         ascii_stdout: args.no_ui && args.ascii,
         max_frames: args.max_frames,
-        debug: args.debug,
         emit_frames: !args.no_ui,
     });
 
@@ -459,14 +477,14 @@ fn main() -> Result<()> {
     //    give the main thread to the iced dashboard.
     if args.no_ui {
         pipeline.run(&running)?;
-        println!("Shutting down...");
+        tracing::info!("shutting down");
         return Ok(());
     }
 
     let pipeline_flag = running.clone();
     let handle = std::thread::spawn(move || {
         if let Err(e) = pipeline.run(&pipeline_flag) {
-            eprintln!("[Pipeline] {e}");
+            tracing::error!("pipeline failed: {e}");
         }
     });
 
@@ -475,7 +493,7 @@ fn main() -> Result<()> {
     running.store(false, Ordering::Relaxed);
     let _ = handle.join();
 
-    println!("Shutting down...");
+    tracing::info!("shutting down");
     ui_result?;
     Ok(())
 }

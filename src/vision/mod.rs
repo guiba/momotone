@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod mock;
 pub mod reuse;
 pub mod sampling;
 pub mod tracker;

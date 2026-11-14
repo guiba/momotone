@@ -50,7 +50,6 @@ impl HandTracker {
         landmarker_path: &str,
         anchors_path: &str,
         score_threshold: f32,
-        debug: bool,
         reuse_landmarks: bool,
         ort_threads: usize,
     ) -> Result<Self> {
@@ -59,7 +58,6 @@ impl HandTracker {
             landmarker_path,
             anchors_path,
             score_threshold,
-            debug,
             reuse_landmarks,
             ort_threads,
         )?)))
@@ -69,7 +67,6 @@ impl HandTracker {
         pose_path: &str,
         input_size: usize,
         score_threshold: f32,
-        debug: bool,
         reuse_landmarks: bool,
         ort_threads: usize,
     ) -> Result<Self> {
@@ -77,7 +74,6 @@ impl HandTracker {
             pose_path,
             input_size,
             score_threshold,
-            debug,
             reuse_landmarks,
             ort_threads,
         )?)))
@@ -135,7 +131,6 @@ pub struct MediaPipeTracker {
     /// Anchor centres in normalised detector space (0..1).
     pub anchors: Vec<(f32, f32)>,
     pub score_threshold: f32,
-    pub debug: bool,
     /// Per-stage input buffers, allocated once here and refilled in place every
     /// frame (see `StageInput`).
     detector_input: StageInput,
@@ -156,7 +151,6 @@ impl MediaPipeTracker {
         landmarker_path: &str,
         anchors_path: &str,
         score_threshold: f32,
-        debug: bool,
         reuse_landmarks: bool,
         ort_threads: usize,
     ) -> Result<Self> {
@@ -183,24 +177,21 @@ impl MediaPipeTracker {
             return Err(anyhow!("anchors file {anchors_path} is empty"));
         }
 
-        if debug {
-            println!(
-                "[Tracker] Loaded detector: {detector_path}, landmarker: {landmarker_path}, {} anchors, ORT intra-op threads {}.",
-                anchors.len(),
-                if threads == 0 {
-                    "default (all cores)"
-                } else {
-                    "pinned"
-                }
-            );
-        }
+        tracing::info!(
+            "loaded detector {detector_path}, landmarker {landmarker_path}, {} anchors, ORT intra-op threads {}",
+            anchors.len(),
+            if threads == 0 {
+                "default (all cores)"
+            } else {
+                "pinned"
+            }
+        );
 
         Ok(Self {
             detector_session,
             landmarker_session,
             anchors,
             score_threshold: score_threshold.clamp(0.0, 1.0),
-            debug,
             detector_input: StageInput::new(DETECTOR_INPUT, DETECTOR_INPUT),
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
             roi_palm: None,
@@ -221,10 +212,10 @@ impl MediaPipeTracker {
         let (tx, ty, side) = detector_crop(self.roi_palm, fw, fh);
         let k = side / DETECTOR_INPUT as f64; // detector pixel -> frame pixel
 
-        if self.debug {
-            let palm = self.roi_palm;
-            eprintln!("[Tracker] detector window x={tx:.0} y={ty:.0} side={side:.0} palm={palm:?}");
-        }
+        tracing::debug!(
+            "detector window x={tx:.0} y={ty:.0} side={side:.0} palm={:?}",
+            self.roi_palm
+        );
 
         let map = sample_affine_to_tensor(
             frame,
@@ -276,12 +267,10 @@ impl MediaPipeTracker {
             }
         }
 
-        if self.debug {
-            eprintln!(
-                "[Tracker] best anchor {best_idx} conf={best_conf:.3} (threshold {})",
-                self.score_threshold
-            );
-        }
+        tracing::debug!(
+            "best anchor {best_idx} conf={best_conf:.3} (threshold {})",
+            self.score_threshold
+        );
 
         if best_conf < self.score_threshold {
             self.note_miss();
@@ -417,20 +406,18 @@ impl MediaPipeTracker {
                 // still valid, so the 224x224 model is not executed this frame.
                 result.hand_landmarks = Some(landmarks);
                 result.timings.landmarker_us = 0.0;
-                if self.debug {
-                    eprintln!(
-                        "[Tracker] palm steady, reusing landmarks ({} frame{} in a row)",
-                        self.cache.streak(),
-                        if self.cache.streak() > 1 { "s" } else { "" }
-                    );
-                }
+                tracing::debug!(
+                    "palm steady, reusing landmarks ({} frame{} in a row)",
+                    self.cache.streak(),
+                    if self.cache.streak() > 1 { "s" } else { "" }
+                );
             } else {
                 let landmarker_start = Instant::now();
                 match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
                     Ok(landmarks) => {
                         result.timings.landmarker_us =
                             landmarker_start.elapsed().as_secs_f64() * 1e6;
-                        if self.debug {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
                             let (mut minx, mut miny, mut maxx, mut maxy) =
                                 (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                             for lm in &landmarks {
@@ -439,13 +426,15 @@ impl MediaPipeTracker {
                                 miny = miny.min(lm.y);
                                 maxy = maxy.max(lm.y);
                             }
-                            eprintln!(
-                                "[Tracker] landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
+                            tracing::debug!(
+                                "landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
                             );
                             for (i, lm) in landmarks.iter().enumerate() {
-                                eprintln!(
-                                    "[Tracker] lm[{i}] = ({:.1}, {:.1}, {:.3})",
-                                    lm.x, lm.y, lm.z
+                                tracing::debug!(
+                                    "lm[{i}] = ({:.1}, {:.1}, {:.3})",
+                                    lm.x,
+                                    lm.y,
+                                    lm.z
                                 );
                             }
                         }
@@ -453,9 +442,7 @@ impl MediaPipeTracker {
                         result.hand_landmarks = Some(landmarks);
                     }
                     Err(e) => {
-                        if self.debug {
-                            eprintln!("[Tracker] landmarker stage skipped: {e}");
-                        }
+                        tracing::warn!("landmarker stage skipped: {e}");
                         self.cache.clear();
                     }
                 }
@@ -787,7 +774,6 @@ mod tests {
             "assets/hand_landmarks_detector.onnx",
             "assets/anchors.csv",
             0.6,
-            false,
             true,
             0,
         )
