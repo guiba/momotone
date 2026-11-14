@@ -8,9 +8,9 @@ Reproduce with:
 
 ```bash
 make headless                          # live camera, MediaPipe
-./target/release/gesture_rust --model yolo --score-threshold 0.3 --no-ui --max-frames 150 --debug
+./target/release/momotone --model yolo --score-threshold 0.3 --no-ui --max-frames 150 --debug
 make mock
-./target/release/gesture_rust --image output_frame.png --debug
+./target/release/momotone --image output_frame.png --debug
 ```
 
 ---
@@ -281,7 +281,7 @@ the guard looks at p95 rather than the mean: an average of 12 ms hides a 57 ms t
 `--budget-ms 5` against the fixture, where inference p95 is 19.4 ms:
 
 ```
-WARN gesture_rust::pipeline: inference p95 19.4 ms exceeds the 5 ms budget - ascii and camera preview off
+WARN momotone::pipeline: inference p95 19.4 ms exceeds the 5 ms budget - ascii and camera preview off
 ```
 
 At the shipped default (`--budget-ms 33`, the 30 fps frame interval) the guard does **not**

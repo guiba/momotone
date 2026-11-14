@@ -1,9 +1,9 @@
-# AGENTS.md - AI Assistant Context for gesture_rust
+# AGENTS.md - AI Assistant Context for momotone
 
 This document provides structural and architectural context to guide AI assistants in working with this codebase.
 
 ## Project Overview
-`gesture_rust` is a real-time hand gesture recognition engine in Rust: OpenCV captures webcam frames, an **ONNX two-stage hand pipeline** (BlazeHand detector → landmark detector, via `ort`) produces a hand box plus 21 landmarks, a **strategy** turns those landmarks into a `GestureEvent`, and the **event bus** dispatches it to sinks (audio, MIDI) while an **iced dashboard** renders the live HUD.
+`momotone` is a real-time hand gesture recognition engine in Rust: OpenCV captures webcam frames, an **ONNX two-stage hand pipeline** (BlazeHand detector → landmark detector, via `ort`) produces a hand box plus 21 landmarks, a **strategy** turns those landmarks into a `GestureEvent`, and the **event bus** dispatches it to sinks (audio, MIDI) while an **iced dashboard** renders the live HUD.
 
 > **Current status (Nov 2026):** the vision pipeline works end-to-end and the local gate `make verify` (check + test + fmt + `clippy --all-targets -D warnings`) is green; the only warning left is a third-party `block v0.1.6` future-incompat notice. The frame loop lives in `src/pipeline.rs` and runs on **its own thread**; `main.rs` hands the main thread to the **iced** dashboard (`src/dashboard/`), so rendering never blocks inference. `tokio` is used only as iced's async executor (`features = ["rt", "time"]`). The detector stage is solid; the landmarker stage runs and returns 21 landmarks but is only lightly validated. The scaffolding from earlier iterations (`sources/mock.rs`, the unused strategies, the `Source`/`Tracker` traits, `Visualizer::draw_hud`, `GestureEvent.event_type`) has been deleted.
 
@@ -119,7 +119,7 @@ next_frame()  ->  advance()  ->  HandEstimator.update()  ->  Strategy.process() 
 | `src/dashboard/metrics.rs` | `FrameMetrics` shared between pipeline and UI, note naming, trail helpers. |
 
 ## Running It
-Models live in `gesture_rust/assets/` and are **gitignored** — they must be present locally or the tracker fails at startup. The MediaPipe pair comes from the Unity/Sentis BlazeHand package (`mediapipe_hand_gesture-onnx-float.zip`; see `assets/new_readme.md`). Defaults:
+Models live in `assets/` and are **gitignored** — they must be present locally or the tracker fails at startup. The MediaPipe pair comes from the Unity/Sentis BlazeHand package (`mediapipe_hand_gesture-onnx-float.zip`; see `assets/new_readme.md`). Defaults:
 `--detector-path assets/hand_detector.onnx`, `--landmarker-path assets/hand_landmarks_detector.onnx`, `--anchors-path assets/anchors.csv` (2016 anchors, normalised 0–1).
 
 ```bash

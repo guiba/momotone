@@ -1,4 +1,4 @@
-# Makefile — local CI for gesture_rust
+# Makefile — local CI for momotone
 #
 # There is no GitHub/GitLab here: this is the pre-commit gate. Run
 #
@@ -41,7 +41,7 @@ verify: check test fmt-check clippy
 ## --- quality ---------------------------------------------------------------
 
 help:
-	@echo "gesture_rust — make targets"
+	@echo "momotone — make targets"
 	@echo ""
 	@echo "  gate     verify | fmt-check | clippy | clippy-fix | check"
 	@echo "  tests    test | bench"

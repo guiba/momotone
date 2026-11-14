@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — architecture review of `gesture_rust`
+# ARCHITECTURE.md — architecture review of `momotone`
 
 **Read-only analysis, no code changed.** Written as a reference for future sessions
 (branch: `master`, commit `bbb7c40`). Focus: **simplification**, measured against

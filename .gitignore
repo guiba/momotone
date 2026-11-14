@@ -3,3 +3,10 @@
 *.pyc
 __pycache__/
 .DS_Store
+
+# Large model / binary assets (download or generate locally)
+assets/
+*.onnx
+*.zip
+*.png
+.zed/

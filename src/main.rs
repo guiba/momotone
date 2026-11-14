@@ -300,7 +300,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     init_logging(args.debug);
 
-    tracing::info!("starting gesture_rust in {:?} mode", args.mode);
+    tracing::info!("starting momotone in {:?} mode", args.mode);
 
     let waveform = core::instrument::Waveform::parse(&args.waveform).ok_or_else(|| {
         anyhow::anyhow!(

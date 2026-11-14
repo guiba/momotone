@@ -1,4 +1,4 @@
-# MASTER_PLAN.md — execution plan for the `gesture_rust` rearchitecture
+# MASTER_PLAN.md — execution plan for the `momotone` rearchitecture
 
 Derived from `ARCHITECTURE.md`. This is the **sequenced work plan**: what to do, in what
 order, how to prove each step worked, and what deliberately stays untouched.

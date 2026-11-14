@@ -1,4 +1,4 @@
-# Roadmap — gesture_rust
+# Roadmap — momotone
 
 Effort tags: **S** (a few hours), **M** (a day-ish), **L** (multi-day). Ordered by value-to-effort.
 Status: measured on `master` after Phases 1–5 of `MASTER_PLAN.md`. Items struck through are done;
