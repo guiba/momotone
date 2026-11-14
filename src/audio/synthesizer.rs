@@ -241,7 +241,7 @@ impl Sink for Synthesizer {
         // needs no lock and no allocation per block.
         let mut voice = Voice::idle();
         let stream = device.build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if target.is_sounding() {
                     let (frequency, amplitude, waveform) = target.read();

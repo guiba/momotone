@@ -161,12 +161,13 @@ impl MediaPipeTracker {
         // flag is an A/B knob for the jitter a full pool causes the UI and capture.
         let threads = ort_threads;
         let pin_error = |e| anyhow!("Failed to set ORT intra-op threads to {threads}: {e}");
-        let detector_session = Session::builder()
+        let env = ort::init().build()?;
+        let detector_session = Session::builder(&env)
             .with_context(|| format!("Failed to load detector {detector_path}"))?
             .with_intra_threads(threads)
             .map_err(pin_error)?
             .commit_from_file(detector_path)?;
-        let landmarker_session = Session::builder()
+        let landmarker_session = Session::builder(&env)
             .with_context(|| format!("Failed to load landmarker {landmarker_path}"))?
             .with_intra_threads(threads)
             .map_err(pin_error)?

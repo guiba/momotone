@@ -167,8 +167,8 @@ impl YoloPoseTracker {
         ort_threads: usize,
     ) -> Result<Self> {
         let mut input_size = input_size.max(32);
-        // See `MediaPipeTracker::new` for what the thread count means.
-        let session = Session::builder()
+        let env = ort::init().build()?;
+        let session = Session::builder(&env)
             .with_context(|| format!("Failed to load pose model {path}"))?
             .with_intra_threads(ort_threads)
             .map_err(|e| anyhow!("Failed to set ORT intra-op threads to {ort_threads}: {e}"))?
