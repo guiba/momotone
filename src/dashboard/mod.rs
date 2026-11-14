@@ -138,6 +138,22 @@ impl Dashboard {
                         shared.scene.pixels.clear();
                     }
                     self.metrics = shared.clone();
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            "ui tick: feed {}, ascii {}, image {}, ascii {}x{} cells, trail {} lit",
+                            self.metrics.status.feed,
+                            self.metrics.status.ascii,
+                            self.frame_image.is_some(),
+                            self.metrics.scene.ascii.cols,
+                            self.metrics.scene.ascii.rows,
+                            self.metrics
+                                .sound
+                                .trail
+                                .iter()
+                                .filter(|&&l| l > 0.0)
+                                .count(),
+                        );
+                    }
                 }
                 push(&mut self.volume_history, self.metrics.sound.volume);
                 push(&mut self.confidence_history, self.metrics.hand.confidence);

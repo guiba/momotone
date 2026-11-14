@@ -148,6 +148,15 @@ impl Presenter {
             // Keep the snapshot free of pixels the UI would discard.
             metrics.scene.pixels.clear();
         }
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "picture: ascii {}x{} cells, feed {} bytes",
+                metrics.scene.ascii.cols,
+                metrics.scene.ascii.rows,
+                metrics.scene.pixels.len()
+            );
+        }
         Ok(())
     }
 }
