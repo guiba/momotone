@@ -24,9 +24,7 @@ use opencv::prelude::*;
 use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
-use crate::core::telemetry::{
-    profile, shed_subsystems, Samples, StageProfile, PROFILE_REFRESH_FRAMES,
-};
+use crate::core::telemetry::{shed_subsystems, RunStats, PROFILE_REFRESH_FRAMES};
 use crate::core::trace::Trace;
 use crate::core::types::Performance;
 use crate::core::{HandDetectionResult, Sink};
@@ -179,7 +177,11 @@ pub struct Pipeline {
 
     // --- run state -------------------------------------------------------------
     run: RunFlags,
-    telemetry: Telemetry,
+    stats: RunStats,
+    /// When a hand was last seen, for the "lost for N ms" readout.
+    last_detection: Instant,
+    /// Deadline of the next synthetic frame, for mock mode's paced clock.
+    next_mock: Instant,
     presentation: Presentation,
     /// Taken by `run` and handed to the presenter thread.
     jobs_rx: Option<Receiver<PresentJob>>,
@@ -209,27 +211,6 @@ struct Budget {
     /// Set once the guard has fired, so the log says it once rather than every
     /// frame after the tail blows.
     shed: bool,
-}
-
-/// Clocks and the rolling samples of each stage: everything the dashboard and the
-/// summary line measure.
-struct Telemetry {
-    started: Instant,
-    /// Wall clock of the last published frame; the fps is derived from the gap
-    /// between publishes, which stays honest once the stages overlap.
-    last_publish: Instant,
-    last_detection: Instant,
-    /// Exponentially smoothed publish interval, in milliseconds.
-    avg_gap_ms: f64,
-    /// Deadline of the next synthetic frame, for mock mode's paced clock.
-    next_mock: Instant,
-    /// Rolling stage timings. The frame loop is paced by the slowest stage, so a
-    /// regression shows up as a tail here long before the average moves.
-    capture: Samples,
-    inference: Samples,
-    latency: Samples,
-    /// Read by the sink thread, which is a different thread, hence the shared ring.
-    dispatch: Arc<Mutex<Samples>>,
 }
 
 /// Presentation wiring: who the frame is handed to, and what that thread does with
@@ -351,17 +332,9 @@ impl Pipeline {
                 max_frames,
                 emit_frames,
             },
-            telemetry: Telemetry {
-                started: now,
-                last_publish: now,
-                last_detection: now,
-                avg_gap_ms: 0.0,
-                next_mock: now,
-                capture: Samples::default(),
-                inference: Samples::default(),
-                latency: Samples::default(),
-                dispatch: Arc::new(Mutex::new(Samples::default())),
-            },
+            stats: RunStats::new(),
+            last_detection: now,
+            next_mock: now,
             presentation: Presentation {
                 jobs: Some(jobs_tx),
                 presenter: Some(Presenter::new(ascii_cols, ascii_stdout, ascii_dump.clone())),
@@ -509,7 +482,7 @@ impl Pipeline {
         // longer holds the frame loop hostage.
         let sink_handle = {
             let sinks = self.sinks.clone();
-            let dispatch = self.telemetry.dispatch.clone();
+            let dispatch = self.stats.dispatch_ring();
             let rx = self.event_rx.take();
             std::thread::spawn(move || {
                 let Some(rx) = rx else {
@@ -586,7 +559,7 @@ impl Pipeline {
             self.metrics.perf.frame_ms,
             self.metrics.perf.dropped,
         );
-        let perf = self.stage_profile();
+        let perf = self.stats.profile();
         tracing::info!(
             "stage tails p50/p95/p99/max ms - capture {:.1}/{:.1}/{:.1}/{:.1}  inference {:.1}/{:.1}/{:.1}/{:.1}  camera->publish {:.1}/{:.1}/{:.1}/{:.1}  dispatch->sink {:.1}/{:.1}/{:.1}/{:.1}  ({} samples)",
             perf.capture.p50, perf.capture.p95, perf.capture.p99, perf.capture.max,
@@ -673,23 +646,6 @@ impl Pipeline {
         );
     }
 
-    /// Percentiles of the four stages. Recomputed once a second rather than every
-    /// frame: the sort is cheap but repeating it 30 times a second is not needed.
-    fn stage_profile(&self) -> StageProfile {
-        let dispatch = self
-            .telemetry
-            .dispatch
-            .lock()
-            .map(|samples| profile(&samples))
-            .unwrap_or_default();
-        StageProfile {
-            inference: profile(&self.telemetry.inference),
-            capture: profile(&self.telemetry.capture),
-            end_to_end: profile(&self.telemetry.latency),
-            dispatch,
-        }
-    }
-
     /// While stopped, release whatever the sinks are holding and publish a
     /// "paused" snapshot once, so the note does not latch and the keyboard trail
     /// fades to nothing.
@@ -702,7 +658,7 @@ impl Pipeline {
             drain_events(rx, &self.sinks);
         }
         // Otherwise the stopped interval shows up as a huge fps dip on resume.
-        self.telemetry.last_publish = Instant::now();
+        self.stats.reset_publish_clock();
 
         if self.metrics.status.paused {
             return;
@@ -736,10 +692,10 @@ impl Pipeline {
             // Sleeping 33 ms on macOS returns after ~41 ms, which would make every
             // mock number 25 % wrong; aim at the deadline instead.
             let now = Instant::now();
-            if now < self.telemetry.next_mock {
-                std::thread::sleep(self.telemetry.next_mock - now);
+            if now < self.next_mock {
+                std::thread::sleep(self.next_mock - now);
             }
-            self.telemetry.next_mock += MOCK_CADENCE;
+            self.next_mock += MOCK_CADENCE;
             // The hand is driven by the *frame index*, not the wall clock: a mock
             // run of N frames always shows the same hand at the same place, which
             // is what makes a golden trace test possible. The deadline clock above
@@ -823,29 +779,7 @@ impl Pipeline {
         inference_ms: f64,
         latency_ms: f64,
     ) {
-        let now = Instant::now();
-        let gap_ms = now
-            .duration_since(self.telemetry.last_publish)
-            .as_secs_f64()
-            * 1000.0;
-        self.telemetry.last_publish = now;
-
-        // Smooth the *interval*, not the reciprocal rate. With the stages
-        // overlapping, individual gaps alternate between a queued frame (a
-        // millisecond) and a full inference, and an EMA of fps turns that jitter
-        // into a number that bears no relation to the frame rate.
-        self.telemetry.avg_gap_ms = if self.telemetry.avg_gap_ms == 0.0 {
-            gap_ms
-        } else {
-            0.9 * self.telemetry.avg_gap_ms + 0.1 * gap_ms
-        };
-        self.metrics.perf.fps = (1000.0 / self.telemetry.avg_gap_ms.max(1.0)) as f32;
-
-        // Stage timings, in milliseconds, into the rolling rings the summary and
-        // the dashboard read as percentiles.
-        self.telemetry.capture.push(capture_ms);
-        self.telemetry.inference.push(inference_ms);
-        self.telemetry.latency.push(latency_ms);
+        self.metrics.perf.fps = self.stats.record(capture_ms, inference_ms, latency_ms);
 
         self.metrics.perf.frames += 1;
         if self
@@ -854,12 +788,12 @@ impl Pipeline {
             .frames
             .is_multiple_of(PROFILE_REFRESH_FRAMES)
         {
-            self.metrics.perf.profile = self.stage_profile();
+            self.metrics.perf.profile = self.stats.profile();
             // Load shedding: the picture is the only work in the loop that is not on
             // the sound path, so it is what goes when inference runs out of time.
             self.shed_if_over_budget();
         }
-        self.metrics.perf.uptime_ms = self.telemetry.started.elapsed().as_millis() as u64;
+        self.metrics.perf.uptime_ms = self.stats.started().elapsed().as_millis() as u64;
         self.metrics.status.paused = false;
         self.metrics.hand.frame_size = detection.frame_size;
         self.metrics.perf.frame_ms = inference_ms;
@@ -894,9 +828,9 @@ impl Pipeline {
         }
 
         if state.present {
-            self.telemetry.last_detection = Instant::now();
+            self.last_detection = Instant::now();
         }
-        self.metrics.hand.lost_ms = self.telemetry.last_detection.elapsed().as_millis() as u64;
+        self.metrics.hand.lost_ms = self.last_detection.elapsed().as_millis() as u64;
         self.metrics.hand.jitter_px = state.jitter_px;
 
         self.metrics.hand.geometry.spread = state.geometry.spread;
@@ -1088,7 +1022,7 @@ mod tests {
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
-    use crate::core::telemetry::{Latency, FRAME_BUDGET_MS};
+    use crate::core::telemetry::{Latency, StageProfile, FRAME_BUDGET_MS};
     use crate::dashboard::metrics::{note_index, StatusView, DEFAULT_FADE_MS};
     use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
@@ -1876,6 +1810,18 @@ mod tests {
         );
     }
 
+    /// A mock frame that pretends inference took `inference_ms`, so the budget guard
+    /// can be exercised without a model that is actually slow.
+    fn slow_frame(seconds: f64, inference_ms: f64) -> FrameOutcome {
+        FrameOutcome {
+            detection: synthetic_detection(seconds),
+            frame: None,
+            capture_ms: 0.0,
+            inference_ms,
+            latency_ms: 0.0,
+        }
+    }
+
     #[test]
     fn an_over_budget_run_sheds_the_picture_and_says_so() {
         let config = RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, true, Ramp::Blocks);
@@ -1895,18 +1841,23 @@ mod tests {
         );
         let jobs = pipeline.jobs_rx.take().unwrap();
 
-        // The guard needs a tail, and a tail needs a second of frames: seed the ring
-        // with a stage whose median is fine but whose p95 is not, then run the frame
-        // that crosses the refresh boundary.
-        pipeline.metrics.perf.frames = PROFILE_REFRESH_FRAMES - 1;
-        for _ in 0..PROFILE_REFRESH_FRAMES - 1 {
-            pipeline.telemetry.inference.push(41.0);
+        // The guard needs a tail, and a tail needs a second of frames. Drive 30
+        // frames whose inference takes 41 ms each - a pose model, roughly - and the
+        // profile that refreshes on the 30th frame trips the guard.
+        for frame in 0..PROFILE_REFRESH_FRAMES {
+            pipeline
+                .advance(slow_frame(frame as f64 * 0.033, 41.0))
+                .unwrap();
         }
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
 
         let applied = pipeline.control.lock().unwrap().clone();
         assert!(!applied.ascii, "the backdrop is the first thing to go");
         assert!(!applied.feed, "and so is the preview upload");
+
+        // Drain whatever the 29 pre-shed frames queued, then check that the shed
+        // stops handing frames over rather than merely flipping a flag.
+        while jobs.try_recv().is_ok() {}
+        pipeline.advance(slow_frame(1.0, 41.0)).unwrap();
         assert!(
             jobs.try_recv().is_err(),
             "shed work is not handed to the presenter"
@@ -1973,18 +1924,11 @@ mod tests {
             },
             ..StageProfile::default()
         };
-        pipeline.metrics.perf.frames = PROFILE_REFRESH_FRAMES;
-        pipeline.metrics.perf.profile = StageProfile {
-            inference: Latency {
-                p50: 8.0,
-                p95: 41.0,
-                p99: 60.0,
-                max: 90.0,
-                count: PROFILE_REFRESH_FRAMES as usize,
-            },
-            ..StageProfile::default()
-        };
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        for frame in 0..PROFILE_REFRESH_FRAMES {
+            pipeline
+                .advance(slow_frame(frame as f64 * 0.033, 41.0))
+                .unwrap();
+        }
         assert!(
             pipeline.control.lock().unwrap().ascii,
             "no budget means no shedding"
