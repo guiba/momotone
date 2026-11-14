@@ -20,8 +20,8 @@ The rearchitecture is finished when all of these are true and measurable:
 | File I/O / GPU upload on the inference thread | yes (`--ascii-dump`, RGBA conversion) | none; presenter thread owns it | ☑ moved to the presenter thread (Phase 4, T4.2) |
 | Locks in the audio callback | 1 per block | 0 (atomics / double buffer) | ☑ 0: the callback reads four atomics, the voice is owned by the closure |
 | Longest function | `Pipeline::advance`, 212 lines, CC 29 | no function > ~60 lines, CC ≤ 12 | ☑ `advance` is 27 lines calling six named stages |
-| `pipeline.rs` | 1707 lines | < 700 lines | ◑ 1905 lines total, **1099 excluding the test module**; the next cut is moving telemetry out |
-| Untested presentation code | ~1.65k lines | stage view testable from a snapshot | ◑ the presenter and the keyboard geometry are testable; the iced rail is not |
+| `pipeline.rs` | 1707 lines | < 700 lines | ◑ 1,937 lines total, **1,018 excluding the test module**; `RunStats` and the mock hand are now out, the capture stage is the next cut |
+| Untested presentation code | ~1.65k lines | stage view testable from a snapshot | ◑ presenter, keyboard geometry and gauge geometry are testable; the iced rail (`dashboard/mod.rs`, 758 lines) is not |
 | Reproducible runs | impossible (a webcam is not a fixture) | `--video clip.mp4` + `--expect trace.json` | ☑ both exist; `make trace-check` is a gate |
 | CI | none | fmt + clippy `-D warnings` + check + test green | ☑ `make verify`, green |
 | Latency | unmeasured; ~60–90 ms worst case | measured, documented, ≤ 50 ms target | ☑ measured, in `bench/baseline.md`; the loop is paced by the 33 ms camera read |
@@ -61,8 +61,8 @@ No GitHub/GitLab here, so the gate is `make verify` = `check` + `test` + `fmt --
 everything after is warm. **Effort: done.**
 *Unblocks:* every later phase gets a regression gate.
 
-### T0.3 — Clear the live lints (the gate is red today)
-`make lint-count` reports 8, of which 5 are auto-fixable (`make clippy-fix`):
+### T0.3 — Clear the live lints (the gate was red at the start) — **done**
+`make lint-count` reported 8 at the time, 5 of them auto-fixable:
 
 | Lint | Where |
 | :-- | :-- |
@@ -74,10 +74,9 @@ everything after is warm. **Effort: done.**
 | unnecessary `usize -> usize` cast | `vision/tracker.rs:494` |
 | too many arguments (9/7) | `vision/tracker.rs:638` |
 
-All are one-liners except the last two, which are fixed by the Phase 2 refactor anyway
-(`bench_sampling` moving to `benches/`, `PipelineConfig` grouping). **Effort S.**
-Until they are cleared, `make verify` stops at clippy — the intent is that it stays red
-until the tree is clean.
+All were one-liners except the last two, which the Phase 2 refactor removed anyway
+(`bench_sampling` leaving `tracker.rs`, `PipelineConfig` grouping). **Effort S — done.**
+The gate stays strict: lints are cleared, never suppressed.
 
 ### T0.4 — End-to-end latency instrumentation — **done**
 `src/core/telemetry.rs`: a 128-sample ring per stage with nearest-rank percentiles,
@@ -370,7 +369,7 @@ automatic decision, not the human one; and `--budget-ms 0` turns the whole thing
 picture is decided *after* the timing is recorded, so a shed that fires on a frame's tail
 takes effect on that frame's picture rather than the next one.
 
-**Gate:** `make verify` green, **151 tests passing** (6 ignored), clippy clean. `make
+**Gate:** `make verify` green, **161 tests passing** (6 ignored), clippy clean. `make
 trace-check` reproduces the fixture trace exactly across three consecutive runs.
 
 ### A caveat on reproducibility
@@ -382,6 +381,29 @@ changes the timings, the timings change the anchor, and the anchor changes the d
 fixture clip is reproducible; the *tracker's* response to it is only reproducible when the
 machine is otherwise idle. `make trace-check` is a regression gate for a quiet machine, not a
 CI-grade assertion — which is consistent with there being no CI.
+
+### Follow-ups that landed after the phase table
+
+These are not new tasks; they are the cleanup the phase work made obvious.
+
+- **The telemetry rings left the pipeline.** `RunStats` (`src/core/telemetry.rs`) owns the start
+  clock, the publish gap and the capture / inference / latency / dispatch rings; `Pipeline` holds
+  one `stats: RunStats` plus two `Instant`s (`last_detection`, `next_mock`). The pipeline-local
+  `Telemetry` struct is gone, and `RunStats::record` returns the fps so the loop never re-derives
+  it.
+- **The budget guard is tested by driving frames, not by seeding a ring.** `slow_frame(seconds,
+  inference_ms)` fabricates a `FrameOutcome` with a chosen inference cost, so
+  `an_over_budget_run_sheds_the_picture_and_says_so` runs 30 real frames through `advance()` and
+  asserts both that the guard fires *and* that the following frame is no longer handed to the
+  presenter. The earlier version wrote a fake `StageProfile` into the snapshot, which proved the
+  arithmetic but not the wiring.
+- **The mock hand moved to `src/vision/mock.rs`** (149 lines, with its own tests): a mock is a
+  source, not part of the loop.
+- **`gauges.rs` is arithmetic plus drawing.** `filled_width`, `quarter_positions` and
+  `trace_points` are free functions with no renderer, and seven tests cover them: a level outside
+  0..1 cannot overdraw the track, a rising trace rises on screen despite the inverted y axis, a
+  flat range does not divide by zero, and a non-finite sample sits on the baseline instead of
+  poisoning the path handed to wgpu. That last one was a real bug the inline code silently carried.
 
 ---
 
@@ -427,7 +449,7 @@ rest never happens.
 
 ---
 
-## 11. Suggested first three commits (start here)
+## 11. Suggested first three commits (historical — these are the commits that started it)
 
 1. `chore: CI + baseline measurements` — T0.1, T0.2, T0.3.
 2. `fix(audio): use the device sample rate; remove unsafe Sync impl` — T1.1, T1.2.
@@ -464,25 +486,36 @@ everything later is judged against them.
 | 3 Instrument layer | T3.1–T3.5 | 2 d | ☑ done (T3.3 kept the voice in `audio/` on purpose) |
 | 4 Presentation | T4.1–T4.6 | 2 d | ☑ done |
 | 5 Observability & test infra | T5.1–T5.6 | 3 d | ☑ done |
-| 6 Unlocked features | — | ongoing | ☐ |
+| 6 Unlocked features | — | ongoing | ☐ deliberately not started |
 
-Branch `phase5-observability` carries T5.1, T5.5 and T5.6; `phase4-snapshot` is already merged
-into `master`. Current gate: `make verify` green, **151 tests passing**, 6 ignored benches,
-clippy clean.
+Branch `phase5-observability` carries T5.1, T5.5, T5.6 and the follow-ups above; T5.2–T5.4 came in
+on `phase4-snapshot`, which is already merged into `master`. Current gate: `make verify` green,
+**161 tests passing**, 6 ignored benches, clippy clean (the only notice is the third-party
+`block v0.1.6` future-incompat warning).
+
+### Where we are, in one paragraph
+
+Phases 0–5 are done. The frame loop is one path with named stages; the UI talks to it through a
+command channel and a five-view snapshot; the audio callback takes no lock and allocates nothing;
+presentation runs on its own thread; and a run can be reproduced from a clip and diffed against a
+golden trace. What is left is shrinkage and coverage, not structure.
 
 ### Where to pick up
 
-1. **Shrink `pipeline.rs`** — 2050 lines, 1150 of them tests. `Telemetry` plus the trace is the
-   obvious next extraction into `src/core/`; the frame loop itself is now four stages and a
-   handful of helpers.
-2. **T5.7 — a headless UI test.** `dashboard/` is still 1955 lines with no tests. The keyboard
-   geometry (T4.5) proved the pattern: split the drawing from the widget and the arithmetic
-   becomes testable. `gauges.rs` and `metrics.rs` are next.
+1. **Move the capture stage out of `pipeline.rs`.** `FrameSource`, `FrameReader`, `CapturedFrame`,
+   `CaptureCounters` and `capture_frames` are the input layer and belong next to `camera.rs` and
+   `video.rs` in `src/vision/source.rs` — roughly 110 lines out of the frame loop, leaving
+   `pipeline.rs` with the loop and the wiring the loop owns. This is the last obvious extraction.
+2. **T5.7 — the iced rail.** `dashboard/mod.rs` is 758 lines with no tests. The pattern is
+   established (T4.5 keyboard geometry, the gauge geometry above): pull the arithmetic out of the
+   widget, test the arithmetic. The candidates are the letterbox mapping and the UI-side ring
+   buffers built from `PerfView`.
 3. **Phase 6** — multi-hand, OSC sink, `--calibrate`, `Landmark.z`. All are now single-file
-   changes; see §9.
+   changes; see §9. Deferred by request, not by design.
 
-Current shape: `src/` is **10,953 lines of Rust across 35 files**. `pipeline.rs` is 2,050 of
-them (1,150 excluding its test module) and owns capture, tracking, gesture dispatch, sinks,
-trace and telemetry; the presenter is 450 lines and owns everything a human sees; the
-estimator is 304. The iced layer (`dashboard/`) is 1,955 lines and is still the least-tested
-part of the app — T4.5 closed the gap for the keyboard geometry, not for the rail.
+Current shape: `src/` is **11,169 lines of Rust across 36 files**. `pipeline.rs` is 1,937 of them
+(1,018 excluding its test module) and owns capture, tracking, gesture dispatch, sinks, trace and
+telemetry; the vision layer is 2,242 lines, the iced layer (`dashboard/`) 2,222, `core/` 1,601,
+presentation 1,050, gesture 792, audio 487 and MIDI 339. The presenter is 444 lines and owns
+everything a human sees; the estimator is 304. `dashboard/mod.rs` (758 lines) is still the
+least-tested file in the app.
