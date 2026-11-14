@@ -10,7 +10,8 @@
 //! `InstrumentConfig.version` counter that used to spread the same state across
 //! `main.rs`, `pipeline.rs` and `dashboard/mod.rs`.
 
-use crate::core::instrument::InstrumentConfig;
+use crate::core::instrument::{InstrumentConfig, VolumeModel};
+use crate::gesture::{PROXIMITY_FAR, PROXIMITY_NEAR};
 use crate::presentation::ascii::Ramp;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -30,6 +31,13 @@ pub struct RuntimeConfig {
     pub ascii_fps: f32,
     /// Glyph ramp the ASCII grid is rendered with.
     pub ramp: Ramp,
+    /// What decides loudness this run: how close the hand is, how open it is, or a
+    /// mix of the two.
+    pub volume: VolumeModel,
+    /// Palm-length-per-frame ratios that bound the proximity band: `far` is silence,
+    /// `near` is full volume.
+    pub proximity_near: f32,
+    pub proximity_far: f32,
 }
 
 impl RuntimeConfig {
@@ -41,7 +49,15 @@ impl RuntimeConfig {
             feed_fps,
             ascii_fps,
             ramp,
+            volume: VolumeModel::Proximity,
+            proximity_near: PROXIMITY_NEAR,
+            proximity_far: PROXIMITY_FAR,
         }
+    }
+
+    /// The loudness settings, straight from the config, for the estimator.
+    pub fn volume_settings(&self) -> (VolumeModel, f32, f32) {
+        (self.volume, self.proximity_near, self.proximity_far)
     }
 }
 
@@ -53,6 +69,8 @@ pub enum UiCommand {
     SetFeed(bool),
     SetAscii(bool),
     SetRamp(Ramp),
+    /// Swap the loudness source: proximity, pinch or a blend.
+    SetVolume(VolumeModel),
     /// The pickers changed the instrument: re-key the strategy, retimbre the
     /// sinks and repaint the header.
     SetInstrument(InstrumentConfig),

@@ -211,6 +211,20 @@ struct Args {
     #[arg(long, default_value = "sine")]
     waveform: String,
 
+    /// What decides loudness: `proximity` (how close the hand is to the lens, read
+    /// from its apparent size), `pinch` (thumb-to-index spread) or `blend` (proximity
+    /// sets the ceiling, the pinch decides how much of it is used).
+    #[arg(long, default_value = "proximity")]
+    volume: String,
+
+    /// Palm-length ratios that bound the proximity band, measured as palm length over
+    /// the shorter frame side. `far` is silence, `near` is full volume. On the fixture
+    /// clip a hand at desk distance reads ~0.08 and one pushed to the lens ~0.23.
+    #[arg(long, default_value_t = gesture::PROXIMITY_FAR)]
+    proximity_far: f32,
+    #[arg(long, default_value_t = gesture::PROXIMITY_NEAR)]
+    proximity_near: f32,
+
     /// Which landmark -> output mapping drives the sinks. `position` plays the
     /// degree x octave keyboard; `theremin` glides continuously through a
     /// frequency band instead, so nothing is quantised to a scale.
@@ -301,6 +315,18 @@ fn main() -> Result<()> {
     })?;
     let instrument =
         core::instrument::InstrumentConfig::new(&args.scale, &args.root, args.octaves, waveform)?;
+
+    let volume_model = core::instrument::VolumeModel::parse(&args.volume).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown volume model '{}'; available: {}",
+            args.volume,
+            core::instrument::VolumeModel::all()
+                .iter()
+                .map(|m| m.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
 
     let ascii_ramp = Ramp::parse(&args.ascii_ramp).ok_or_else(|| {
         anyhow::anyhow!(
@@ -423,6 +449,7 @@ fn main() -> Result<()> {
             sink: sink_label.to_string(),
             scale: scale_name,
             root: root_name,
+            volume_model: volume_model.name().to_string(),
             feed: false,
             ascii: args.ascii,
             ..StatusView::default()
@@ -448,6 +475,13 @@ fn main() -> Result<()> {
         args.ascii,
         ascii_ramp,
     )));
+    // The loudness model and its band are runtime knobs, so they live in the same
+    // config the dashboard will change later.
+    if let Ok(mut config) = control.lock() {
+        config.volume = volume_model;
+        config.proximity_near = args.proximity_near;
+        config.proximity_far = args.proximity_far;
+    }
 
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
         source,

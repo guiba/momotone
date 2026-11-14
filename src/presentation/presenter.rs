@@ -202,14 +202,9 @@ mod tests {
     use opencv::core::{Mat, Scalar};
 
     fn settings(feed: bool, ascii: bool, feed_fps: f32, ascii_fps: f32) -> RuntimeConfig {
-        RuntimeConfig {
-            active: true,
-            feed,
-            ascii,
-            feed_fps,
-            ascii_fps,
-            ramp: Ramp::Blocks,
-        }
+        let mut config = RuntimeConfig::new(feed_fps, ascii_fps, ascii, Ramp::Blocks);
+        config.feed = feed;
+        config
     }
 
     fn frame_of(value: u8) -> Mat {

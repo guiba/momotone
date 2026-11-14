@@ -96,6 +96,9 @@ mod tests {
             confidence: 0.9,
             tip: (tip_x, 240.0),
             volume,
+            proximity: volume,
+            proximity_ratio: 0.12,
+            approach: 0.0,
             geometry: Default::default(),
             jitter_px: 0.0,
         }

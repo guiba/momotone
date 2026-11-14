@@ -156,6 +156,13 @@ pub struct SoundView {
     pub note: Option<u8>,
     pub volume: f32,
     pub frequency: Option<f32>,
+    /// How close the hand looks, 0.0 (far) .. 1.0 (at the lens), regardless of which
+    /// model is currently driving `volume`.
+    pub proximity: f32,
+    /// The raw apparent size behind `proximity`: palm lengths per frame side.
+    pub proximity_ratio: f32,
+    /// -1.0 (backing away) .. 1.0 (charging in), smoothed.
+    pub approach: f32,
     /// Per-semitone keyboard brightness, index = note - NOTE_LOW.
     pub trail: Vec<f32>,
     /// The trail's decay time constant, in milliseconds, for the header readout.
@@ -212,6 +219,8 @@ pub struct StatusView {
     pub root: String,
     /// Timbre of the oscillator, e.g. "saw".
     pub waveform: String,
+    /// Which signal is driving loudness this run: "proximity", "pinch" or "blend".
+    pub volume_model: String,
     /// The picture subsystems as the pipeline actually ran them. The dashboard used
     /// to mirror these in its own fields; the budget guard can turn them off without
     /// a click, so a mirror would lie. One writer (the frame loop), one reader (the UI).

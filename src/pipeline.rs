@@ -343,6 +343,14 @@ impl Pipeline {
             },
             jobs_rx: Some(jobs_rx),
         };
+        // The loudness model the run opens with lives in the same config the
+        // dashboard will change later, so the estimator is armed from it rather
+        // than from a second default.
+        if let Ok(config) = pipeline.control.lock() {
+            let (model, near, far) = config.volume_settings();
+            pipeline.estimator.set_volume(model, near, far);
+            pipeline.metrics.status.volume_model = model.name().to_string();
+        }
         // Seed the instrument so the strategy, the sinks and the published keyboard
         // agree from the very first frame.
         pipeline.apply_instrument(&instrument);
@@ -428,6 +436,12 @@ impl Pipeline {
                 UiCommand::SetFeed(on) => config.feed = on,
                 UiCommand::SetAscii(on) => config.ascii = on,
                 UiCommand::SetRamp(ramp) => config.ramp = ramp,
+                UiCommand::SetVolume(model) => {
+                    config.volume = model;
+                    self.estimator
+                        .set_volume(model, config.proximity_near, config.proximity_far);
+                    self.metrics.status.volume_model = model.name().to_string();
+                }
                 UiCommand::SetInstrument(_) => unreachable!("handled above"),
             }
         }
@@ -837,6 +851,11 @@ impl Pipeline {
         self.metrics.hand.geometry.extension = state.geometry.extension;
         self.metrics.hand.geometry.tilt_deg = state.geometry.tilt_deg;
         self.metrics.hand.geometry.palm_length = state.geometry.palm_length;
+        // How close the hand looks, independent of which model is currently driving
+        // the volume: the HUD needs it even when loudness comes from the pinch.
+        self.metrics.sound.proximity = state.proximity;
+        self.metrics.sound.proximity_ratio = state.proximity_ratio;
+        self.metrics.sound.approach = state.approach;
     }
 
     /// Fade the keyboard trail and light the key that is sounding. The trail is
@@ -914,7 +933,7 @@ impl Pipeline {
                 _ => "silent".to_string(),
             };
             tracing::debug!(
-                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
+                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} proximity {:.2} ({:.3} palm/frame) approach {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
                 self.metrics.perf.fps,
                 self.metrics.perf.frame_ms,
                 self.metrics.perf.capture_ms,
@@ -924,6 +943,9 @@ impl Pipeline {
                 self.metrics.perf.landmarker_us,
                 self.metrics.hand.confidence,
                 self.metrics.sound.volume,
+                self.metrics.sound.proximity,
+                self.metrics.sound.proximity_ratio,
+                self.metrics.sound.approach,
                 self.metrics.hand.geometry.spread,
                 self.metrics.hand.jitter_px,
                 self.metrics.hand.tip_x,

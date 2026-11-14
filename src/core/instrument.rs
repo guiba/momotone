@@ -111,6 +111,52 @@ impl std::fmt::Display for Waveform {
     }
 }
 
+/// What decides loudness.
+///
+/// * `Proximity` - how close the hand is to the lens, read from its apparent size.
+/// * `Pinch` - the original thumb-to-index spread.
+/// * `Blend` - proximity is the ceiling and the pinch decides how much of it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeModel {
+    Proximity,
+    Pinch,
+    Blend,
+}
+
+impl VolumeModel {
+    pub fn all() -> [VolumeModel; 3] {
+        [
+            VolumeModel::Proximity,
+            VolumeModel::Pinch,
+            VolumeModel::Blend,
+        ]
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VolumeModel::Proximity => "proximity",
+            VolumeModel::Pinch => "pinch",
+            VolumeModel::Blend => "blend",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<VolumeModel> {
+        let key = name.trim().to_lowercase();
+        match key.as_str() {
+            "p" | "prox" | "proximity" | "distance" => Some(VolumeModel::Proximity),
+            "pinch" | "spread" | "open" => Some(VolumeModel::Pinch),
+            "both" | "mix" | "blend" => Some(VolumeModel::Blend),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for VolumeModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstrumentConfig {
     pub scale: Scale,
@@ -323,5 +369,14 @@ mod tests {
         }
         assert_eq!(Waveform::parse("Sawtooth"), Some(Waveform::Saw));
         assert_eq!(Waveform::parse("wobble"), None);
+    }
+
+    #[test]
+    fn volume_model_names_round_trip() {
+        for model in VolumeModel::all() {
+            assert_eq!(VolumeModel::parse(model.name()), Some(model));
+        }
+        assert_eq!(VolumeModel::parse("distance"), Some(VolumeModel::Proximity));
+        assert_eq!(VolumeModel::parse("LOUD"), None);
     }
 }

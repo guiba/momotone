@@ -29,7 +29,7 @@ use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, 
 use iced::{time, Subscription};
 
 use crate::core::geometry::FINGER_NAMES;
-use crate::core::instrument::{InstrumentConfig, Waveform};
+use crate::core::instrument::{InstrumentConfig, VolumeModel, Waveform};
 use crate::core::runtime::UiCommand;
 use crate::core::telemetry::Latency;
 use crate::dashboard::gauges::{Meter, Sparkline};
@@ -49,6 +49,7 @@ const VOLUME: Color = Color::from_rgb8(6, 214, 160);
 const CONFIDENCE: Color = Color::from_rgb8(78, 161, 255);
 const NOTE: Color = Color::from_rgb8(255, 209, 102);
 const ALARM: Color = Color::from_rgb8(255, 107, 107);
+const PROXIMITY: Color = Color::from_rgb8(122, 200, 220);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -72,6 +73,7 @@ enum Message {
     PickRoot(String),
     PickOctaves(usize),
     PickWaveform(Waveform),
+    PickVolume(String),
 }
 
 pub struct Dashboard {
@@ -91,6 +93,7 @@ pub struct Dashboard {
     frame_image: Option<Handle>,
     volume_history: Vec<f32>,
     confidence_history: Vec<f32>,
+    proximity_history: Vec<f32>,
     show_box: bool,
     show_labels: bool,
 }
@@ -113,6 +116,7 @@ impl Dashboard {
             frame_image: None,
             volume_history: Vec::new(),
             confidence_history: Vec::new(),
+            proximity_history: Vec::new(),
             show_box: true,
             show_labels: false,
         }
@@ -157,6 +161,7 @@ impl Dashboard {
                 }
                 push(&mut self.volume_history, self.metrics.sound.volume);
                 push(&mut self.confidence_history, self.metrics.hand.confidence);
+                push(&mut self.proximity_history, self.metrics.sound.proximity);
             }
             Message::ToggleRun => {
                 self.active = !self.active;
@@ -194,6 +199,11 @@ impl Dashboard {
             Message::PickRoot(name) => self.apply(|config| config.set_root(&name)),
             Message::PickOctaves(n) => self.apply(|config| config.set_octaves(n)),
             Message::PickWaveform(waveform) => self.apply(|config| config.set_waveform(waveform)),
+            Message::PickVolume(name) => {
+                if let Some(model) = VolumeModel::parse(&name) {
+                    let _ = self.control.send(UiCommand::SetVolume(model));
+                }
+            }
         }
     }
 
@@ -225,7 +235,7 @@ impl Dashboard {
         let header = row![
             text("Hand Gesture HUD").size(20),
             text(format!(
-                "{} · {} · {} {} · {}x{} · {} · trail {:.0} ms{}",
+                "{} · {} · {} {} · {}x{} · {} · vol {} · trail {:.0} ms{}",
                 self.metrics.status.mode,
                 self.metrics.status.sink,
                 self.metrics.status.scale,
@@ -233,6 +243,7 @@ impl Dashboard {
                 self.metrics.scene.layout.rows,
                 self.metrics.scene.layout.cols,
                 self.metrics.status.waveform,
+                self.metrics.status.volume_model,
                 self.metrics.sound.fade_ms,
                 if ascii {
                     format!(
@@ -316,6 +327,7 @@ impl Dashboard {
             Tab::Basic => column![
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
+                loudness_card(&self.metrics),
                 render_card(self.ramp, ascii),
                 meter_card("Volume", self.metrics.sound.volume, VOLUME),
                 meter_card("Confidence", self.metrics.hand.confidence, CONFIDENCE),
@@ -326,6 +338,7 @@ impl Dashboard {
                 perf_card(&self.metrics),
                 geometry_card(&self.metrics),
                 sparkline_card("VOLUME", &self.volume_history, (0.0, 1.0), VOLUME),
+                sparkline_card("PROXIMITY", &self.proximity_history, (0.0, 1.0), PROXIMITY),
                 sparkline_card(
                     "CONFIDENCE",
                     &self.confidence_history,
@@ -581,6 +594,56 @@ fn note_card(metrics: &FrameMetrics) -> Element<'_, Message> {
             kv("volume", format!("{:.0}%", metrics.sound.volume * 100.0)),
         ]
         .spacing(6),
+    )
+}
+
+/// Which signal is making the note loud, and how close the hand actually is. The
+/// picker re-keys the model live; the meter and the ratio show the raw proximity
+/// whatever model is selected, so a run can be calibrated by reading it.
+fn loudness_card<'a>(metrics: &FrameMetrics) -> Element<'a, Message> {
+    let models: Vec<String> = VolumeModel::all()
+        .iter()
+        .map(|model| model.name().to_string())
+        .collect();
+    let model = if metrics.status.volume_model.is_empty() {
+        "proximity".to_string()
+    } else {
+        metrics.status.volume_model.clone()
+    };
+    card(
+        "LOUDNESS",
+        column![
+            pick_list(models, Some(model), Message::PickVolume).width(Length::Fill),
+            canvas(Meter {
+                value: metrics.sound.proximity,
+                color: PROXIMITY,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "proximity",
+                format!(
+                    "{:.0} % · {:.3} palm/frame",
+                    metrics.sound.proximity * 100.0,
+                    metrics.sound.proximity_ratio
+                ),
+            ),
+            kv(
+                "approach",
+                format!(
+                    "{:+.2} {}",
+                    metrics.sound.approach,
+                    if metrics.sound.approach > 0.05 {
+                        "closing in"
+                    } else if metrics.sound.approach < -0.05 {
+                        "backing off"
+                    } else {
+                        "steady"
+                    }
+                ),
+            ),
+        ]
+        .spacing(8),
     )
 }
 
