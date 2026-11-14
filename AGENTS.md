@@ -9,13 +9,14 @@ This document provides structural and architectural context to guide AI assistan
 
 ## Tech Stack
 - **Language**: Rust (Edition 2021)
-- **Vision / inference**: `opencv` 0.100 (`clang-runtime` feature), `ort` 2.0.0-rc.13 (ONNX Runtime) — the model tensors are plain `Vec<f32>` buffers handed to ort as `TensorRef` views, so there is no array crate in the dependency list
-- **Audio**: `cpal` 0.17 (`Synthesizer` with a `Voice` sine oscillator)
+- **Toolchain**: `rustc` / `cargo` 1.100.0 from the Homebrew `rust` formula (no `rustup` here — upgrade with `brew upgrade rust`), `rustfmt` 1.11.0, `clippy` 0.1.100, and Homebrew LLVM 23.1.5 supplying `libclang` for the OpenCV binding generator.
+- **Vision / inference**: `opencv` 0.102 (`clang-runtime` feature), `ort` 2.0.0-rc.15 (ONNX Runtime; still prerelease, there is no stable 2.0) — the model tensors are plain `Vec<f32>` buffers handed to ort as `TensorRef` views, so there is no array crate in the dependency list
+- **Audio**: `cpal` 0.18 (`Synthesizer` with a `Voice` sine oscillator). Note the 0.18 API: `build_output_stream` takes `StreamConfig` **by value** (it is `Copy`) and every backend returns a *paused* stream, so `stream.play()` is mandatory; all error types are unified into `cpal::Error` (`e.kind()`). Upstream 0.19 will rename `play()` to `start()` and merge `OutputCallbackInfo`/`InputCallbackInfo` into `CallbackInfo`.
 - **MIDI**: `midir` 0.11 (`MidiOutputEngine`)
 - **Messaging**: `crossbeam-channel` (unbounded MPMC) — the event bus
 - **UI**: `iced` 0.14 (`canvas`, `image`, `tokio` features) — native dashboard window; `wgpu` renderer
-- **CLI**: `clap` 4.5 (derive); `serde`/`serde_json` on the event types
-- **Async**: `tokio` 1.36 (iced's executor); concurrency is `std` threads + `Mutex`/`Arc`/`AtomicBool`
+- **CLI**: `clap` 4.6 (derive); `serde`/`serde_json` on the event types
+- **Async**: `tokio` 1.36 floor (the lock resolves 1.54.1; iced's executor); concurrency is `std` threads + `Mutex`/`Arc`/`AtomicBool`
 - **Error handling**: `anyhow`
 
 ## Build Environment
@@ -152,7 +153,7 @@ Useful `Args`: `--mode signal|midi|mock`, `--model mediapipe|yolo`, `--ort-threa
 ## Known Gaps / Things To Fix
 See `ROADMAP.md` for the prioritised list of next features and performance work (effort-tagged).
 - `Landmark.z` is read nowhere. The dead scaffolding is gone: `sources/mock.rs`, `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, the core `Source`/`Tracker` traits and `GestureEvent.event_type`/`EventType` have been deleted, so `cargo build` is warning-free apart from the third-party `block v0.1.6` future-incompat notice and one clippy lint in `pipeline.rs`.
-- Unit tests cover the strategies (pitch range, box-independence, the theremin band and its smoothing), the resampling helper and the palm-anchored detector window, both Ultralytics pose-output layouts, the geometry helpers, the synthetic mock hand, the gesture **release** and **pause** paths in the pipeline, the MIDI note gate, the keyboard trail decay and the canvas/keyboard band alignment, the synthesizer's voice lifecycle, and the ASCII ramp/mocking/cell-fitting (`cargo test`, 139 passing). The bench is `#[ignore]`d; nothing exercises the ONNX stages on a fixture image, and the iced dashboard still has no tests. Still no lint/CI.
+- Unit tests cover the strategies (pitch range, box-independence, the theremin band and its smoothing), the resampling helper and the palm-anchored detector window, both Ultralytics pose-output layouts, the geometry helpers, the synthetic mock hand, the gesture **release** and **pause** paths in the pipeline, the MIDI note gate, the keyboard trail decay and the canvas/keyboard band alignment, the synthesizer's voice lifecycle, and the ASCII ramp/mocking/cell-fitting (`cargo test`, 168 passing, 6 `#[ignore]`d). The bench is `#[ignore]`d; nothing exercises the ONNX stages on a fixture image, and the iced dashboard still has no tests. Still no lint/CI.
 - ~~The camera, inference and sinks share one pipeline thread~~ **done** — capture, inference and sinks are separate threads; the UI tick is separate and Start/Stop pauses the loop via an `AtomicBool`.
 - ~~`frame_to_rgba` runs every frame when the UI is open~~ **done** — the conversion is gated on the `feed` toggle *and* the `--feed-fps` cadence, the snapshot publishes its pixel buffer by move rather than clone, and the dashboard keeps the previous handle between uploads. The camera preview is now the only GPU-bound part of the UI: each `image::Handle` is uploaded synchronously by iced's wgpu renderer.
 

@@ -14,11 +14,11 @@ anyhow = "1.0"
 crossbeam-channel = "0.5.17"
 
 # Audio and MIDI
-cpal = "0.17"
+cpal = "0.18"
 midir = "0.11.1"
 
 # Vision & Math
-opencv = { version = "0.100", features = ["clang-runtime"] }
+opencv = { version = "0.102", features = ["clang-runtime"] }
 
 # Async runtime - only needed as iced's executor for the UI subscription.
 # `full` pulls in networking, fs and process support we never touch.
