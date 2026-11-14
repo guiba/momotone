@@ -570,6 +570,23 @@ impl<Message> Program<Message> for Skeleton {
 
         let keyboard = Keyboard::new(stage, &self.layout);
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "stage draw: bounds {:.0}x{:.0}, frame {:.0}x{:.0}, ascii on {}, feed on {}, image {}, keyboard {}, trail {} lit",
+                bounds.width,
+                bounds.height,
+                self.frame_size.0,
+                self.frame_size.1,
+                self.show_ascii,
+                self.show_feed,
+                self.image.is_some(),
+                keyboard
+                    .map(|k| format!("{:.0}x{:.0}", k.band.width, k.band.height))
+                    .unwrap_or_else(|| "none".to_string()),
+                self.trail.iter().filter(|&&l| l > 0.0).count(),
+            );
+        }
+
         // Layer 3: the instrument - cells, separators, octave and note labels.
         if let Some(keyboard) = keyboard {
             let grid_key = (stage.width, stage.height, self.layout.notes.clone());
@@ -728,7 +745,8 @@ impl<Message> Program<Message> for Skeleton {
             }
         }
 
-        vec![frame.into_geometry()]
+        geometry.push(frame.into_geometry());
+        geometry
     }
 }
 
