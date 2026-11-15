@@ -23,7 +23,7 @@ This document provides structural and architectural context to guide AI assistan
 - `.cargo/config.toml` forces `LIBCLANG_PATH` / `DYLD_LIBRARY_PATH` to `/opt/homebrew/opt/llvm/lib` (Homebrew LLVM) so the `opencv` build script finds clang. Do not remove it on macOS.
 - OpenCV is built by the crate's build script on first compile; `target/` is ~1.7 GB and is gitignored.
 - Quick verification loop: `cargo check` (≈4 s warm) rather than a full build.
-- The gate before any commit is `make verify` (`check` + `test` + `fmt --check` + `clippy --all-targets -D warnings`). There is no CI: everything runs locally through the `Makefile` (`make help` lists the targets).
+- The gate before any commit is `make verify` (`check` + `test` + `fmt --check` + `clippy --all-targets -D warnings`), mirrored on GitHub Actions by `.github/workflows/ci.yml` (push to `master` and every PR), which also runs a `--mode mock` smoke test that needs no camera and no models. `make help` lists the local targets.
 
 ## Core Architecture & Data Flow
 One frame per iteration of `Pipeline::run`, on a dedicated thread:
