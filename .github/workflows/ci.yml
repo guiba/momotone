@@ -17,11 +17,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # The opencv crate generates its bindings with clang and needs the OpenCV
-      # headers and libraries; ort fetches its ONNX Runtime itself.
+      # headers and libraries; cpal's alsa-sys needs ALSA's pkg-config entry.
+      # ort fetches its ONNX Runtime itself.
       - name: System dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libopencv-dev clang pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            libopencv-dev libasound2-dev clang pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
