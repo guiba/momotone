@@ -153,9 +153,47 @@ Useful `Args`: `--mode signal|midi|mock`, `--model mediapipe|yolo`, `--ort-threa
 ## Known Gaps / Things To Fix
 See `ROADMAP.md` for the prioritised list of next features and performance work (effort-tagged).
 - `Landmark.z` is read nowhere. The dead scaffolding is gone: `sources/mock.rs`, `SimplePinchStrategy`, `FrequencyStrategy`, `Visualizer::draw_hud`, the core `Source`/`Tracker` traits and `GestureEvent.event_type`/`EventType` have been deleted, so `cargo build` is warning-free apart from the third-party `block v0.1.6` future-incompat notice and one clippy lint in `pipeline.rs`.
-- Unit tests cover the strategies (pitch range, box-independence, the theremin band and its smoothing), the resampling helper and the palm-anchored detector window, both Ultralytics pose-output layouts, the geometry helpers, the synthetic mock hand, the gesture **release** and **pause** paths in the pipeline, the MIDI note gate, the keyboard trail decay and the canvas/keyboard band alignment, the synthesizer's voice lifecycle, and the ASCII ramp/mocking/cell-fitting (`cargo test`, 168 passing, 6 `#[ignore]`d). The bench is `#[ignore]`d; nothing exercises the ONNX stages on a fixture image, and the iced dashboard still has no tests. Still no lint/CI.
+- Unit tests cover the strategies (pitch range, box-independence, the theremin band and its smoothing), the resampling helper and the palm-anchored detector window, both Ultralytics pose-output layouts, the geometry helpers, the synthetic mock hand, the gesture **release** and **pause** paths in the pipeline, the MIDI note gate, the keyboard trail decay and the canvas/keyboard band alignment, the synthesizer's voice lifecycle, and the ASCII ramp/mocking/cell-fitting (`cargo test`, 168 passing, 6 `#[ignore]`d). The bench is `#[ignore]`d; nothing exercises the ONNX stages on a fixture image, and the iced dashboard still has no tests.
 - ~~The camera, inference and sinks share one pipeline thread~~ **done** — capture, inference and sinks are separate threads; the UI tick is separate and Start/Stop pauses the loop via an `AtomicBool`.
 - ~~`frame_to_rgba` runs every frame when the UI is open~~ **done** — the conversion is gated on the `feed` toggle *and* the `--feed-fps` cadence, the snapshot publishes its pixel buffer by move rather than clone, and the dashboard keeps the previous handle between uploads. The camera preview is now the only GPU-bound part of the UI: each `image::Handle` is uploaded synchronously by iced's wgpu renderer.
+
+## Working conventions
+
+The usual open-source Rust workflow. Deviating is fine with a reason in the commit message.
+
+### Branches
+- One topic per branch, named `feat/…`, `fix/…`, `perf/…`, `chore/…`, `ci/…` (the `phaseN-…` branches are the historical phase names from the rearchitecture).
+- Branch off `master`, keep the branch short-lived, rebase onto `master` before opening the PR.
+- `master` is always green: it passes `make verify` and CI at every merge.
+
+### Commits
+- **Conventional commits**: `feat:`, `fix:`, `perf:`, `docs:`, `test:`, `chore:`, `ci:` — with an optional scope, e.g. `fix(vision): …`.
+- Subject in the imperative mood, ≤ 72 chars ("Add landmark reuse", not "Added"); body explains *why*, wrapped near 100 chars.
+- One logical change per commit. A dependency bump that forces an API change is its own commit.
+- Never commit `target/`, `assets/`, `.onnx`/`.zip`, screenshots or editor config — they are gitignored for a reason.
+
+### Pull requests
+- Small and focused: the diff should be readable in one sitting.
+- The description says what changed, why, and **how it was verified** (which command you ran).
+- CI must pass before merging; squash-merge keeps `master` one commit per feature.
+
+### Tests
+- Every new pure function gets a unit test in the same file under `#[cfg(test)]` — the dashboard aside, this codebase is tested where it is testable.
+- A change to the gesture mapping is checked against the golden trace: `make trace-check`. Regenerate with `make trace` only when the change is intentional, and read the diff it produces first.
+- Perf claims need numbers: run the `#[ignore]`d benches (`make bench`) and record them in `bench/baseline.md`.
+
+### Dependencies
+- `cargo update` is a standalone `chore(deps)` commit; if an upgrade forces an API change, the CHANGELOG says so.
+- Prefer bumping a minor/patch of an existing crate over adding a new one. Keep `Cargo.lock` committed so CI and local builds agree.
+
+### Documentation
+- User-visible behaviour → README (flags table) plus a CHANGELOG entry under **Unreleased**.
+- Architecture changes → the data-flow section of AGENTS.md, and ARCHITECTURE.md if it was a design decision.
+
+### Releases
+- Semantic versioning in `Cargo.toml`: mapping/API break = major, new feature = minor, fix = patch.
+- Tag `vX.Y.Z` at release, move the **Unreleased** CHANGELOG section under that version, and cut a release branch only if you need to backport.
+- Before publishing publicly, add a license (`Cargo.toml` currently has none) — MIT or Apache-2.0 are the usual choices for this stack.
 
 ## Development Guidelines for AI Assistants
 

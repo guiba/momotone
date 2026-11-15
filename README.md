@@ -34,8 +34,8 @@ hand is the keyboard, the machine makes the sound.
 # macOS
 brew install opencv llvm
 
-# Ubuntu / Debian (libasound2-dev is cpal's ALSA headers)
-sudo apt-get install libopencv-dev libasound2-dev clang pkg-config
+# Ubuntu / Debian (libasound2-dev for cpal, libclang-dev for the OpenCV bindings)
+sudo apt-get install libopencv-dev libasound2-dev libclang-dev clang pkg-config
 ```
 
 Rust 1.88+ (tested on 1.100). The models are gitignored — put them in `assets/`:

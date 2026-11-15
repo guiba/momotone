@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev libasound2-dev clang pkg-config
+            libopencv-dev libasound2-dev libclang-dev clang pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
