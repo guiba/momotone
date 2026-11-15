@@ -23,15 +23,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev libasound2-dev libclang-dev clang pkg-config
+            libopencv-dev libasound2-dev libclang-dev llvm-dev clang pkg-config
 
       # bindgen only probes a fixed list of LLVM directories; pin it to whatever
       # LLVM the runner actually ships.
       - name: Point bindgen at the runner's libclang
         run: |
           clang_lib=$(find /usr/lib/llvm-*/lib -name 'libclang.so*' | head -1)
-          echo "LIBCLANG_PATH=${clang_lib%/*}" >> "$GITHUB_ENV"
-          echo "found $clang_lib"
+          echo "clang lib: $clang_lib"
+          ls -l "$(dirname "$clang_lib")" | grep -i clang
+          echo "LIBCLANG_PATH=$(dirname "$clang_lib")" >> "$GITHUB_ENV"
+          echo "llvm-config prefix: $(llvm-config --prefix 2>/dev/null || echo none)"
 
       - name: Cache cargo
         uses: actions/cache@v4
