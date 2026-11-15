@@ -25,10 +25,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libopencv-dev libasound2-dev libclang-dev clang pkg-config
 
-      # bindgen only probes a fixed list of LLVM directories; pin it to whatever
-      # LLVM the runner actually ships, as a real file rather than a versioned
-      # symlink, so clang-sys' glob search can open it.
-      - name: Point bindgen at the runner's libclang
+      # The runner's libclang is a chain of versioned symlinks that clang-sys'
+      # search does not follow; put a plain libclang.so where it looks by default.
+      - name: Make libclang findable
         run: |
           clang_lib=$(find /usr/lib/llvm-*/lib -name 'libclang.so*' | head -1)
           clang_real=$(readlink -f "$clang_lib")
@@ -39,11 +38,8 @@ jobs:
             sudo apt-get install -y libclang1-21
             clang_real=$(readlink -f "$clang_lib")
           fi
-          dir="$RUNNER_TEMP/libclang"
-          mkdir -p "$dir"
-          cp "$clang_real" "$dir/libclang.so"
-          ls -l "$dir"
-          echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+          sudo cp "$clang_real" /usr/local/lib/libclang.so
+          ls -l /usr/local/lib/libclang.so
 
       - name: Cache cargo
         uses: actions/cache@v4
