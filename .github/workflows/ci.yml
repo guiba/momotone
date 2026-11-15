@@ -23,17 +23,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev libasound2-dev libclang-dev llvm-dev clang pkg-config
+            libopencv-dev libasound2-dev libclang-dev clang pkg-config
 
       # bindgen only probes a fixed list of LLVM directories; pin it to whatever
-      # LLVM the runner actually ships.
+      # LLVM the runner actually ships, as a real file rather than a versioned
+      # symlink, so clang-sys' glob search can open it.
       - name: Point bindgen at the runner's libclang
         run: |
           clang_lib=$(find /usr/lib/llvm-*/lib -name 'libclang.so*' | head -1)
-          echo "clang lib: $clang_lib"
-          ls -l "$(dirname "$clang_lib")" | grep -i clang
-          echo "LIBCLANG_PATH=$(dirname "$clang_lib")" >> "$GITHUB_ENV"
-          echo "llvm-config prefix: $(llvm-config --prefix 2>/dev/null || echo none)"
+          clang_real=$(readlink -f "$clang_lib")
+          echo "libclang symlink:  $clang_lib"
+          echo "libclang resolved: $clang_real"
+          if [ ! -f "$clang_real" ]; then
+            echo "the libclang symlink is dangling; installing the runtime library"
+            sudo apt-get install -y libclang1-21
+            clang_real=$(readlink -f "$clang_lib")
+          fi
+          dir="$RUNNER_TEMP/libclang"
+          mkdir -p "$dir"
+          cp "$clang_real" "$dir/libclang.so"
+          ls -l "$dir"
+          echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
 
       - name: Cache cargo
         uses: actions/cache@v4
