@@ -17,11 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use opencv::prelude::*;
-
 use crate::core::event_bus::{BusMessage, EventBus};
+use crate::core::frame::Frame;
 use crate::core::instrument::InstrumentConfig;
 use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{shed_subsystems, RunStats, PROFILE_REFRESH_FRAMES};
@@ -39,6 +36,8 @@ use crate::vision::camera::WebcamSource;
 use crate::vision::mock::{synthetic_detection, MOCK_CADENCE};
 use crate::vision::tracker::HandTracker;
 use crate::vision::video::VideoSource;
+use anyhow::Result;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 /// Where the pixels come from. Mock mode has neither: `next_frame` synthesises the
 /// hand instead of reading a frame.
@@ -57,7 +56,7 @@ pub enum FrameSource {
 /// together is what makes a fixture run look slower than it is.
 trait FrameReader {
     fn wait_for_next(&mut self) {}
-    fn read(&mut self) -> Result<Mat>;
+    fn read(&mut self) -> Result<Frame>;
 }
 
 impl FrameReader for FrameSource {
@@ -71,7 +70,7 @@ impl FrameReader for FrameSource {
         }
     }
 
-    fn read(&mut self) -> Result<Mat> {
+    fn read(&mut self) -> Result<Frame> {
         match self {
             FrameSource::Camera(camera) => camera.get_frame(),
             FrameSource::Video(video) => video.read(),
@@ -86,7 +85,7 @@ const PAUSE_POLL_MS: u64 = 50;
 
 /// A frame handed from the capture stage to inference.
 struct CapturedFrame {
-    frame: Mat,
+    frame: Frame,
     /// Wall clock the pixels came off the camera, so end-to-end latency is known.
     captured_at: Instant,
     /// Time the capture stage spent reading them.
@@ -97,7 +96,7 @@ struct CapturedFrame {
 /// time and inference time separately instead of one conflated number.
 struct FrameOutcome {
     detection: HandDetectionResult,
-    frame: Option<Mat>,
+    frame: Option<Frame>,
     capture_ms: f64,
     inference_ms: f64,
     latency_ms: f64,
@@ -360,7 +359,7 @@ impl Pipeline {
     /// Hand the frame to the presenter. The channel holds one frame: a presenter
     /// still drawing the previous one drops this frame rather than drifting behind
     /// the camera, which is exactly right for a picture nobody is measuring.
-    fn hand_over(&mut self, frame: Option<Mat>, state: &HandState, settings: &RuntimeConfig) {
+    fn hand_over(&mut self, frame: Option<Frame>, state: &HandState, settings: &RuntimeConfig) {
         let Some(jobs) = &self.presentation.jobs else {
             return;
         };
@@ -1658,18 +1657,12 @@ mod tests {
     }
 
     impl FrameReader for ScriptedSource {
-        fn read(&mut self) -> Result<Mat> {
+        fn read(&mut self) -> Result<Frame> {
             self.produced += 1;
             if self.produced >= self.stop_at {
                 self.running.store(false, Ordering::Relaxed);
             }
-            Ok(Mat::new_rows_cols_with_default(
-                4,
-                4,
-                opencv::core::CV_8UC3,
-                opencv::core::Scalar::all(7.0),
-            )
-            .unwrap())
+            Ok(Frame::solid(4, 4, 7))
         }
     }
 
@@ -1678,15 +1671,9 @@ mod tests {
     }
 
     impl FrameReader for CountingSource {
-        fn read(&mut self) -> Result<Mat> {
+        fn read(&mut self) -> Result<Frame> {
             self.produced += 1;
-            Ok(Mat::new_rows_cols_with_default(
-                2,
-                2,
-                opencv::core::CV_8UC3,
-                opencv::core::Scalar::all(0.0),
-            )
-            .unwrap())
+            Ok(Frame::solid(2, 2, 0))
         }
     }
 

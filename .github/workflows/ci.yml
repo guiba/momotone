@@ -16,14 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The opencv crate generates its bindings with clang and needs the OpenCV
-      # headers and libraries; cpal's alsa-sys needs ALSA's pkg-config entry.
+      # Capture, decoding and image I/O are all pure Rust now, so the only system
+      # library left is ALSA, which cpal's alsa-sys finds through pkg-config.
       # ort fetches its ONNX Runtime itself.
       - name: System dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev libasound2-dev libclang-dev clang pkg-config
+            libasound2-dev pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -46,3 +46,10 @@ jobs:
       # End-to-end smoke test with no camera and no model assets.
       - name: Smoke test
         run: cargo run -- --mode mock --no-ui --max-frames 30 --debug
+
+      # Regression gate on the gesture mapping. The mock hand is driven by the frame
+      # index, so this trace is reproducible on any machine - no webcam, no ONNX
+      # files, no Linux/macOS difference. It covers the detection gate, the estimator,
+      # the grid strategy and the release path.
+      - name: Golden trace (mock)
+        run: cargo run -- --mode mock --no-ui --max-frames 120 --expect fixtures/mock_trace.json

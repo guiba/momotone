@@ -31,11 +31,11 @@ hand is the keyboard, the machine makes the sound.
 ## Install
 
 ```bash
-# macOS
-brew install opencv llvm
+# macOS — nothing to install beyond Rust; capture and decoding are pure Rust
+# (AVFoundation via nokhwa, H.264 via rusty_h264-decoder).
 
-# Ubuntu / Debian (libasound2-dev for cpal, libclang-dev for the OpenCV bindings)
-sudo apt-get install libopencv-dev libasound2-dev libclang-dev clang pkg-config
+# Ubuntu / Debian — ALSA for cpal's audio output
+sudo apt-get install libasound2-dev pkg-config
 ```
 
 Rust 1.88+ (tested on 1.100). The models are gitignored — put them in `assets/`:
@@ -89,7 +89,9 @@ louder. `Ctrl+C` stops.
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ```bash
-make fixture       # 300 frames of fixtures/hand_clip.mp4, headless
+make record        # record a 20 s webcam clip into fixtures/hand_clip.mp4 (needs ffmpeg)
+make fixture       # 120 frames of that local clip, headless
+make trace-check   # compare its note/volume trace against fixtures/clip_trace.json
 make trace-check   # fails if the note/volume trace drifts from the golden trace
 ```
 

@@ -5,7 +5,40 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
-Nothing in flight — the gate (`make verify`) is green on `master`.
+- **OpenCV is gone.** `opencv` 0.102 was the project's only native dependency and it was
+  doing three chores: grabbing pixels, cropping/resampling into the model input, and
+  drawing the `--image` overlay. All three are now Rust:
+  - `src/core/frame.rs` - a `Frame` of RGB, row-major, replacing `opencv::Mat` throughout.
+  - `src/vision/sampling.rs` - a hand-written bilinear `sample_affine_to_tensor` that
+    writes the NHWC/NCHW float tensor in one pass (the pipeline's mappings are all
+    axis-aligned, so `warpAffine` was only ever reached when a crop hung off the edge).
+  - `src/presentation/ascii.rs` - a box-average downsample, which is what OpenCV's
+    `INTER_AREA` was doing.
+  - `src/presentation/annotator.rs` - Bresenham lines and filled discs instead of
+    `imgproc::line`/`circle`.
+  - `src/vision/camera.rs` - webcam capture via `nokhwa` (AVFoundation) with a
+    hand-written YUYV -> RGB pass; nokhwa's own decoder takes 53 ms per 640x480 frame,
+    this one takes 1.4 ms.
+  - `src/vision/video.rs` - MP4/H.264 decoding via `mp4io` + `rusty_h264-decoder`, both
+    `#![forbid(unsafe_code)]`. Verified bit-exact against ffmpeg on the fixture; the RGB
+    conversion lands within 2 LSB of ffmpeg's.
+- Cold `cargo build --release` drops from ~19 minutes to ~4 minutes, and `.cargo/config.toml`
+  no longer needs to point `LIBCLANG_PATH` at Homebrew LLVM.
+- `build.rs` links clang's compiler-rt on Apple targets: fat LTO drops
+  `___isPlatformVersionAtLeast` from `std`, which ONNX Runtime's CoreML object references
+  (rustc issue #164915). Without it `cargo build --release` fails to link on macOS.
+- ~~`fixtures/hand_clip.mp4`~~ and `fixtures/clip_trace.json` are **not committed**: the clip is
+  a recording of a real hand, so `make record` generates it locally and `make trace` regenerates
+  the golden trace against it. `make fixture|trace-check|trace` say so when either is missing.
+- `--video` decodes the clip with `mp4io` + `rusty_h264-decoder` (both `#![forbid(unsafe_code)]`).
+  `rusty_h264-decoder` is 4:2:0-only, hence the `-pix_fmt yuv420p` in `make record`.
+- **CI has a regression gate it can actually run.** There is no macOS runner, so CI can never
+  touch the camera or the gitignored ONNX assets. Mock mode is driven by the frame index, so
+  `fixtures/mock_trace.json` (120 frames, deterministic across debug and release builds) is
+  committed and CI diffs against it — `make mock-trace-check`.
+- `src/midi/mod.rs` maps `midir::ConnectError` to a message before the `?`. On the ALSA backend
+  that error carries a raw pointer, so it is not `Sync` and cannot become an `anyhow::Error`;
+  the CI build failed with E0277 while macOS built fine.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

@@ -1,18 +1,27 @@
 //! Input sampling shared by every ONNX vision stage.
 //!
-//! A stage takes an affine crop of the frame (scale + translate, optionally with a
-//! fill for the part of the window that falls outside the image) and needs it as a
-//! float tensor in either NHWC (MediaPipe) or NCHW (Ultralytics YOLO) layout. The
-//! buffers are allocated once per tracker and refilled in place every frame.
+//! A stage takes an axis-aligned crop of the frame (scale + translate, with a fill
+//! for the part of the window that falls outside the image) and needs it as a float
+//! tensor in either NHWC (MediaPipe) or NCHW (Ultralytics YOLO) layout. The buffers
+//! are allocated once per tracker and refilled in place every frame.
+//!
+//! This used to be `imgproc::resize` plus `imgproc::warp_affine`. Every mapping the
+//! pipeline builds is axis-aligned - the `warp_affine` branch was reached only
+//! because the crop window ran off the edge of the frame - so the sampling is a
+//! bilinear sweep over one buffer. Doing it in a single pass writes the f32 tensor
+//! directly: no intermediate 8-bit image, no channel swap, no allocation per frame.
 
 use anyhow::{anyhow, Result};
-use opencv::prelude::*;
-use opencv::{core, imgproc};
+
+use crate::core::frame::Frame;
 
 const INV_255: f32 = 1.0 / 255.0;
 
 /// Affine mapping from output (model) pixels to frame pixels:
 /// `frame_x = m00 * out_x + m01 * out_y + tx`, and the same for y.
+///
+/// Every mapping built here is a pure scale and translation; the off-diagonal
+/// fields are kept so a rotation or a shear can still be expressed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Affine {
     pub(crate) m00: f64,
@@ -25,7 +34,7 @@ pub(crate) struct Affine {
 
 impl Affine {
     /// Axis-aligned mapping: one output pixel covers `scale` frame pixels, starting
-    /// at (tx, ty). Both MediaPipe stages use this.
+    /// at (tx, ty). Both MediaPipe stages and the letterbox use this.
     pub(crate) fn scale_translate(scale: f64, tx: f64, ty: f64) -> Self {
         Affine {
             m00: scale,
@@ -44,20 +53,35 @@ impl Affine {
     pub(crate) fn frame_y(&self, out_x: f64, out_y: f64) -> f64 {
         self.ty + self.m10 * out_x + self.m11 * out_y
     }
+
+    /// The frame coordinate of the centre of output pixel (ox, oy).
+    ///
+    /// A source pixel `j` is taken to cover `[j, j + 1)`, so the centre of output
+    /// pixel `i` maps to `tx + scale * (i + 0.5) - 0.5`. With `scale == 1` that is
+    /// exactly `tx + i`, which is what makes an identity crop sample whole pixels.
+    fn centre(&self, ox: usize, oy: usize) -> (f64, f64) {
+        let ox = ox as f64;
+        let oy = oy as f64;
+        (
+            self.tx + self.m00 * (ox + 0.5) + self.m01 * (oy + 0.5) - 0.5,
+            self.ty + self.m10 * (ox + 0.5) + self.m11 * (oy + 0.5) - 0.5,
+        )
+    }
+
+    fn is_axis_aligned(&self) -> bool {
+        self.m01.abs() < 1e-9 && self.m10.abs() < 1e-9
+    }
 }
 
-/// Scratch buffers for one inference stage, allocated once when the tracker is
-/// built and reused every frame: `warped` is the OpenCV crop output (8UC3), `data`
-/// the model input in the layout the stage wants.
+/// Scratch buffer for one inference stage, allocated once when the tracker is built
+/// and refilled in place every frame.
 pub(crate) struct StageInput {
-    pub(crate) warped: Mat,
     pub(crate) data: Vec<f32>,
 }
 
 impl StageInput {
     pub(crate) fn new(out_w: usize, out_h: usize) -> Self {
         StageInput {
-            warped: Mat::default(),
             data: vec![0.0f32; out_w * out_h * 3],
         }
     }
@@ -75,15 +99,11 @@ pub(crate) enum TensorLayout {
 /// Anything outside the image is filled with `border` (MediaPipe crops pad with
 /// black, the letterboxed YOLO input pads with Ultralytics' mid-grey 114).
 ///
-/// Returns the *effective* mapping that was applied: the `resize` fast path snaps
-/// the crop to whole pixels, so callers must use the returned map (not the one they
-/// passed in) when converting model coordinates back to frame pixels.
-///
-/// OpenCV does all of the sampling: `resize` for the axis-aligned crop both stages
-/// actually need (the common case), `warpAffine` otherwise - which expects the
-/// *forward* frame -> output matrix, i.e. the inverse of the mapping handed in here.
+/// Returns the *effective* mapping that was applied: the integer-crop fast path
+/// snaps the window to whole pixels, so callers must use the returned map (not the
+/// one they passed in) when converting model coordinates back to frame pixels.
 pub(crate) fn sample_affine_to_tensor(
-    frame: &Mat,
+    frame: &Frame,
     map: Affine,
     out_w: usize,
     out_h: usize,
@@ -91,84 +111,128 @@ pub(crate) fn sample_affine_to_tensor(
     layout: TensorLayout,
     border: f64,
 ) -> Result<Affine> {
-    if frame.channels() != 3 {
-        return Err(anyhow!(
-            "expected a 3-channel frame, got {}",
-            frame.channels()
-        ));
+    let fw = frame.width();
+    let fh = frame.height();
+    if fw == 0 || fh == 0 {
+        return Err(anyhow!("cannot sample an empty frame"));
     }
 
-    let fw = frame.cols();
-    let fh = frame.rows();
-    let out_size = core::Size::new(out_w as i32, out_h as i32);
-    let applied;
+    let applied = if map.is_axis_aligned() && map.m00 > 0.0 && map.m11 > 0.0 {
+        // Snap the window to whole pixels, then sample. Snapping is what `resize`
+        // did, and the snapped mapping is what the caller needs back so its
+        // coordinate conversion agrees with the pixels the model actually saw.
+        let x0 = map.tx.floor() as i64;
+        let y0 = map.ty.floor() as i64;
+        let w = (map.m00 * out_w as f64).round() as i64;
+        let h = (map.m11 * out_h as f64).round() as i64;
 
-    if map.m01.abs() < 1e-9 && map.m10.abs() < 1e-9 && map.m00 > 0.0 && map.m11 > 0.0 {
-        // Pure scale + translation: crop to whole pixels, then let resize interpolate.
-        // OpenCV reuses `stage.warped`'s buffer as long as the size/type match.
-        let x0 = map.tx.floor() as i32;
-        let y0 = map.ty.floor() as i32;
-        let w = (map.m00 * out_w as f64).round() as i32;
-        let h = (map.m11 * out_h as f64).round() as i32;
-
-        if x0 >= 0 && y0 >= 0 && w > 0 && h > 0 && x0 + w <= fw && y0 + h <= fh {
-            let crop = frame.roi(core::Rect::new(x0, y0, w, h))?;
-            imgproc::resize(
-                &crop,
-                &mut stage.warped,
-                out_size,
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
-            applied = Affine {
+        if x0 >= 0 && y0 >= 0 && w > 0 && h > 0 && (x0 + w) <= fw as i64 && (y0 + h) <= fh as i64 {
+            Affine {
                 m00: w as f64 / out_w as f64,
                 m01: 0.0,
                 tx: x0 as f64,
                 m10: 0.0,
                 m11: h as f64 / out_h as f64,
                 ty: y0 as f64,
-            };
+            }
         } else {
-            // The window runs off the edge of the frame; warpAffine clamps and pads.
-            applied = warp_affine(frame, map, out_size, &mut stage.warped, border)?;
+            // The window runs off the edge of the frame; the sampler fills the part
+            // that falls outside with `border`, exactly as `warpAffine`'s
+            // BORDER_CONSTANT did.
+            map
         }
     } else {
-        applied = warp_affine(frame, map, out_size, &mut stage.warped, border)?;
-    }
+        if map.m00 * map.m11 - map.m01 * map.m10 < 1e-12 {
+            return Err(anyhow!("degenerate affine mapping"));
+        }
+        map
+    };
 
     let n = out_h * out_w * 3;
     if stage.data.len() != n {
         stage.data.resize(n, 0.0);
     }
-    // Safety: `stage.warped` was just written by resize/warpAffine as a contiguous
-    // out_h x out_w 3-channel u8 matrix (no ROI), and `stage.data` has exactly `n`
-    // f32 elements.
-    unsafe {
-        let src = std::slice::from_raw_parts(stage.warped.data(), n);
-        let dst = stage.data.as_mut_ptr();
-        match layout {
-            TensorLayout::Nhwc => {
-                for i in (0..n).step_by(3) {
-                    // BGR -> RGB while normalising, in the same pass.
-                    *dst.add(i) = src[i + 2] as f32 * INV_255;
-                    *dst.add(i + 1) = src[i + 1] as f32 * INV_255;
-                    *dst.add(i + 2) = src[i] as f32 * INV_255;
+
+    let border = [(border as f32) * INV_255; 3];
+    let pixels = frame.pixels();
+    let plane = out_w * out_h;
+
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let rgb = sample_bilinear(pixels, fw, fh, applied.centre(ox, oy), border);
+            match layout {
+                TensorLayout::Nhwc => {
+                    let dst = (oy * out_w + ox) * 3;
+                    stage.data[dst] = rgb[0];
+                    stage.data[dst + 1] = rgb[1];
+                    stage.data[dst + 2] = rgb[2];
                 }
-            }
-            TensorLayout::Nchw => {
-                let plane = out_w * out_h;
-                for i in (0..n).step_by(3) {
-                    let p = i / 3;
-                    *dst.add(p) = src[i + 2] as f32 * INV_255;
-                    *dst.add(plane + p) = src[i + 1] as f32 * INV_255;
-                    *dst.add(2 * plane + p) = src[i] as f32 * INV_255;
+                TensorLayout::Nchw => {
+                    let p = oy * out_w + ox;
+                    stage.data[p] = rgb[0];
+                    stage.data[plane + p] = rgb[1];
+                    stage.data[2 * plane + p] = rgb[2];
                 }
             }
         }
     }
 
     Ok(applied)
+}
+
+/// Bilinear sample of one output pixel centre.
+///
+/// A centre that falls outside the image is answered with `border`, matching
+/// OpenCV's `BORDER_CONSTANT`. Inside the image the two taps on each axis are
+/// clamped to the nearest real pixel, so an edge sample replicates the border
+/// pixel rather than inventing one.
+fn sample_bilinear(
+    pixels: &[u8],
+    fw: usize,
+    fh: usize,
+    centre: (f64, f64),
+    border: [f32; 3],
+) -> [f32; 3] {
+    let (fx, fy) = centre;
+    if fx < 0.0 || fy < 0.0 || fx >= fw as f64 || fy >= fh as f64 {
+        return border;
+    }
+
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let wx = (fx - x0 as f64) as f32;
+    let wy = (fy - y0 as f64) as f32;
+
+    let x1 = (x0 + 1).min(fw - 1);
+    let y1 = (y0 + 1).min(fh - 1);
+
+    let w00 = (1.0 - wx) * (1.0 - wy);
+    let w10 = wx * (1.0 - wy);
+    let w01 = (1.0 - wx) * wy;
+    let w11 = wx * wy;
+
+    let a = (y0 * fw + x0) * 3;
+    let b = (y0 * fw + x1) * 3;
+    let c = (y1 * fw + x0) * 3;
+    let d = (y1 * fw + x1) * 3;
+
+    [
+        (w00 * pixels[a] as f32
+            + w10 * pixels[b] as f32
+            + w01 * pixels[c] as f32
+            + w11 * pixels[d] as f32)
+            * INV_255,
+        (w00 * pixels[a + 1] as f32
+            + w10 * pixels[b + 1] as f32
+            + w01 * pixels[c + 1] as f32
+            + w11 * pixels[d + 1] as f32)
+            * INV_255,
+        (w00 * pixels[a + 2] as f32
+            + w10 * pixels[b + 2] as f32
+            + w01 * pixels[c + 2] as f32
+            + w11 * pixels[d + 2] as f32)
+            * INV_255,
+    ]
 }
 
 /// Build the letterbox mapping for a square model input: the frame is scaled to
@@ -187,76 +251,22 @@ pub(crate) fn letterbox_map(fw: f64, fh: f64, size: usize) -> Affine {
     )
 }
 
-/// Sample `frame` through the inverse of `map` using `warpAffine`, which takes the
-/// forward frame -> output matrix. Returns the mapping that was applied.
-fn warp_affine(
-    frame: &Mat,
-    map: Affine,
-    out_size: core::Size,
-    dst: &mut Mat,
-    border: f64,
-) -> Result<Affine> {
-    let Affine {
-        m00,
-        m01,
-        tx,
-        m10,
-        m11,
-        ty,
-    } = map;
-    let det = m00 * m11 - m01 * m10;
-    if det.abs() < 1e-12 {
-        return Err(anyhow!("degenerate affine mapping (det = {det})"));
-    }
-    let a11 = m11 / det;
-    let a12 = -m01 / det;
-    let a21 = -m10 / det;
-    let a22 = m00 / det;
-    let fwd = [
-        a11,
-        a12,
-        -(a11 * tx + a12 * ty),
-        a21,
-        a22,
-        -(a21 * tx + a22 * ty),
-    ];
-    // warpAffine insists on a 2x3 matrix.
-    let fwd_mat = Mat::from_slice(&fwd)?;
-    let forward = fwd_mat.reshape(1, 2)?;
-
-    imgproc::warp_affine(
-        frame,
-        dst,
-        &forward,
-        out_size,
-        imgproc::INTER_LINEAR,
-        core::BORDER_CONSTANT,
-        core::Scalar::all(border),
-    )?;
-
-    Ok(map)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn frame(rows: i32, cols: i32) -> Mat {
+    fn frame(rows: usize, cols: usize) -> Frame {
         // Gradient frame: R = 50 everywhere, B grows left to right, G top to bottom.
-        let mut mat =
-            Mat::new_rows_cols_with_default(rows, cols, core::CV_8UC3, core::Scalar::all(0.0))
-                .unwrap();
+        let mut pixels = vec![0u8; rows * cols * 3];
         for y in 0..rows {
-            let row = mat.ptr_mut(y).unwrap();
-            unsafe {
-                for x in 0..cols {
-                    *row.add(x as usize * 3) = (x * 10) as u8; // B
-                    *row.add(x as usize * 3 + 1) = (y * 10) as u8; // G
-                    *row.add(x as usize * 3 + 2) = 50; // R
-                }
+            for x in 0..cols {
+                let i = (y * cols + x) * 3;
+                pixels[i] = 50; // R
+                pixels[i + 1] = (y * 10) as u8; // G
+                pixels[i + 2] = (x * 10) as u8; // B
             }
         }
-        mat
+        Frame::new(cols, rows, pixels)
     }
 
     #[test]
@@ -273,10 +283,30 @@ mod tests {
     }
 
     #[test]
+    fn an_identity_crop_samples_whole_pixels() {
+        let mut stage = StageInput::new(4, 4);
+        let applied = sample_affine_to_tensor(
+            &frame(4, 4),
+            letterbox_map(4.0, 4.0, 4),
+            4,
+            4,
+            &mut stage,
+            TensorLayout::Nhwc,
+            114.0,
+        )
+        .unwrap();
+        assert!((applied.m00 - 1.0).abs() < 1e-9);
+        // Output pixel (3, 2) is frame pixel (3, 2): R = 50, G = 20, B = 30.
+        let dst = (2 * 4 + 3) * 3;
+        assert!((stage.data[dst] - 50.0 / 255.0).abs() < 1e-6);
+        assert!((stage.data[dst + 1] - 20.0 / 255.0).abs() < 1e-6);
+        assert!((stage.data[dst + 2] - 30.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn an_nchw_stage_has_three_colour_planes() {
         let mut stage = StageInput::new(4, 4);
-        // A square frame needs no padding, so this takes the resize fast path.
-        let applied = sample_affine_to_tensor(
+        sample_affine_to_tensor(
             &frame(4, 4),
             letterbox_map(4.0, 4.0, 4),
             4,
@@ -286,18 +316,53 @@ mod tests {
             114.0,
         )
         .unwrap();
-        assert!((applied.m00 - 1.0).abs() < 1e-9);
-
         let plane = 4 * 4;
-        // Output pixel (0,0) is frame pixel (0,0) = BGR (50, 0, 0) -> R = 50/255.
-        assert!((stage.data[0] - 50.0 / 255.0).abs() < 1e-6);
-        assert!((stage.data[plane] - 0.0).abs() < 1e-6);
-        assert!((stage.data[2 * plane] - 0.0).abs() < 1e-6);
-        // Output pixel (ox=3, oy=2) is frame pixel (3, 2): R = 50, G = 20, B = 30.
-        let p = 2 * 4 + 3;
+        let p = 2 * 4 + 3; // output pixel (3, 2) = frame pixel (3, 2)
         assert!((stage.data[p] - 50.0 / 255.0).abs() < 1e-6);
         assert!((stage.data[plane + p] - 20.0 / 255.0).abs() < 1e-6);
         assert!((stage.data[2 * plane + p] - 30.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_downsample_averages_the_pixels_a_cell_covers() {
+        // 4x4 -> 2x2: output (0,0) covers frame pixels (0,0), (1,0), (0,1), (1,1).
+        let mut stage = StageInput::new(2, 2);
+        let applied = sample_affine_to_tensor(
+            &frame(4, 4),
+            Affine::scale_translate(2.0, 0.0, 0.0),
+            2,
+            2,
+            &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
+        )
+        .unwrap();
+        assert!((applied.m00 - 2.0).abs() < 1e-9);
+        assert!((stage.data[0] - 50.0 / 255.0).abs() < 1e-6);
+        assert!((stage.data[1] - 5.0 / 255.0).abs() < 1e-6); // G: (0 + 0 + 10 + 10) / 4
+        assert!((stage.data[2] - 5.0 / 255.0).abs() < 1e-6); // B: (0 + 10 + 0 + 10) / 4
+    }
+
+    #[test]
+    fn a_rounded_crop_reports_the_effective_mapping() {
+        // A window that is not an integer number of pixels wide is snapped to whole
+        // pixels, and the snapped mapping is what the caller gets back so its
+        // coordinate conversion agrees with the pixels the model actually saw.
+        let mut stage = StageInput::new(3, 3);
+        let applied = sample_affine_to_tensor(
+            &frame(12, 12),
+            Affine::scale_translate(3.33, 1.4, 2.6),
+            3,
+            3,
+            &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(applied.tx, 1.0);
+        assert_eq!(applied.ty, 2.0);
+        assert!((applied.m00 - 10.0 / 3.0).abs() < 1e-9); // round(3.33 * 3) = 10
+        assert!((applied.m11 - 10.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]
@@ -320,5 +385,23 @@ mod tests {
         assert!((stage.data[2] - 114.0 / 255.0).abs() < 1e-6);
         let last = (8 * 8 - 1) * 3;
         assert!((stage.data[last] - 114.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_crop_running_off_the_frame_is_padded_with_black() {
+        // The detector window can slide so its square hangs off the edge.
+        let mut stage = StageInput::new(4, 4);
+        sample_affine_to_tensor(
+            &frame(4, 4),
+            Affine::scale_translate(2.0, 4.0, 0.0), // window starts at the right edge
+            4,
+            4,
+            &mut stage,
+            TensorLayout::Nhwc,
+            0.0,
+        )
+        .unwrap();
+        // Every output pixel is outside the 4x4 image, so all of it is padding.
+        assert!(stage.data.iter().all(|&v| v == 0.0));
     }
 }

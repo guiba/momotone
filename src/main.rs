@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
 use crate::core::event_bus::EventBus;
+use crate::core::frame::Frame;
 use crate::core::runtime::{control_channel, RuntimeConfig};
 use crate::core::telemetry::FRAME_BUDGET_MS;
 use crate::core::Sink;
@@ -340,16 +341,15 @@ fn main() -> Result<()> {
     if let Some(path) = &args.image {
         let mut tracker = build_tracker(&args).context("Failed to initialize hand tracker")?;
 
-        let mut frame = opencv::imgcodecs::imread(path, opencv::imgcodecs::IMREAD_COLOR)
-            .with_context(|| format!("Failed to read image {path}"))?;
+        let mut frame = Frame::read(path)?;
         let detection = tracker.process_frame(&frame)?;
-        Visualizer::new().draw_skeleton(&mut frame, &detection)?;
+        Visualizer::new().draw_skeleton(&mut frame, &detection);
 
         let out = args
             .dump_frame
             .clone()
             .unwrap_or_else(|| "output_frame.png".to_string());
-        opencv::imgcodecs::imwrite(&out, &frame, &opencv::core::Vector::new())?;
+        frame.write(&out)?;
 
         tracing::info!(
             "detection: box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",

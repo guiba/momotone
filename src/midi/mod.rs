@@ -142,7 +142,11 @@ impl MidiOutputEngine {
 
 impl Sink for MidiOutputEngine {
     fn start(&mut self) -> Result<()> {
-        let midi_out = MidiOutput::new("Gesture MIDI")?;
+        // `midir::ConnectError` is not `Sync` on Linux - it carries a raw ALSA
+        // pointer - so it cannot go through `?` into an `anyhow::Error`. Turning it
+        // into a message here is both the fix and a better error for the user.
+        let midi_out = MidiOutput::new("Gesture MIDI")
+            .map_err(|e| anyhow!("could not open a MIDI output: {e}"))?;
         let available_ports = midi_out.ports();
 
         // Find the port with a matching name
@@ -156,7 +160,9 @@ impl Sink for MidiOutputEngine {
             })
             .ok_or_else(|| anyhow!("MIDI port '{}' not found", self.port_name))?;
 
-        let conn = midi_out.connect(port, "Gesture MIDI Rust")?;
+        let conn = midi_out
+            .connect(port, "Gesture MIDI Rust")
+            .map_err(|e| anyhow!("could not connect to the MIDI port: {e}"))?;
         self.connection = Some(Mutex::new(conn));
         Ok(())
     }

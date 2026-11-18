@@ -291,3 +291,91 @@ policy that only bites when something else (the pose model, a second process, a 
 capture) pushes inference past the interval. `--budget-ms 0` disables it entirely.
 
 Tests: **152 passing** (6 ignored), `make verify` green.
+
+---
+
+# After OpenCV removal (`chore/opencv-removal`, same machine, rustc 1.100)
+
+## Build cost — the headline number
+
+| | with `opencv` | without |
+| :-- | --: | --: |
+| Cold `cargo check --all-targets` | **19 m 12 s** | **34 s** |
+| Cold `cargo build --release` | ~20 min | **3 m 52 s** |
+| Warm `cargo check` | ~4 s | ~0.3 s |
+
+The OpenCV crate's build script runs `clang` over the whole OpenCV header tree to
+generate the bindings; that was the single largest item in a cold build. Capture,
+decoding, sampling, the ASCII downsample and the `--image` overlay are now pure Rust,
+so there is no native toolchain requirement at all: `.cargo/config.toml`, which pinned
+`LIBCLANG_PATH`/`DYLD_LIBRARY_PATH` to Homebrew LLVM, is gone.
+
+`build.rs` links clang's compiler-rt on Apple targets. rustc 1.100's fat LTO drops
+`___isPlatformVersionAtLeast` from `std` (rustc issue #164915), and ONNX Runtime's
+CoreML object references it, so a release build with `lto = "fat"` fails to link
+without it. LTO is worth keeping: the Rust hot path is ~13 % faster with it.
+
+## Hot-path stages (`cargo test --release -- --include-ignored --nocapture`)
+
+| Stage | OpenCV | pure Rust |
+| :-- | --: | --: |
+| Detector sampling 192x192 | 133 µs | 146–180 µs |
+| Landmarker sampling 224x224 | 94 µs | 254–278 µs |
+| ASCII downsample 640x480 -> 140x105 | ~0.3 ms (`imgproc::resize`) | **0.30 ms** (hand-written box average) |
+| `Frame::to_rgba` 640x480 | 0.30 ms | 0.32 ms |
+| MP4/H.264 decode + RGB convert, 640x480 | ~0.2 ms (OpenCV `VideoCapture`) | **1.17–1.25 ms** (`mp4io` + `rusty_h264-decoder`) |
+| Webcam YUYV -> RGB, 640x480 | (OpenCV decoded it) | **1.4 ms** hand-written; nokhwa's own RGBA decoder is **53 ms** |
+
+The sampler is the one place the hand-written code is slower than OpenCV's `resize`:
+OpenCV vectorises the bilinear tap, our loop does not, so the 224x224 landmarker crop
+costs ~2.5x more. On a 33 ms frame budget that is noise — the whole capture stage of a
+fixture run is 1.9 ms p50.
+
+## Fixture and trace
+
+`fixtures/hand_clip.mp4` is a recording of a real hand, so it is **not in the repo**
+(`fixtures/*.mp4` and `fixtures/clip_trace.json` are gitignored). `make record` generates it
+locally; `make fixture`, `make trace-check` and `make trace` use it. It had to be re-encoded
+to `yuv420p`: `rusty_h264-decoder` is 4:2:0-only and the original clip was High 4:2:2. The
+decode is **bit-exact against ffmpeg's YUV planes** over all 599 frames after reordering
+B-frames into display order; the RGB conversion lands within 2 LSB of ffmpeg's `rgb24`.
+
+Because the fixture's pixels changed, the golden trace changed with it and was regenerated:
+
+| | old trace | new trace |
+| :-- | :-- | :-- |
+| First detection | frame 17 | frame 2 |
+| First note / volume | 62 / 0.39 | 64 / 0.37 |
+| Detections in 120 frames | 104 | 94 |
+
+`make trace-check` passes, and two consecutive runs write byte-identical traces.
+
+## The trace CI can actually run
+
+There is no macOS runner, so CI can never open a camera or load the gitignored ONNX assets.
+Mock mode is driven by the **frame index**, so 120 mock frames always produce the same hand
+at the same place — `fixtures/mock_trace.json` is committed and CI diffs against it
+(`make mock-trace-check`). It covers the detection gate, the estimator, the grid strategy
+and the release path, and it is what catches a change to the gesture mapping on Linux.
+
+```bash
+make mock-trace          # rewrite fixtures/mock_trace.json
+make mock-trace-check    # CI's gate
+```
+
+## End to end
+
+```
+# fixture, MediaPipe, 300 frames
+300 frames in 10.00 s: 29.7 fps, 33.35 ms/frame (capture 1.9 ms, inference 12.9 ms, 0 dropped)
+
+# live webcam, nokhwa, 60 frames
+60 frames in 2.53 s: 28.5 fps, 42.20 ms/frame (capture 33.1 ms, inference 9.6 ms, 0 dropped)
+
+# YOLO pose on the fixture, 30 frames
+30 frames in 0.99 s: 32.1 fps (capture 2.7 ms, inference 22.7 ms p50)
+```
+
+Tests: **181 passing** (7 ignored), `make verify` green, `unsafe` down to the single
+documented `unsafe impl Send for StreamWrapper` (four raw-pointer reads in the tracker's
+tensor sampling went away with OpenCV).

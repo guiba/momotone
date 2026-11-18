@@ -1,5 +1,6 @@
 pub mod detection_gate;
 pub mod event_bus;
+pub mod frame;
 pub mod geometry;
 pub mod grid;
 pub mod instrument;

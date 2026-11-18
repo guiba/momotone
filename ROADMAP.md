@@ -13,24 +13,27 @@ the numbers below are from the current tree.
 | Frame loop (pose model) | **21 fps**, 41 ms/frame — capture 29 ms, inference 69 ms, 13 of 73 dropped | same with `--model yolo --score-threshold 0.3` |
 | Camera read | ~31 ms; the loop is paced by the driver, not by inference | end-of-run `INFO` summary |
 | Detector stage (192×192, hand absent) | 9.5 ms | `--debug` |
-| Detector input sampling (192×192) | 133 µs (reused buffer) vs 247 µs legacy | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
-| Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
+| Detector input sampling (192×192) | **146 µs** (reused buffer), 162 µs fresh — hand-written bilinear, slightly slower than OpenCV's vectorised `resize` (133 µs) | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
+| Landmarker input sampling (224×224) | **254 µs** vs 278 µs fresh | same bench |
 | RGBA conversion (`frame_to_rgba`) | 0.30 ms/frame — only when the feed is on *and* due | presenter benches |
 | Mirroring | **0.018 ms/frame**, no allocation after the first frame | `cargo test --release -- --include-ignored bench_mirror_flip` |
 | Mock-mode clock | **33 ms/frame** — a deadline clock, not a flat sleep | `--mode mock --no-ui --max-frames 120 --debug` |
 | rustc warnings | 0 (only the third-party `block v0.1.6` future-incompat notice) | `cargo build` |
+| `unsafe` in the crate | 1 — `unsafe impl Send for StreamWrapper` in `audio/synthesizer.rs` | `cargo` + review |
+| Cold `cargo check` | **34 s** (was 19 m 12 s with OpenCV) | `cargo clean && cargo check --all-targets` |
 | clippy lints | 0 — `make clippy` is `-D warnings` and part of `make verify` | `make verify` |
 | Dead code | 1 flag, `Visualizer::draw_skeleton`, which *is* used by `--image` — a call-graph false positive | `aft_inspect` |
 
 ## Codebase census (this sweep)
 
-- **35 source files, 10,953 lines.** `pipeline.rs` (2,050, of which 1,150 is its test module) and
-  `dashboard/skeleton.rs` (909) are the two big ones; the iced layer is 1,955 lines.
-- **151 tests pass, 6 benches are `#[ignore]`d.** Coverage now spans the strategies, the estimator,
-  the detection gate, the resampling helper and the ROI window, both pose-output layouts, the
-  geometry helpers, the mock hand, the release and pause paths, the MIDI note gate, the trail
-  decay, the synthesizer voice lifecycle, the presenter cadence, the keyboard band/cell geometry,
-  the trace differ and the video pacing.
+- **37 source files, 12,178 lines.** `pipeline.rs` and `dashboard/skeleton.rs` are the two
+  big ones; the iced layer is ~1,950 lines.
+- **181 tests pass, 7 benches are `#[ignore]`d.** Coverage now spans the strategies, the
+  estimator, the detection gate, the affine sampler, the ROI window, both pose-output
+  layouts, the geometry helpers, the mock hand, the release and pause paths, the MIDI note
+  gate, the trail decay, the synthesizer voice lifecycle, the presenter cadence, the
+  keyboard band/cell geometry, the trace differ, the video pacing and B-frame reordering,
+  the `Frame` invariants, the ASCII ramps and the pure-Rust skeleton overlay.
 - **Still zero tests** in `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs`. The keyboard
   geometry (T4.5) proved the pattern — split the arithmetic from the widget and it becomes testable;
   `gauges.rs` and `metrics.rs` are next.
@@ -58,7 +61,7 @@ the numbers below are from the current tree.
 
 1. ~~MIDI note-on/off discipline~~ (finding 2) + **retrigger on cell change** — one attack per cell transition, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **done for MIDI; the audio sink glides by design** (see finding 3).
 2. ~~Mock-mode deadline clock~~ (finding 1) **done**.
-3. ~~Tracker fixture tests~~ **done** — `tracker_finds_the_hand_in_the_clip` runs the real ONNX graphs over `fixtures/hand_clip.mp4` (106/120 detections, all 21 landmarks).
+3. ~~Tracker fixture tests~~ **done** — `tracker_finds_the_hand_in_the_clip` runs the real ONNX graphs over the locally recorded `fixtures/hand_clip.mp4` (106/120 detections, all 21 landmarks). `#[ignore]`d: it needs the clip and the gitignored model assets.
 4. ~~CI~~ (finding 11) **done** — `make verify`.
 5. ~~Audio: band-limited waveforms + ADSR + portamento~~ (finding 3) **done**.
 6. ~~Detector hysteresis~~ (finding 8) **done**.
@@ -130,7 +133,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 ### Input & evaluation
 - ~~`--video <file>` playback source~~ **done** — `VideoSource` reads a clip paced at its own frame rate, so a run is reproducible and `make trace-check` can diff it against a golden trace.
-- ~~Benchmark harness~~ **done** — `fixtures/hand_clip.mp4` + `bench/baseline.md` + `make fixture`/`make stats`.
+- ~~Benchmark harness~~ **done** — `bench/baseline.md` + `make fixture`/`make stats`. The clip itself is no longer in the repo (it is a recording of a real hand); `make record` produces it and `make mock-trace-check` is the committed, machine-independent gate.
 - **`--calibrate`** — sample the user's comfortable hand range and store per-user min/max, replacing the fixed `NOTE_MARGIN`. **M**
 - ~~Stage latency percentiles~~ (finding 12) **done** — p50/p95/p99/max per stage on the Performance card.
 
