@@ -32,6 +32,13 @@ in parentheses are the branches each phase was developed on.
   the golden trace against it. `make fixture|trace-check|trace` say so when either is missing.
 - `--video` decodes the clip with `mp4io` + `rusty_h264-decoder` (both `#![forbid(unsafe_code)]`).
   `rusty_h264-decoder` is 4:2:0-only, hence the `-pix_fmt yuv420p` in `make record`.
+- **CI has a regression gate it can actually run.** There is no macOS runner, so CI can never
+  touch the camera or the gitignored ONNX assets. Mock mode is driven by the frame index, so
+  `fixtures/mock_trace.json` (120 frames, deterministic across debug and release builds) is
+  committed and CI diffs against it — `make mock-trace-check`.
+- `src/midi/mod.rs` maps `midir::ConnectError` to a message before the `?`. On the ALSA backend
+  that error carries a raw pointer, so it is not `Sync` and cannot become an `anyhow::Error`;
+  the CI build failed with E0277 while macOS built fine.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 
