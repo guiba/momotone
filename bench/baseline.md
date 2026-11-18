@@ -333,13 +333,14 @@ fixture run is 1.9 ms p50.
 
 ## Fixture and trace
 
-`fixtures/hand_clip.mp4` had to be re-encoded to `yuv420p`: `rusty_h264-decoder` is
-4:2:0-only and the original clip was High 4:2:2. The decode is **bit-exact against
-ffmpeg's YUV planes** over all 599 frames after reordering B-frames into display order;
-the RGB conversion lands within 2 LSB of ffmpeg's `rgb24`.
+`fixtures/hand_clip.mp4` is a recording of a real hand, so it is **not in the repo**
+(`fixtures/*.mp4` and `fixtures/clip_trace.json` are gitignored). `make record` generates it
+locally; `make fixture`, `make trace-check` and `make trace` use it. It had to be re-encoded
+to `yuv420p`: `rusty_h264-decoder` is 4:2:0-only and the original clip was High 4:2:2. The
+decode is **bit-exact against ffmpeg's YUV planes** over all 599 frames after reordering
+B-frames into display order; the RGB conversion lands within 2 LSB of ffmpeg's `rgb24`.
 
-Because the fixture's pixels changed, the golden trace changed with it and was
-regenerated:
+Because the fixture's pixels changed, the golden trace changed with it and was regenerated:
 
 | | old trace | new trace |
 | :-- | :-- | :-- |
@@ -348,6 +349,19 @@ regenerated:
 | Detections in 120 frames | 104 | 94 |
 
 `make trace-check` passes, and two consecutive runs write byte-identical traces.
+
+## The trace CI can actually run
+
+There is no macOS runner, so CI can never open a camera or load the gitignored ONNX assets.
+Mock mode is driven by the **frame index**, so 120 mock frames always produce the same hand
+at the same place — `fixtures/mock_trace.json` is committed and CI diffs against it
+(`make mock-trace-check`). It covers the detection gate, the estimator, the grid strategy
+and the release path, and it is what catches a change to the gesture mapping on Linux.
+
+```bash
+make mock-trace          # rewrite fixtures/mock_trace.json
+make mock-trace-check    # CI's gate
+```
 
 ## End to end
 
