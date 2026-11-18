@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
-use opencv::prelude::*;
 
+use crate::core::frame::Frame;
 use crate::core::runtime::RuntimeConfig;
 use crate::core::Landmark;
 use crate::dashboard::metrics::FrameMetrics;
@@ -27,7 +27,7 @@ pub const DEFAULT_FEED_FPS: f32 = 15.0;
 /// One frame's worth of material for the presenter: pixels if the source has any,
 /// and the skeleton in mock mode, where there are none.
 pub struct PresentJob {
-    pub frame: Option<Mat>,
+    pub frame: Option<Frame>,
     pub landmarks: Vec<Landmark>,
     pub frame_size: (usize, usize),
 }
@@ -142,7 +142,7 @@ impl Presenter {
         if settings.feed && feed_due(self.next_feed, now) {
             if let Some(frame) = &job.frame {
                 self.next_feed = now + feed_interval(settings.feed_fps);
-                metrics.scene.pixels = frame_to_rgba(frame);
+                metrics.scene.pixels = frame.to_rgba();
             }
         } else {
             // Keep the snapshot free of pixels the UI would discard.
@@ -177,29 +177,11 @@ fn feed_due(next: Instant, now: Instant) -> bool {
     now >= next
 }
 
-/// BGR OpenCV frame -> RGBA bytes for the iced `image` handle.
-fn frame_to_rgba(frame: &Mat) -> Vec<u8> {
-    let count = (frame.cols() as usize) * (frame.rows() as usize) * (frame.channels() as usize);
-    // Safe: `frame` is a captured, contiguous Mat, so its buffer holds exactly
-    // `count` bytes starting at `data()`.
-    let src = unsafe { std::slice::from_raw_parts(frame.data(), count) };
-    bgr_to_rgba(src)
-}
-
-fn bgr_to_rgba(src: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(src.len() / 3 * 4);
-    for pixel in src.as_chunks::<3>().0 {
-        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
-    }
-    rgba
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::runtime::RuntimeConfig;
     use crate::presentation::ascii::DEFAULT_COLS;
-    use opencv::core::{Mat, Scalar};
 
     fn settings(feed: bool, ascii: bool, feed_fps: f32, ascii_fps: f32) -> RuntimeConfig {
         let mut config = RuntimeConfig::new(feed_fps, ascii_fps, ascii, Ramp::Blocks);
@@ -207,14 +189,8 @@ mod tests {
         config
     }
 
-    fn frame_of(value: u8) -> Mat {
-        Mat::new_rows_cols_with_default(
-            480,
-            640,
-            opencv::core::CV_8UC3,
-            Scalar::new(value as f64, value as f64, value as f64, 0.0),
-        )
-        .unwrap()
+    fn frame_of(value: u8) -> Frame {
+        Frame::solid(640, 480, value)
     }
 
     fn job(value: u8) -> PresentJob {
@@ -226,11 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn bgr_pixels_become_rgba() {
-        // Two BGR pixels.
+    fn rgb_pixels_become_rgba() {
+        // Two RGB pixels.
         assert_eq!(
-            bgr_to_rgba(&[1, 2, 3, 4, 5, 6]),
-            vec![3, 2, 1, 255, 6, 5, 4, 255]
+            Frame::new(2, 1, vec![1, 2, 3, 4, 5, 6]).to_rgba(),
+            vec![1, 2, 3, 255, 4, 5, 6, 255]
         );
     }
 
@@ -437,11 +413,11 @@ mod tests {
         let frame = frame_of(128);
         let start = Instant::now();
         for _ in 0..200 {
-            let pixels = frame_to_rgba(&frame);
+            let pixels = frame.to_rgba();
             assert_eq!(pixels.len(), 640 * 480 * 4);
         }
         println!(
-            "frame_to_rgba 640x480: {:.3} ms/frame",
+            "Frame::to_rgba 640x480: {:.3} ms/frame",
             start.elapsed().as_secs_f64() * 1000.0 / 200.0
         );
     }

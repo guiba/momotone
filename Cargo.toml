@@ -18,7 +18,22 @@ cpal = "0.18"
 midir = "0.11.1"
 
 # Vision & Math
-opencv = { version = "0.102", features = ["clang-runtime"] }
+# Camera capture through AVFoundation. The YUYV -> RGB conversion is done here rather
+# than with nokhwa's decoder (see src/vision/camera.rs). `camera-sync-impl` is
+# nokhwa's own opt-in `unsafe impl Send for Camera`: without it the camera cannot be
+# moved onto the capture thread, and the pipeline's four-thread shape depends on that.
+nokhwa = { version = "0.10", default-features = false, features = ["input-avfoundation", "camera-sync-impl"] }
+# Pure-Rust image I/O for the offline `--image` / `--dump-frame` path. Already in
+# the tree through iced's `image` feature; naming it here makes the dependency
+# explicit rather than incidental.
+image = "0.25"
+
+# Clip decoding for `--video`, both crates pure Rust with no C and no build script.
+# `mp4io` parses the container, `rusty_h264-decoder` decodes the pictures; see
+# src/vision/video.rs. `asm` is the crate's SIMD kernels (portable Rust intrinsics,
+# not assembly); dropping it keeps the tree smaller for a 640x480 fixture.
+rusty_h264-decoder = { version = "0.17.2", default-features = false, features = ["std", "asm"] }
+mp4io = "0.1.2"
 
 # Async runtime - only needed as iced's executor for the UI subscription.
 # `full` pulls in networking, fs and process support we never touch.
@@ -29,7 +44,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Real-time budget is 33 ms/frame; cross-unit inlining and a single codegen unit
-# are what make the ONNX/OpenCV hot path as tight as it can be on stable Rust.
+# are what make the sampling and H.264 decode hot path as tight as it can be on
+# stable Rust.
 [profile.release]
 lto = "fat"
 codegen-units = 1

@@ -10,12 +10,12 @@
 //! drawing lives in `crate::visualizer`.
 
 use anyhow::{anyhow, Context, Result};
-use opencv::prelude::*;
 use std::time::Instant;
 
 use ort::session::Session;
 use ort::value::TensorRef;
 
+use crate::core::frame::Frame;
 use crate::core::HandDetectionResult;
 use crate::core::Landmark;
 use crate::core::StageTimings;
@@ -79,7 +79,7 @@ impl HandTracker {
         )?)))
     }
 
-    pub fn process_frame(&mut self, frame: &Mat) -> Result<HandDetectionResult> {
+    pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
         match self {
             Self::MediaPipe(tracker) => tracker.process_frame(frame),
             Self::YoloPose(tracker) => tracker.process_frame(frame),
@@ -203,9 +203,9 @@ impl MediaPipeTracker {
 
     /// Detector stage: returns the palm centre and the x2-expanded hand radius,
     /// in frame pixels.
-    fn run_detector(&mut self, frame: &Mat) -> Result<Option<PalmBox>> {
-        let fw = frame.cols() as f64;
-        let fh = frame.rows() as f64;
+    fn run_detector(&mut self, frame: &Frame) -> Result<Option<PalmBox>> {
+        let fw = frame.width() as f64;
+        let fh = frame.height() as f64;
 
         // The detector wants a square input. The window follows the palm so a
         // hand at the frame edge is still fully sampled instead of being cut out
@@ -320,7 +320,13 @@ impl MediaPipeTracker {
     }
 
     /// Landmarker stage: crop a square around the palm into 224x224 and run it.
-    fn run_landmarks(&mut self, frame: &Mat, cx: f64, cy: f64, half: f64) -> Result<Vec<Landmark>> {
+    fn run_landmarks(
+        &mut self,
+        frame: &Frame,
+        cx: f64,
+        cy: f64,
+        half: f64,
+    ) -> Result<Vec<Landmark>> {
         // The box the detector produced is the palm expanded x2. Cropping a square
         // slightly larger than it, centred on the *true* palm centre, keeps the
         // fingers inside the crop even when the hand is clipped by the frame edge:
@@ -375,11 +381,11 @@ impl MediaPipeTracker {
         Ok(landmarks)
     }
 
-    pub fn process_frame(&mut self, frame: &Mat) -> Result<HandDetectionResult> {
+    pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
         let mut result = HandDetectionResult {
             hand_landmarks: None,
             r#box: None,
-            frame_size: (frame.cols() as usize, frame.rows() as usize),
+            frame_size: (frame.width(), frame.height()),
             score: 0.0,
             timings: StageTimings::default(),
         };
@@ -487,88 +493,9 @@ fn load_anchors(path: &str) -> Result<Vec<(f32, f32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opencv::core;
-
-    /// 2x2 BGR frame: (10,20,30) (40,50,60) / (70,80,90) (100,110,120)
-    const TEST_PIXELS: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-
-    fn test_frame() -> Mat {
-        let mut frame =
-            core::Mat::new_rows_cols_with_default(2, 2, core::CV_8UC3, core::Scalar::all(0.0))
-                .unwrap();
-        for y in 0..2 {
-            let row = frame.ptr_mut(y).unwrap();
-            unsafe {
-                for x in 0..2 {
-                    let src = &TEST_PIXELS[(y as usize * 2 + x) * 3..];
-                    *row.add(x * 3) = src[0];
-                    *row.add(x * 3 + 1) = src[1];
-                    *row.add(x * 3 + 2) = src[2];
-                }
-            }
-        }
-        frame
-    }
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-6
-    }
-
-    fn resample(frame: &Mat, map: Affine, out_w: usize, out_h: usize) -> (Affine, Vec<f32>) {
-        let mut stage = StageInput::new(out_w, out_h);
-        let map = sample_affine_to_tensor(
-            frame,
-            map,
-            out_w,
-            out_h,
-            &mut stage,
-            TensorLayout::Nhwc,
-            0.0,
-        )
-        .unwrap();
-        (map, stage.data)
-    }
-
-    /// Channel `c` of output pixel (oy, ox) in a (out_h, out_w, 3) buffer.
-    fn px(data: &[f32], out_w: usize, oy: usize, ox: usize, c: usize) -> f32 {
-        data[(oy * out_w + ox) * 3 + c]
-    }
-
-    #[test]
-    fn identity_crop_is_normalised_rgb() {
-        let frame = test_frame();
-        let (map, data) = resample(&frame, Affine::scale_translate(1.0, 0.0, 0.0), 2, 2);
-
-        assert_eq!(data.len(), 2 * 2 * 3);
-        assert!(near(px(&data, 2, 0, 0, 0), 30.0 / 255.0)); // R of BGR(10,20,30)
-        assert!(near(px(&data, 2, 0, 0, 1), 20.0 / 255.0));
-        assert!(near(px(&data, 2, 0, 0, 2), 10.0 / 255.0));
-        assert!(near(px(&data, 2, 1, 1, 1), 110.0 / 255.0)); // G of the bottom-right pixel
-        assert!((map.m00 - 1.0).abs() < 1e-9 && map.tx == 0.0 && map.ty == 0.0);
-    }
-
-    #[test]
-    fn rounded_crop_reports_the_effective_mapping() {
-        let frame =
-            core::Mat::new_rows_cols_with_default(4, 4, core::CV_8UC3, core::Scalar::all(0.0))
-                .unwrap();
-        let (map, _) = resample(&frame, Affine::scale_translate(4.0 / 3.0, 0.0, 0.0), 3, 3);
-
-        assert!((map.m00 - 4.0 / 3.0).abs() < 1e-9);
-        assert!((map.m11 - 4.0 / 3.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn crop_running_off_the_frame_is_padded_with_black() {
-        let frame = test_frame();
-        // 3x2 output starting one pixel left of the frame: only the warp path can do this.
-        let (map, data) = resample(&frame, Affine::scale_translate(1.0, -1.0, 0.0), 3, 2);
-
-        assert_eq!(data.len(), 2 * 3 * 3);
-        assert!(near(px(&data, 3, 0, 0, 0), 0.0)); // column -1 is outside the frame
-        assert!(near(px(&data, 3, 1, 1, 0), 90.0 / 255.0)); // frame pixel (1,0) -> R
-        assert!(near(px(&data, 3, 1, 2, 0), 120.0 / 255.0)); // frame pixel (1,1) -> R
-        assert!((map.tx + 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -610,7 +537,7 @@ mod tests {
 
     #[test]
     fn stage_buffers_are_reused_across_frames() {
-        let frame = test_frame();
+        let frame = Frame::solid(2, 2, 7);
         let mut stage = StageInput::new(2, 2);
         sample_affine_to_tensor(
             &frame,
@@ -623,7 +550,6 @@ mod tests {
         )
         .unwrap();
         let ptr = stage.data.as_ptr();
-        let warped_ptr = stage.warped.data();
         sample_affine_to_tensor(
             &frame,
             Affine::scale_translate(1.0, 0.0, 0.0),
@@ -635,59 +561,15 @@ mod tests {
         )
         .unwrap();
 
-        // Neither the f32 buffer nor the OpenCV scratch matrix is reallocated.
+        // The f32 buffer is not reallocated between frames.
         assert_eq!(ptr, stage.data.as_ptr());
-        assert_eq!(warped_ptr, stage.warped.data());
     }
 
     use std::time::{Duration, Instant};
 
-    /// The old per-pixel sampler, kept only so the benchmark has something to compare
-    /// against. Run with `cargo test --release -- --include-ignored bench_sampling`.
-    fn legacy_sample(frame: &Mat, map: Affine, out_w: usize, out_h: usize) -> Vec<f32> {
-        let fw = frame.cols() as f64;
-        let fh = frame.rows() as f64;
-        let mut data = vec![0.0f32; out_h * out_w * 3];
-        unsafe {
-            for oy in 0..out_h {
-                for ox in 0..out_w {
-                    let sx = map.m00 * ox as f64 + map.m01 * oy as f64 + map.tx;
-                    let sy = map.m10 * ox as f64 + map.m11 * oy as f64 + map.ty;
-                    if sx < 0.0 || sy < 0.0 || sx >= fw || sy >= fh {
-                        continue;
-                    }
-                    let x0 = sx.floor() as usize;
-                    let y0 = sy.floor() as usize;
-                    let x1 = (x0 + 1).min(frame.cols() as usize - 1);
-                    let y1 = (y0 + 1).min(frame.rows() as usize - 1);
-                    let fx = sx - x0 as f64;
-                    let fy = sy - y0 as f64;
-                    let row0 = frame.ptr(y0 as i32).unwrap();
-                    let row1 = frame.ptr(y1 as i32).unwrap();
-                    let px = |p: *const u8, c: usize| -> f64 { *p.add(c) as f64 };
-                    let c00 = row0.add(x0 * 3);
-                    let c01 = row0.add(x1 * 3);
-                    let c10 = row1.add(x0 * 3);
-                    let c11 = row1.add(x1 * 3);
-                    let b = (px(c00, 0) * (1.0 - fx) + px(c01, 0) * fx) * (1.0 - fy)
-                        + (px(c10, 0) * (1.0 - fx) + px(c11, 0) * fx) * fy;
-                    let g = (px(c00, 1) * (1.0 - fx) + px(c01, 1) * fx) * (1.0 - fy)
-                        + (px(c10, 1) * (1.0 - fx) + px(c11, 1) * fx) * fy;
-                    let r = (px(c00, 2) * (1.0 - fx) + px(c01, 2) * fx) * (1.0 - fy)
-                        + (px(c10, 2) * (1.0 - fx) + px(c11, 2) * fx) * fy;
-                    let i = (oy * out_w + ox) * 3;
-                    data[i] = (r / 255.0) as f32;
-                    data[i + 1] = (g / 255.0) as f32;
-                    data[i + 2] = (b / 255.0) as f32;
-                }
-            }
-        }
-        data
-    }
-
     /// One stage, sampled N times: either with a buffer reused across calls (what
     /// the tracker does) or allocated per call (what it used to do).
-    fn time_stage(frame: &Mat, affine: Affine, size: usize, fresh_buffer: bool) -> Duration {
+    fn time_stage(frame: &Frame, affine: Affine, size: usize, fresh_buffer: bool) -> Duration {
         const N: u32 = 300;
         let mut reused = StageInput::new(size, size);
         let start = Instant::now();
@@ -721,25 +603,10 @@ mod tests {
         start.elapsed() / N
     }
 
-    fn time_legacy(frame: &Mat, affine: Affine, size: usize) -> Duration {
-        const N: u32 = 300;
-        let start = Instant::now();
-        for _ in 0..N {
-            std::hint::black_box(legacy_sample(frame, affine, size, size));
-        }
-        start.elapsed() / N
-    }
-
     #[test]
     #[ignore]
     fn bench_sampling() {
-        let frame = core::Mat::new_rows_cols_with_default(
-            720,
-            1280,
-            core::CV_8UC3,
-            core::Scalar::all(127.0),
-        )
-        .unwrap();
+        let frame = Frame::solid(720, 1280, 127);
         // The affine each stage really applies on a 640x480 frame.
         let stages = [
             ("detector", 192, Affine::scale_translate(3.75, 280.0, 0.0)),
@@ -751,10 +618,9 @@ mod tests {
         ];
         for (name, size, affine) in stages {
             println!(
-                "{name} {size}x{size}: reused {:?}  fresh {:?}  legacy {:?}",
+                "{name} {size}x{size}: reused {:?}  fresh {:?}",
                 time_stage(&frame, affine, size, false),
                 time_stage(&frame, affine, size, true),
-                time_legacy(&frame, affine, size),
             );
         }
     }

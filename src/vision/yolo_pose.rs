@@ -12,12 +12,12 @@
 //! no changes.
 
 use anyhow::{anyhow, Context, Result};
-use opencv::prelude::*;
 use std::time::Instant;
 
 use ort::session::Session;
 use ort::value::TensorRef;
 
+use crate::core::frame::Frame;
 use crate::core::{HandDetectionResult, Landmark, StageTimings};
 use crate::vision::reuse::{square_box, ReuseCache};
 use crate::vision::sampling::{letterbox_map, sample_affine_to_tensor, StageInput, TensorLayout};
@@ -228,8 +228,8 @@ impl YoloPoseTracker {
     }
 
     /// One letterboxed inference pass, returning the best hand in frame pixels.
-    fn run(&mut self, frame: &Mat) -> Result<Option<Pose>> {
-        let map = letterbox_map(frame.cols() as f64, frame.rows() as f64, self.input_size);
+    fn run(&mut self, frame: &Frame) -> Result<Option<Pose>> {
+        let map = letterbox_map(frame.width() as f64, frame.height() as f64, self.input_size);
         let applied = sample_affine_to_tensor(
             frame,
             map,
@@ -337,11 +337,11 @@ impl YoloPoseTracker {
         }))
     }
 
-    pub fn process_frame(&mut self, frame: &Mat) -> Result<HandDetectionResult> {
+    pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
         let mut result = HandDetectionResult {
             hand_landmarks: None,
             r#box: None,
-            frame_size: (frame.cols() as usize, frame.rows() as usize),
+            frame_size: (frame.width(), frame.height()),
             score: 0.0,
             timings: StageTimings::default(),
         };

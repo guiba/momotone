@@ -10,10 +10,9 @@
 //! Rows are derived from the frame's aspect ratio, so the art has the same
 //! proportions as the camera view before the UI stretches it into the panel.
 
-use anyhow::{Context, Result};
-use opencv::prelude::*;
-use opencv::{core, imgproc};
+use anyhow::Result;
 
+use crate::core::frame::Frame;
 use crate::core::Landmark;
 
 /// Number of brightness buckets. Nine is enough for a legible ramp: the glyph
@@ -178,40 +177,42 @@ pub fn rows_for(cols: usize, frame_size: (usize, usize)) -> usize {
 }
 
 /// Downsample `frame` to `cols x rows_for(cols)` and quantise each cell.
-fn frame_levels(frame: &Mat, cols: usize) -> Result<Vec<u8>> {
-    let rows = rows_for(cols, (frame.cols() as usize, frame.rows() as usize));
-    let mut small = Mat::default();
-    imgproc::resize(
-        frame,
-        &mut small,
-        core::Size::new(cols as i32, rows as i32),
-        0.0,
-        0.0,
-        imgproc::INTER_AREA,
-    )
-    .with_context(|| format!("failed to downsample the frame to {cols}x{rows}"))?;
-
-    let channels = small.channels().max(1) as usize;
-    let count = cols * rows * channels;
-    // Safe: `resize` returns a freshly allocated contiguous 8UC3 Mat, so its
-    // buffer is exactly `cols * rows * channels` bytes starting at `data()`.
-    let pixels = unsafe { std::slice::from_raw_parts(small.data(), count) };
-
+///
+/// Each cell is the mean luminance of the block of pixels it covers - the same
+/// area-average the OpenCV `INTER_AREA` resize produced - accumulated in `u32`
+/// so a 640x480 frame costs one pass over the pixels and no allocation.
+fn frame_levels(frame: &Frame, cols: usize) -> Result<Vec<u8>> {
+    let fw = frame.width();
+    let fh = frame.height();
+    let rows = rows_for(cols, (fw, fh));
+    let pixels = frame.pixels();
     let mut cells = vec![0u8; cols * rows];
-    for (index, cell) in cells.iter_mut().enumerate() {
-        let offset = index * channels;
-        // OpenCV stores BGR; the weights are the standard Rec. 709 luma ones.
-        let luminance = if channels >= 3 {
-            0.299 * f32::from(pixels[offset + 2])
-                + 0.587 * f32::from(pixels[offset + 1])
-                + 0.114 * f32::from(pixels[offset])
-        } else {
-            f32::from(pixels[offset])
-        };
-        *cell = level_of(luminance);
+
+    for cy in 0..rows {
+        let y0 = cy * fh / rows;
+        let y1 = ((cy + 1) * fh / rows).max(y0 + 1);
+        for cx in 0..cols {
+            let x0 = cx * fw / cols;
+            let x1 = ((cx + 1) * fw / cols).max(x0 + 1);
+            let (mut red, mut green, mut blue) = (0u32, 0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * fw + x) * 3;
+                    red += pixels[i] as u32;
+                    green += pixels[i + 1] as u32;
+                    blue += pixels[i + 2] as u32;
+                }
+            }
+            let count = ((y1 - y0) * (x1 - x0)) as u32;
+            // The weights are the same Rec. 601 luma the frame helper uses.
+            let luminance =
+                (0.299 * red as f32 + 0.587 * green as f32 + 0.114 * blue as f32) / count as f32;
+            cells[cy * cols + cx] = level_of(luminance);
+        }
     }
     Ok(cells)
 }
+
 /// Bones drawn into the mock grid: the palm loop plus the five finger chains in
 /// MediaPipe landmark order.
 const BONES: [(usize, usize); 20] = [
@@ -250,7 +251,7 @@ impl AsciiLayer {
         }
     }
 
-    pub fn render(&mut self, frame: &Mat, cols: usize) -> Result<AsciiGrid> {
+    pub fn render(&mut self, frame: &Frame, cols: usize) -> Result<AsciiGrid> {
         let cols = cols.clamp(8, 400);
         let mut cells = frame_levels(frame, cols)?;
         if self.smoothed.len() != cells.len() {
@@ -264,7 +265,7 @@ impl AsciiLayer {
         }
         Ok(AsciiGrid {
             cols,
-            rows: rows_for(cols, (frame.cols() as usize, frame.rows() as usize)),
+            rows: rows_for(cols, frame.size()),
             cells,
         })
     }
@@ -321,22 +322,10 @@ impl Default for AsciiLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
-    fn solid(rows: i32, cols: i32, b: u8, g: u8, r: u8) -> Mat {
-        let mut mat =
-            Mat::new_rows_cols_with_default(rows, cols, core::CV_8UC3, core::Scalar::all(0.0))
-                .unwrap();
-        for y in 0..rows {
-            let row = mat.ptr_mut(y).unwrap();
-            unsafe {
-                for x in 0..cols {
-                    *row.add(x as usize * 3) = b;
-                    *row.add(x as usize * 3 + 1) = g;
-                    *row.add(x as usize * 3 + 2) = r;
-                }
-            }
-        }
-        mat
+    fn solid(rows: usize, cols: usize, r: u8, g: u8, b: u8) -> Frame {
+        Frame::new(cols, rows, [r, g, b].repeat(rows * cols))
     }
 
     #[test]
@@ -388,20 +377,19 @@ mod tests {
 
     #[test]
     fn a_gradient_is_monotonic_across_the_grid() {
-        let mut mat =
-            Mat::new_rows_cols_with_default(48, 64, core::CV_8UC3, core::Scalar::all(0.0)).unwrap();
+        let mut pixels = vec![0u8; 48 * 64 * 3];
         for y in 0..48 {
-            let row = mat.ptr_mut(y).unwrap();
-            unsafe {
-                for x in 0..64 {
-                    let value = (x * 255 / 63) as u8;
-                    *row.add(x as usize * 3) = value;
-                    *row.add(x as usize * 3 + 1) = value;
-                    *row.add(x as usize * 3 + 2) = value;
-                }
+            for x in 0..64 {
+                let value = (x * 255 / 63) as u8;
+                let i = (y * 64 + x) * 3;
+                pixels[i] = value;
+                pixels[i + 1] = value;
+                pixels[i + 2] = value;
             }
         }
-        let grid = AsciiLayer::new().render(&mat, 16).unwrap();
+        let grid = AsciiLayer::new()
+            .render(&Frame::new(64, 48, pixels), 16)
+            .unwrap();
         for row in 0..grid.rows {
             for col in 1..grid.cols {
                 assert!(grid.level(row, col) >= grid.level(row, col - 1));
@@ -473,6 +461,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    /// What downsampling a 640x480 frame to the dashboard's 140-column grid costs.
+    /// Run with
+    /// `cargo test --release -- --include-ignored bench_ascii_downsample --nocapture`.
+    fn bench_ascii_downsample() {
+        const N: u64 = 200;
+        let frame = Frame::new(
+            640,
+            480,
+            (0..640 * 480 * 3).map(|i| (i % 256) as u8).collect(),
+        );
+        let start = Instant::now();
+        for _ in 0..N {
+            let levels = frame_levels(&frame, 140).expect("a 640x480 frame has rows");
+            std::hint::black_box(&levels);
+        }
+        println!(
+            "frame_levels 640x480 -> 140x{}: {:.3} ms/frame",
+            rows_for(140, (640, 480)),
+            start.elapsed().as_secs_f64() * 1000.0 / N as f64
+        );
     }
 
     #[test]
