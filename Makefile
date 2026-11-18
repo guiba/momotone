@@ -8,7 +8,8 @@
 # before every commit. `make help` lists everything.
 #
 # Notes:
-#   * The first build compiles OpenCV; afterwards `cargo check` is ~4 s warm.
+#   * `cargo check` is ~4 s warm. There is no heavy native build any more: the
+#     vision path is pure Rust (see OPENCV_REMOVAL_PLAN.md).
 #   * `make verify` treats clippy warnings as errors on purpose, and it is green.
 #     Clear a lint rather than lowering the bar; if a suppression is ever needed,
 #     say why in the commit message.
@@ -117,8 +118,10 @@ image:
 
 ## Record a 20 s webcam clip into fixtures/hand_clip.mp4. Needs ffmpeg and a
 ## free camera; run once, then use `make trace-check` from then on.
+## `-pix_fmt yuv420p` is not cosmetic: the pure-Rust decoder in src/vision/video.rs
+## only handles 4:2:0, and AVFoundation defaults to a 4:2:2 stream.
 record:
-	ffmpeg -y -f avfoundation -framerate 30 -video_size 640x480 -i "0:none" -t 20 $(CLIP)
+	ffmpeg -y -f avfoundation -framerate 30 -video_size 640x480 -i "0:none" -t 20 -pix_fmt yuv420p $(CLIP)
 
 ## Run the recorded clip headlessly with per-stage timing.
 fixture:

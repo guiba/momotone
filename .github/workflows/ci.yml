@@ -16,30 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The opencv crate generates its bindings with clang and needs the OpenCV
-      # headers and libraries; cpal's alsa-sys needs ALSA's pkg-config entry.
+      # Capture, decoding and image I/O are all pure Rust now, so the only system
+      # library left is ALSA, which cpal's alsa-sys finds through pkg-config.
       # ort fetches its ONNX Runtime itself.
       - name: System dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev libasound2-dev libclang-dev clang pkg-config
-
-      # The runner's libclang is a chain of versioned symlinks that clang-sys'
-      # search does not follow; put a plain libclang.so where it looks by default.
-      - name: Make libclang findable
-        run: |
-          clang_lib=$(find /usr/lib/llvm-*/lib -name 'libclang.so*' | head -1)
-          clang_real=$(readlink -f "$clang_lib")
-          echo "libclang symlink:  $clang_lib"
-          echo "libclang resolved: $clang_real"
-          if [ ! -f "$clang_real" ]; then
-            echo "the libclang symlink is dangling; installing the runtime library"
-            sudo apt-get install -y libclang1-21
-            clang_real=$(readlink -f "$clang_lib")
-          fi
-          sudo cp "$clang_real" /usr/local/lib/libclang.so
-          ls -l /usr/local/lib/libclang.so
+            libasound2-dev pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4

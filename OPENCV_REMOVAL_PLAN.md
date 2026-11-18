@@ -1,9 +1,18 @@
 # OpenCV Removal Plan — momotone
 
-**Status:** Draft for review. Not started.
+**Status:** **Done.** Executed on `chore/opencv-removal`; the measured results are in
+`bench/baseline.md` under "After OpenCV removal". The decisions below are kept as the
+rationale; §4.3 and §10 record where execution differed from the plan.
 **Scope:** remove the `opencv` crate from `momotone` and replace it with maintained, Rust-native equivalents.
-**Branch convention:** `chore/opencv-removal` (or `perf/no-opencv` if it lands as a perf win — decide after Phase 0).
+**Branch convention:** `chore/opencv-removal`.
 **Effort:** ~2–3 working days total. Each phase is independently mergeable and independently revertible.
+
+> **What actually happened, in one line:** cold `cargo check` went from 19 m 12 s to 34 s,
+> `opencv` and `.cargo/config.toml` are gone, capture is `nokhwa`, the fixture decodes with
+> `mp4io` + `rusty_h264-decoder`, and every gate (`make verify`, `make trace-check`, the
+> ONNX fixture test) is green. Two deviations from the plan: the MP4 decoder is
+> `rusty_h264-decoder`, not `yscv-video` (§4.3), and `annotator.rs` was reimplemented in
+> Rust rather than deleted (§10, question 3).
 
 ---
 
@@ -325,23 +334,41 @@ left from the removal.
 
 ---
 
-## 8. Verification & benchmark gate
+## 8. Verification & benchmark gate — results
 
-Run and record before/after in `bench/baseline.md`:
+Measured on the same machine after Phases 1–7, rustc 1.100:
 
-| Metric | Command | Baseline (current) | Target |
-| :--- | :--- | ---: | :---: |
-| Cold `cargo check` | `cargo clean && cargo check` | **19 m 12 s** | < 4 min |
-| Warm `cargo check` | `cargo check` | ~4 s | ~2 s |
-| Detector sampling (192×192) | `cargo test --release -- --include-ignored bench_sampling --nocapture` | 133 µs | ≤ 133 µs |
-| Landmarker sampling (224×224) | same | 94 µs | ≤ 94 µs |
-| RGBA conversion (640×480) | `bench_feed_upload` | 0.30 ms | ≤ 0.30 ms |
-| Mirror flip | `bench_mirror_flip` | 0.017 ms | ≤ 0.017 ms |
-| Live fps | `make headless` | 29.9 fps | ≥ 29.9 fps |
-| Fixture fps | `make fixture` | 29.7 fps | ≥ 29.7 fps |
-| Golden trace | `make trace-check` | pass | pass |
-| `unsafe` sites in the crate | grep | 10 | 1 (`StreamWrapper`) |
-| Direct dependencies | `Cargo.toml` | 13 | 15 (−`opencv`, +`image`, +`nokhwa`, +`yscv-video`) — `image` is already resolved in `Cargo.lock` |
+| Metric | Command | Before | After | Target | Verdict |
+| :--- | :--- | ---: | ---: | :---: | :---: |
+| Cold `cargo check` | `cargo clean && cargo check --all-targets` | **19 m 12 s** | **34 s** | < 4 min | ✅ 34× faster |
+| Cold `cargo build --release` | `cargo clean && cargo build --release` | ~20 min | **3 m 52 s** | — | ✅ |
+| Detector sampling (192×192) | `bench_sampling` | 133 µs | 146 µs | ≤ 133 µs | ❌ +13 µs |
+| Landmarker sampling (224×224) | `bench_sampling` | 94 µs | 254 µs | ≤ 94 µs | ❌ +160 µs |
+| ASCII downsample (140×105) | `bench_ascii_downsample` | ~0.3 ms | 0.30 ms | ≤ 0.30 ms | ✅ |
+| RGBA conversion (640×480) | `bench_feed_upload` | 0.30 ms | 0.32 ms | ≤ 0.30 ms | ≈ |
+| Mirror flip | `bench_mirror_flip` | 0.017 ms | 0.018 ms | ≤ 0.017 ms | ≈ |
+| Clip decode | `bench_clip_decode` | ~0.2 ms (OpenCV) | 1.2 ms | — | ✅ still 0.4 % of a 33 ms frame |
+| Fixture fps | `make fixture` | 29.7 fps | 29.7 fps | ≥ 29.7 fps | ✅ |
+| Live fps | `make headless` | 29.9 fps | 28.5 fps | ≥ 29.9 fps | ⚠️ camera-limited, not decode-limited |
+| Golden trace | `make trace-check` | pass | pass | pass | ✅ (regenerated) |
+| `unsafe` sites in the crate | grep | 10 | **1** | 1 | ✅ |
+| Direct dependencies | `Cargo.toml` | 13 | **15** (−`opencv`, +`image`, +`nokhwa`, +`mp4io`, +`rusty_h264-decoder`) | — | ✅ |
+
+**The one honest regression:** the hand-written bilinear sampler is not as fast as
+OpenCV's vectorised `resize` on the 224×224 crop. It costs ~160 µs more per frame, which
+is 0.5 % of the 33 ms budget and is invisible in the end-to-end numbers. Reaching
+OpenCV's throughput would need a SIMD/row-sum rewrite; the plan deliberately accepts the
+scalar loop for clarity and testability.
+
+`nokhwa` was chosen over `cameras` (§4.3) because it is the more established crate and
+`camera-sync-impl` gives the opt-in `unsafe impl Send for Camera` the capture thread
+needs. It worked on this camera on the first try (30 fps at 640×480, no duplicate
+frames), so `nokhwa#247` did not bite.
+
+For the fixture the plan's `yscv-video` was **not** used: `mp4io` + `rusty_h264-decoder`
+decoded the clip bit-exactly against ffmpeg, is `#![forbid(unsafe_code)]`, and runs at
+~0.5 ms per 640×480 frame. `ffmpeg-next` was rejected outright because it reintroduces a
+C toolchain.
 
 ---
 

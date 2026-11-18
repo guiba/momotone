@@ -13,24 +13,27 @@ the numbers below are from the current tree.
 | Frame loop (pose model) | **21 fps**, 41 ms/frame — capture 29 ms, inference 69 ms, 13 of 73 dropped | same with `--model yolo --score-threshold 0.3` |
 | Camera read | ~31 ms; the loop is paced by the driver, not by inference | end-of-run `INFO` summary |
 | Detector stage (192×192, hand absent) | 9.5 ms | `--debug` |
-| Detector input sampling (192×192) | 133 µs (reused buffer) vs 247 µs legacy | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
-| Landmarker input sampling (224×224) | 94 µs vs 367 µs legacy | same bench |
+| Detector input sampling (192×192) | **146 µs** (reused buffer), 162 µs fresh — hand-written bilinear, slightly slower than OpenCV's vectorised `resize` (133 µs) | `cargo test --release -- --include-ignored bench_sampling --nocapture` |
+| Landmarker input sampling (224×224) | **254 µs** vs 278 µs fresh | same bench |
 | RGBA conversion (`frame_to_rgba`) | 0.30 ms/frame — only when the feed is on *and* due | presenter benches |
 | Mirroring | **0.018 ms/frame**, no allocation after the first frame | `cargo test --release -- --include-ignored bench_mirror_flip` |
 | Mock-mode clock | **33 ms/frame** — a deadline clock, not a flat sleep | `--mode mock --no-ui --max-frames 120 --debug` |
 | rustc warnings | 0 (only the third-party `block v0.1.6` future-incompat notice) | `cargo build` |
+| `unsafe` in the crate | 1 — `unsafe impl Send for StreamWrapper` in `audio/synthesizer.rs` | `cargo` + review |
+| Cold `cargo check` | **34 s** (was 19 m 12 s with OpenCV) | `cargo clean && cargo check --all-targets` |
 | clippy lints | 0 — `make clippy` is `-D warnings` and part of `make verify` | `make verify` |
 | Dead code | 1 flag, `Visualizer::draw_skeleton`, which *is* used by `--image` — a call-graph false positive | `aft_inspect` |
 
 ## Codebase census (this sweep)
 
-- **35 source files, 10,953 lines.** `pipeline.rs` (2,050, of which 1,150 is its test module) and
-  `dashboard/skeleton.rs` (909) are the two big ones; the iced layer is 1,955 lines.
-- **151 tests pass, 6 benches are `#[ignore]`d.** Coverage now spans the strategies, the estimator,
-  the detection gate, the resampling helper and the ROI window, both pose-output layouts, the
-  geometry helpers, the mock hand, the release and pause paths, the MIDI note gate, the trail
-  decay, the synthesizer voice lifecycle, the presenter cadence, the keyboard band/cell geometry,
-  the trace differ and the video pacing.
+- **37 source files, 12,178 lines.** `pipeline.rs` and `dashboard/skeleton.rs` are the two
+  big ones; the iced layer is ~1,950 lines.
+- **181 tests pass, 7 benches are `#[ignore]`d.** Coverage now spans the strategies, the
+  estimator, the detection gate, the affine sampler, the ROI window, both pose-output
+  layouts, the geometry helpers, the mock hand, the release and pause paths, the MIDI note
+  gate, the trail decay, the synthesizer voice lifecycle, the presenter cadence, the
+  keyboard band/cell geometry, the trace differ, the video pacing and B-frame reordering,
+  the `Frame` invariants, the ASCII ramps and the pure-Rust skeleton overlay.
 - **Still zero tests** in `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs`. The keyboard
   geometry (T4.5) proved the pattern — split the arithmetic from the widget and it becomes testable;
   `gauges.rs` and `metrics.rs` are next.

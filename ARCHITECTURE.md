@@ -72,7 +72,7 @@ main.rs (449 lines, 36 flags)
 | Thread | Owns | Blocking work on the hot path? |
 | :-- | :-- | :-- |
 | Capture | `WebcamSource` | camera read only — good |
-| Pipeline | tracker, strategy, `FrameMetrics`, ASCII layer, event bus, **file writes** (`--ascii-dump`) | yes: RGBA conversion, ASCII resize, `std::fs::write` |
+| Pipeline | tracker, strategy, `FrameMetrics`, ASCII layer, event bus, **file writes** (`--ascii-dump`) | yes: RGBA conversion, ASCII downsample, `std::fs::write` |
 | Sinks | `Vec<Box<dyn Sink>>`, event receiver | MIDI write (fine), cpal state lock (fine) |
 | UI | `FrameMetrics` clone, image handle, trail | GPU texture upload (documented, throttled) |
 | Audio callback (cpal-owned) | `Voice` array | **mutex lock per block** |
