@@ -402,6 +402,13 @@ fn keyboard_grid(frame: &mut Frame, keyboard: &Keyboard, layout: &GridLayout) {
     }
 }
 
+/// A note's current brightness. The trail carries one level per playable note, so
+/// the index is always `note - NOTE_LOW`; the `get` covers the snapshot the window
+/// sees before the frame loop has published a trail at all.
+fn trail_level(trail: &[f32], note: u8) -> f32 {
+    trail.get(note_index(note)).copied().unwrap_or(0.0)
+}
+
 /// The part that changes every frame: the fading trail and the cell being played.
 /// `trail[note - NOTE_LOW]` is that note's current brightness (already faded).
 fn keyboard_trail(
@@ -414,7 +421,7 @@ fn keyboard_trail(
 ) {
     // 1. The trail: cells you have just played, glowing and fading out.
     for (index, &note) in layout.notes.iter().enumerate() {
-        let level = trail[note_index(note)];
+        let level = trail_level(trail, note);
         if level < TRAIL_EPS {
             continue;
         }
@@ -754,6 +761,7 @@ impl<Message> Program<Message> for Skeleton {
 mod tests {
     use super::*;
     use crate::core::NOTE_COUNT;
+    use crate::core::NOTE_HIGH;
     use crate::gesture::band_position;
 
     fn grid(cols: usize, rows: usize) -> AsciiGrid {
@@ -923,5 +931,20 @@ mod tests {
         // 440 Hz is A4, pitch class A.
         assert_eq!(backdrop_colour(&trail, None, Some(440.0)), PITCH_COLORS[9]);
         assert_eq!(backdrop_colour(&trail, None, None), MUTED);
+    }
+
+    #[test]
+    fn a_trail_that_has_not_been_published_yet_reads_as_silent() {
+        // The window ticks and draws before the frame loop has produced a snapshot;
+        // every cell of the grid still needs a level to read.
+        assert_eq!(trail_level(&[], 72), 0.0);
+        assert_eq!(
+            trail_level(&[], 0),
+            0.0,
+            "a note below the range clamps, never panics"
+        );
+        assert_eq!(trail_level(&[], NOTE_HIGH + 1), 0.0);
+        let full = vec![0.0; NOTE_COUNT];
+        assert_eq!(trail_level(&full, 72), 0.0);
     }
 }
