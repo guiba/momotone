@@ -384,18 +384,23 @@ C toolchain.
 
 ---
 
-## 10. Open questions for review
+## 10. Open questions for review — and how they were answered
 
 1. **Capture:** `nokhwa` (proven, legacy `objc`) or `cameras` (modern `objc2`, younger)?
-   Phase 0 benchmarks both on this camera.
+   **`nokhwa`.** Phase 0 opened this camera at 640×480/30 fps with zero duplicate frames,
+   and its `camera-sync-impl` feature gives the opt-in `unsafe impl Send for Camera` the
+   capture thread needs. `cameras` is cleaner but younger and unproven here.
 2. **Fixture decode:** pure-Rust `yscv-video`, `ffmpeg-next` (mature but reintroduces a C
    toolchain), or change `--video` to accept an image sequence and drop MP4 entirely?
-   The third option has the lowest risk and the most honest telemetry for `capture_ms`.
-3. **Is `--image` / `--dump-frame` worth keeping?** If the offline skeleton dump is rarely
-   used, deleting `annotator.rs` outright is simpler than reimplementing line/circle
-   drawing — the iced canvas already draws the exact same skeleton.
-4. **Do we go all the way in one PR, or land Phases 1–4 first?** OpenCV-for-capture-only
-   is a stable halfway state. Recommend two PRs: `chore/rgb-frame` (Phases 1–4), then
-   `chore/opencv-removal` (Phases 5–7).
+   **Neither of the three.** `mp4io` + `rusty_h264-decoder` decode the clip bit-exactly,
+   both are `#![forbid(unsafe_code)]`, and `--video` keeps accepting real MP4 files. ffmpeg
+   stayed in the Makefile as a *fixture generator*, never a runtime dependency.
+   One consequence worth knowing: the decoder is 4:2:0-only, so `make record` re-encodes to
+   `yuv420p`.
+3. **Is `--image` / `--dump-frame` worth keeping?** **Yes** - `annotator.rs` was
+   reimplemented in Rust (Bresenham + filled discs) rather than deleted.
+4. **Do we go all the way in one PR, or land Phases 1–4 first?** **One PR.** The `Frame`
+   type made the phases interdependent enough that a halfway OpenCV state would have been
+   more confusing than the clean break.
 5. **Do we also fix ROADMAP finding 9** (capture at 320×240) in the same branch, since
    Phase 5 touches the capture configuration anyway?
