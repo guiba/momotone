@@ -27,8 +27,11 @@ in parentheses are the branches each phase was developed on.
 - `build.rs` links clang's compiler-rt on Apple targets: fat LTO drops
   `___isPlatformVersionAtLeast` from `std`, which ONNX Runtime's CoreML object references
   (rustc issue #164915). Without it `cargo build --release` fails to link on macOS.
-- `fixtures/hand_clip.mp4` is re-encoded to `yuv420p` (the Rust decoder is 4:2:0-only), so
-  the golden trace `fixtures/clip_trace.json` was regenerated against it.
+- ~~`fixtures/hand_clip.mp4`~~ and `fixtures/clip_trace.json` are **not committed**: the clip is
+  a recording of a real hand, so `make record` generates it locally and `make trace` regenerates
+  the golden trace against it. `make fixture|trace-check|trace` say so when either is missing.
+- `--video` decodes the clip with `mp4io` + `rusty_h264-decoder` (both `#![forbid(unsafe_code)]`).
+  `rusty_h264-decoder` is 4:2:0-only, hence the `-pix_fmt yuv420p` in `make record`.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

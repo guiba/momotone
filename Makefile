@@ -28,12 +28,14 @@ CAMERA     ?= 0
 COLS       ?= 70
 CLIP       ?= fixtures/hand_clip.mp4
 TRACE      ?= fixtures/clip_trace.json
+MOCK_TRACE ?= fixtures/mock_trace.json
 CLIP_FRAMES ?= 120
 
 .DEFAULT_GOAL := help
 
 .PHONY: help verify lint check clippy clippy-fix fmt fmt-check test bench build run \
         run-release mock ascii headless budget yolo image fixture trace-check record trace \
+        mock-trace mock-trace-check \
         stats clean
 
 ## The gate: run this before every commit.
@@ -50,6 +52,7 @@ help:
 	@echo "  builds   build | check"
 	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
 	@echo "  fixture  fixture | trace-check | record | trace"
+	@echo "  mock     mock-trace | mock-trace-check"
 	@echo "  misc     stats | budget | clean"
 
 fmt:
@@ -117,24 +120,40 @@ image:
 ## --- fixture runs ---------------------------------------------------------
 
 ## Record a 20 s webcam clip into fixtures/hand_clip.mp4. Needs ffmpeg and a
-## free camera; run once, then use `make trace-check` from then on.
-## `-pix_fmt yuv420p` is not cosmetic: the pure-Rust decoder in src/vision/video.rs
-## only handles 4:2:0, and AVFoundation defaults to a 4:2:2 stream.
+## free camera; run once, then use `make trace-check` from then on. The clip is
+## not in the repo - it is a recording of a real hand, so every machine uses its
+## own. `-pix_fmt yuv420p` is not cosmetic: the pure-Rust decoder in
+## src/vision/video.rs only handles 4:2:0, and AVFoundation defaults to 4:2:2.
 record:
+	mkdir -p fixtures
 	ffmpeg -y -f avfoundation -framerate 30 -video_size 640x480 -i "0:none" -t 20 -pix_fmt yuv420p $(CLIP)
 
 ## Run the recorded clip headlessly with per-stage timing.
 fixture:
+	@test -f $(CLIP) || { echo "no $(CLIP) - run \`make record\` first"; exit 1; }
 	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --debug
 
 ## Re-run the clip and compare against the golden trace.
 trace-check:
+	@test -f $(CLIP) || { echo "no $(CLIP) - run \`make record\` first"; exit 1; }
+	@test -f $(TRACE) || { echo "no $(TRACE) - run \`make trace\` first"; exit 1; }
 	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --expect $(TRACE)
 
 ## Rewrite the golden trace from the current build. Only after an intentional
 ## change, and read the diff it produces first.
 trace:
+	@test -f $(CLIP) || { echo "no $(CLIP) - run \`make record\` first"; exit 1; }
 	$(CARGO) run --release -- --no-ui --video $(CLIP) --max-frames $(CLIP_FRAMES) --trace $(TRACE)
+
+## --- mock trace -----------------------------------------------------------
+
+## The mock hand is driven by the frame index, so a mock run is reproducible on
+## any machine with no camera and no ONNX assets. This is the trace CI checks.
+mock-trace:
+	$(CARGO) run --release -- --mode mock --no-ui --max-frames $(CLIP_FRAMES) --trace $(MOCK_TRACE)
+
+mock-trace-check:
+	$(CARGO) run --release -- --mode mock --no-ui --max-frames $(CLIP_FRAMES) --expect $(MOCK_TRACE)
 
 ## --- misc ---------------------------------------------------------------
 

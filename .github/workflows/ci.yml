@@ -46,3 +46,10 @@ jobs:
       # End-to-end smoke test with no camera and no model assets.
       - name: Smoke test
         run: cargo run -- --mode mock --no-ui --max-frames 30 --debug
+
+      # Regression gate on the gesture mapping. The mock hand is driven by the frame
+      # index, so this trace is reproducible on any machine - no webcam, no ONNX
+      # files, no Linux/macOS difference. It covers the detection gate, the estimator,
+      # the grid strategy and the release path.
+      - name: Golden trace (mock)
+        run: cargo run -- --mode mock --no-ui --max-frames 120 --expect fixtures/mock_trace.json

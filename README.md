@@ -89,7 +89,9 @@ louder. `Ctrl+C` stops.
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ```bash
-make fixture       # 300 frames of fixtures/hand_clip.mp4, headless
+make record        # record a 20 s webcam clip into fixtures/hand_clip.mp4 (needs ffmpeg)
+make fixture       # 120 frames of that local clip, headless
+make trace-check   # compare its note/volume trace against fixtures/clip_trace.json
 make trace-check   # fails if the note/volume trace drifts from the golden trace
 ```
 
