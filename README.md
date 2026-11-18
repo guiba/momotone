@@ -85,17 +85,20 @@ louder. `Ctrl+C` stops.
 
 ## Tests
 
-`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (168 tests),
+`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (181 tests),
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ```bash
-make record        # record a 20 s webcam clip into fixtures/hand_clip.mp4 (needs ffmpeg)
-make fixture       # 120 frames of that local clip, headless
-make trace-check   # compare its note/volume trace against fixtures/clip_trace.json
-make trace-check   # fails if the note/volume trace drifts from the golden trace
+make record           # record a 20 s webcam clip into fixtures/hand_clip.mp4 (needs ffmpeg)
+make fixture          # 120 frames of that local clip, headless
+make trace-check      # fails if the clip's note/volume trace drifts
+make trace            # rewrite fixtures/clip_trace.json from the current build
+make mock-trace-check # CI's gate: deterministic mock run, no camera, no models
 ```
 
-CI runs the same thing on every push to `master` and every pull request.
+The clip and its trace are not in the repo - they are recordings of a real hand. The mock
+trace is committed because mock mode is driven by the frame index, so it reproduces on any
+machine; that is what CI actually checks.
 
 ## Layout
 

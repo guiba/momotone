@@ -152,6 +152,7 @@ make record           # 20 s from the webcam into fixtures/hand_clip.mp4 (ffmpeg
 make fixture          # 120 frames of that clip, headless
 make trace-check      # exits non-zero if the note/volume trace drifts
 make trace            # rewrite fixtures/clip_trace.json from the current behaviour
+make mock-trace-check # CI's gate: deterministic mock run, no camera, no models
 ```
 
 `fixtures/` is gitignored: the clip is a recording of a real hand and is generated locally,
