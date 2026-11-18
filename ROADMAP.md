@@ -61,7 +61,7 @@ the numbers below are from the current tree.
 
 1. ~~MIDI note-on/off discipline~~ (finding 2) + **retrigger on cell change** — one attack per cell transition, with a `--min-note-ms` floor so a fast sweep becomes an arpeggio rather than a blur. **done for MIDI; the audio sink glides by design** (see finding 3).
 2. ~~Mock-mode deadline clock~~ (finding 1) **done**.
-3. ~~Tracker fixture tests~~ **done** — `tracker_finds_the_hand_in_the_clip` runs the real ONNX graphs over `fixtures/hand_clip.mp4` (106/120 detections, all 21 landmarks).
+3. ~~Tracker fixture tests~~ **done** — `tracker_finds_the_hand_in_the_clip` runs the real ONNX graphs over the locally recorded `fixtures/hand_clip.mp4` (106/120 detections, all 21 landmarks). `#[ignore]`d: it needs the clip and the gitignored model assets.
 4. ~~CI~~ (finding 11) **done** — `make verify`.
 5. ~~Audio: band-limited waveforms + ADSR + portamento~~ (finding 3) **done**.
 6. ~~Detector hysteresis~~ (finding 8) **done**.
@@ -133,7 +133,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 ### Input & evaluation
 - ~~`--video <file>` playback source~~ **done** — `VideoSource` reads a clip paced at its own frame rate, so a run is reproducible and `make trace-check` can diff it against a golden trace.
-- ~~Benchmark harness~~ **done** — `fixtures/hand_clip.mp4` + `bench/baseline.md` + `make fixture`/`make stats`.
+- ~~Benchmark harness~~ **done** — `bench/baseline.md` + `make fixture`/`make stats`. The clip itself is no longer in the repo (it is a recording of a real hand); `make record` produces it and `make mock-trace-check` is the committed, machine-independent gate.
 - **`--calibrate`** — sample the user's comfortable hand range and store per-user min/max, replacing the fixed `NOTE_MARGIN`. **M**
 - ~~Stage latency percentiles~~ (finding 12) **done** — p50/p95/p99/max per stage on the Performance card.
 
