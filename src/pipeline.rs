@@ -687,7 +687,7 @@ impl Pipeline {
         self.metrics.hand.tip_x = 0.0;
         self.metrics.hand.tip_y = 0.0;
         self.trail.clear();
-        self.metrics.sound.trail.clear();
+        self.sync_trail();
         // Keep the published picture state truthful while stopped too, so the header
         // buttons and the guard's decisions read the same way paused as running.
         let settings = self.settings();
@@ -862,9 +862,19 @@ impl Pipeline {
     /// the keyboard dark and a resumed run starts from a clean grid.
     fn update_trail(&mut self) {
         self.trail.advance(Instant::now(), self.metrics.sound.note);
-        // Reuse the snapshot's buffer instead of allocating 49 floats a frame.
-        self.metrics.sound.trail.clear();
-        self.metrics.sound.trail.extend(self.trail.levels());
+        self.sync_trail();
+    }
+
+    /// Mirror the trail into the snapshot, copying into the existing buffer so the
+    /// frame loop does not allocate 49 floats a frame. The length is always one level
+    /// per playable note: the stage draws a cell for every note of the layout, so an
+    /// empty or short buffer makes a draw index past the end.
+    fn sync_trail(&mut self) {
+        let levels = self.trail.levels();
+        if self.metrics.sound.trail.len() != levels.len() {
+            self.metrics.sound.trail.resize(levels.len(), 0.0);
+        }
+        self.metrics.sound.trail.copy_from_slice(levels);
         self.metrics.sound.fade_ms = self.trail.fade_ms();
     }
 
@@ -1044,6 +1054,7 @@ mod tests {
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
     use crate::core::telemetry::{Latency, StageProfile, FRAME_BUDGET_MS};
+    use crate::core::NOTE_COUNT;
     use crate::dashboard::metrics::{note_index, StatusView, DEFAULT_FADE_MS};
     use crate::gesture::keyboard::FingerPositionStrategy;
     use crate::presentation::ascii::{DEFAULT_ASCII_FPS, DEFAULT_COLS};
@@ -1496,6 +1507,11 @@ mod tests {
         assert_eq!(pipeline.metrics.sound.fade_ms, DEFAULT_FADE_MS);
 
         pipeline.pause();
+        assert_eq!(
+            pipeline.metrics.sound.trail.len(),
+            NOTE_COUNT,
+            "a stopped player publishes a level per note, not an empty buffer"
+        );
         assert!(
             pipeline
                 .metrics

@@ -39,6 +39,13 @@ in parentheses are the branches each phase was developed on.
 - `src/midi/mod.rs` maps `midir::ConnectError` to a message before the `?`. On the ALSA backend
   that error carries a raw pointer, so it is not `Sync` and cannot become an `anyhow::Error`;
   the CI build failed with E0277 while macOS built fine.
+- **Fix: the stage no longer panics before the first frame is published.** The keyboard glow is
+  a per-note buffer, but `main` seeded the snapshot with an empty one and `Pipeline::pause`
+  cleared it, while the layout the stage draws is always full. Whichever side won the race -
+  a UI tick landing before the frame loop's first publish, or a Stop press - the first draw
+  indexed past the end of the trail (`index out of bounds: the len is 0 but the index is 36`).
+  `SoundView::default()` now carries one level per note, `pause` zeroes the buffer instead of
+  emptying it, and `keyboard_trail` reads levels through a clamped getter.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

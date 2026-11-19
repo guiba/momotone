@@ -151,7 +151,7 @@ pub struct HandView {
 }
 
 /// What is sounding, including the keyboard glow. Owned by the frame loop.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SoundView {
     pub note: Option<u8>,
     pub volume: f32,
@@ -167,6 +167,25 @@ pub struct SoundView {
     pub trail: Vec<f32>,
     /// The trail's decay time constant, in milliseconds, for the header readout.
     pub fade_ms: f32,
+}
+
+impl Default for SoundView {
+    fn default() -> Self {
+        SoundView {
+            note: None,
+            volume: 0.0,
+            frequency: None,
+            proximity: 0.0,
+            proximity_ratio: 0.0,
+            approach: 0.0,
+            // One level per playable note, always. The stage draws a cell for every
+            // note in the layout, and the window can tick before the frame loop has
+            // published a single frame - a shorter buffer would make the first draw
+            // index past the end.
+            trail: vec![0.0; NOTE_COUNT],
+            fade_ms: DEFAULT_FADE_MS,
+        }
+    }
 }
 
 /// How fast the run is going: instantaneous numbers plus the tail of each stage,
@@ -271,6 +290,16 @@ mod tests {
         // Out-of-range notes are clamped rather than panicking.
         assert_eq!(note_index(0), 0);
         assert_eq!(note_index(200), 48);
+    }
+
+    #[test]
+    fn a_default_snapshot_has_a_level_for_every_note() {
+        // The stage draws one cell per note of the layout, and it can be drawn before
+        // the frame loop has published anything; an empty trail used to panic there.
+        let sound = SoundView::default();
+        assert_eq!(sound.trail.len(), NOTE_COUNT);
+        assert!(sound.trail.iter().all(|&level| level == 0.0));
+        assert_eq!(sound.fade_ms, DEFAULT_FADE_MS);
     }
 
     #[test]
