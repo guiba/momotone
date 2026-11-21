@@ -76,6 +76,7 @@ louder. `Ctrl+C` stops.
 | `--volume proximity\|pinch\|blend` | what decides loudness (default: proximity) |
 | `--scale`, `--root`, `--octaves` | keyboard layout, e.g. `--scale minor pentatonic --root A` |
 | `--waveform sine\|triangle\|square\|saw` | synthesiser timbre |
+| `--effects lowpass,vibrato,delay` | which stages are in the sound chain (default: `lowpass`; `none` for a bare note) |
 | `--model mediapipe\|yolo` | which ONNX backend |
 | `--camera 1`, `--camera-width 1280` | pick the webcam and capture size |
 | `--debug` | DEBUG logging, per-frame timings |
@@ -87,7 +88,7 @@ iced's window/compositor dumps, which are silenced by default).
 
 ## Tests
 
-`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (181 tests),
+`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (208 tests),
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ```bash

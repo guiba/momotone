@@ -1,4 +1,5 @@
 pub mod detection_gate;
+pub mod effects;
 pub mod event_bus;
 pub mod frame;
 pub mod geometry;
@@ -10,6 +11,7 @@ pub mod telemetry;
 pub mod trace;
 pub mod types;
 
+use crate::core::effects::Modulation;
 use crate::core::instrument::Waveform;
 use crate::core::types::Performance;
 use anyhow::Result;
@@ -67,4 +69,7 @@ pub trait Sink: Send {
     /// express it (MIDI, which hands the timbre to the receiving device) ignore
     /// it, so a default no-op keeps every sink trivially conformant.
     fn set_waveform(&mut self, _waveform: Waveform) {}
+    /// The parameters of the effect chain: filter cutoff, vibrato, delay. Same
+    /// contract as `set_waveform` - a sink with nothing to modulate does nothing.
+    fn set_modulation(&mut self, _modulation: &Modulation) {}
 }

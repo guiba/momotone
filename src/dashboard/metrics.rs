@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::core::effects::Modulation;
 use crate::core::geometry::HandGeometry;
 use crate::core::grid::GridLayout;
 use crate::core::telemetry::StageProfile;
@@ -167,6 +168,9 @@ pub struct SoundView {
     pub trail: Vec<f32>,
     /// The trail's decay time constant, in milliseconds, for the header readout.
     pub fade_ms: f32,
+    /// The effect chain as the frame loop last computed it, so the rail shows what
+    /// the sound is actually doing rather than what the toggles were clicked.
+    pub modulation: Modulation,
 }
 
 impl Default for SoundView {
@@ -184,6 +188,7 @@ impl Default for SoundView {
             // index past the end.
             trail: vec![0.0; NOTE_COUNT],
             fade_ms: DEFAULT_FADE_MS,
+            modulation: Modulation::neutral(),
         }
     }
 }

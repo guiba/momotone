@@ -23,11 +23,12 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, canvas, column, container, pick_list, row, rule, space, text, Column, Scrollable,
+    button, canvas, column, container, pick_list, row, rule, space, text, Column, Row, Scrollable,
 };
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
+use crate::core::effects::{Effect, CUTOFF_MAX_HZ, CUTOFF_MIN_HZ, DELAY_MAX_MS, VIBRATO_MAX_CENTS};
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, VolumeModel, Waveform};
 use crate::core::runtime::UiCommand;
@@ -74,6 +75,7 @@ enum Message {
     PickOctaves(usize),
     PickWaveform(Waveform),
     PickVolume(String),
+    ToggleEffect(String),
 }
 
 pub struct Dashboard {
@@ -204,6 +206,16 @@ impl Dashboard {
                     let _ = self.control.send(UiCommand::SetVolume(model));
                 }
             }
+            // The chain's parameters are continuous, so switching a stage on or off
+            // joins a note that is already sounding rather than waiting for the next
+            // attack. The state shown here is the pipeline's, not a local copy: the
+            // budget guard and the frame loop are the ones that decide.
+            Message::ToggleEffect(name) => {
+                if let Some(effect) = Effect::parse(&name) {
+                    let on = !self.metrics.sound.modulation.enabled.is_on(effect);
+                    let _ = self.control.send(UiCommand::SetEffect(effect, on));
+                }
+            }
         }
     }
 
@@ -328,6 +340,7 @@ impl Dashboard {
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
                 loudness_card(&self.metrics),
+                effects_card(&self.metrics),
                 render_card(self.ramp, ascii),
                 meter_card("Volume", self.metrics.sound.volume, VOLUME),
                 meter_card("Confidence", self.metrics.hand.confidence, CONFIDENCE),
@@ -401,6 +414,109 @@ fn small_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
             text_color: TEXT,
             border: Border {
                 color: CARD_BORDER,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        })
+        .into()
+}
+
+/// The effect chain, as the frame loop last computed it: which stages are in, and
+/// how far the hand has taken each one. The parameters keep tracking the hand even
+/// when a stage is switched off - the mask decides what the voice runs, not what is
+/// measured - so the bars show what the stage *would* do, and the label says whether
+/// it is in the chain at all.
+fn effects_card(metrics: &FrameMetrics) -> Element<'_, Message> {
+    let modulation = metrics.sound.modulation;
+    let bar = |value: f32, low: f32, high: f32| (value - low) / (high - low);
+    let buttons = Effect::all()
+        .into_iter()
+        .map(|effect| {
+            effect_button(
+                effect.name(),
+                modulation.enabled.is_on(effect),
+                Message::ToggleEffect(effect.name().to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    card(
+        "EFFECTS",
+        column![
+            Row::with_children(buttons).spacing(6),
+            canvas(Meter {
+                value: bar(modulation.cutoff_hz, CUTOFF_MIN_HZ, CUTOFF_MAX_HZ),
+                color: PROXIMITY,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "tone",
+                format!(
+                    "{:.0} Hz {}",
+                    modulation.cutoff_hz,
+                    if modulation.enabled.is_on(Effect::Lowpass) {
+                        ""
+                    } else {
+                        "(off)"
+                    }
+                ),
+            ),
+            canvas(Meter {
+                value: modulation.vibrato_cents / VIBRATO_MAX_CENTS,
+                color: NOTE,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "vibrato",
+                format!(
+                    "{:.0} cents @ {:.1} Hz{}",
+                    modulation.vibrato_cents,
+                    modulation.vibrato_hz,
+                    if modulation.enabled.is_on(Effect::Vibrato) {
+                        ""
+                    } else {
+                        " (off)"
+                    }
+                ),
+            ),
+            canvas(Meter {
+                value: modulation.delay_ms / DELAY_MAX_MS,
+                color: CONFIDENCE,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "delay",
+                format!(
+                    "{:.0} ms · feedback {:.2}{}",
+                    modulation.delay_ms,
+                    modulation.feedback,
+                    if modulation.enabled.is_on(Effect::Delay) {
+                        ""
+                    } else {
+                        " (off)"
+                    }
+                ),
+            ),
+        ]
+        .spacing(6),
+    )
+}
+
+/// Effect toggles: lit when the stage is in the chain, dimmed when it is not.
+fn effect_button<'a>(label: &'a str, on: bool, message: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .on_press(message)
+        .padding(8)
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(if on { VOLUME } else { CARD })),
+            text_color: if on { TEXT } else { MUTED },
+            border: Border {
+                color: if on { VOLUME } else { CARD_BORDER },
                 width: 1.0,
                 radius: 8.0.into(),
             },

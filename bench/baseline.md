@@ -379,3 +379,26 @@ make mock-trace-check    # CI's gate
 Tests: **181 passing** (7 ignored), `make verify` green, `unsafe` down to the single
 documented `unsafe impl Send for StreamWrapper` (four raw-pointer reads in the tracker's
 tensor sampling went away with OpenCV).
+
+## The effect chain costs nanoseconds, not milliseconds
+
+The chain (one-pole lowpass, LFO vibrato, comb delay) runs inside the cpal callback, so the
+number that matters is cost per audio sample, not per frame. Measured on the same machine,
+`cargo test --release -- --include-ignored bench_chain_cost --nocapture` (1 M samples at
+44.1 kHz):
+
+| Voice | ns/sample | Cost over one 33 ms frame |
+| :-- | :-- | :-- |
+| Sine, no chain | 5.7 | 0.19 ms |
+| Sine, all three stages | 12.8 | 0.42 ms |
+| Square, no chain | 31.6 | 1.04 ms |
+| Square, all three stages | 36.9 | 1.22 ms |
+
+The chain adds ~7 ns per sample, i.e. ~0.2 ms per frame - 0.6 % of the 33 ms budget, and it
+does not touch inference at all (the parameters are computed once per frame on the pipeline
+thread and read once per audio block). The timbre is an order of magnitude more expensive
+than the filtering: a band-limited square is 5x the cost of a sine before any effect is
+switched on.
+
+The delay ring is `DELAY_MAX_MS` (600 ms) long, allocated once in `Voice::idle` when the
+stream opens: ~106 KB at 44.1 kHz, never reallocated by the callback.

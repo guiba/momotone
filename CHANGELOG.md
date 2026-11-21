@@ -5,6 +5,19 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
+- **An effect chain, driven by the hand.** `src/core/effects.rs` declares the stages
+  (`lowpass`, `vibrato`, `delay`) as source -> parameter -> curve, and the frame loop
+  smooths their parameters every frame and puts them on the bus as
+  `BusMessage::Modulation`, which sinks receive through `Sink::set_modulation` (a
+  default no-op, so the MIDI engine is unaffected for now). The synthesizer runs
+  `glide -> vibrato -> oscillator -> one-pole lowpass -> comb delay -> soft clip`; the
+  delay line is allocated once when the stream opens, and the audio callback still takes
+  no lock and allocates nothing. `--effects lowpass,vibrato,delay|none` sets the chain
+  at launch and the dashboard's EFFECTS card toggles it live. When the hand leaves the
+  frame the chain fades to neutral over `--fade-ms` rather than switching off, and a
+  released note rings out through an echo that is already in the ring instead of being
+  cut off. Measured cost: ~7 ns per audio sample, ~0.2 ms of the 33 ms frame budget, and
+  it is not spent in the frame loop at all.
 - **OpenCV is gone.** `opencv` 0.102 was the project's only native dependency and it was
   doing three chores: grabbing pixels, cropping/resampling into the model input, and
   drawing the `--image` overlay. All three are now Rust:

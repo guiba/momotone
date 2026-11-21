@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::effects::{blend, is_different, modulation_from_hand, Modulation};
 use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::frame::Frame;
 use crate::core::instrument::InstrumentConfig;
@@ -29,7 +30,7 @@ use crate::dashboard::metrics::{
     cell_index, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView, SoundView,
     LOG_CAPACITY,
 };
-use crate::gesture::{HandEstimator, HandState, Strategy};
+use crate::gesture::{band_position, HandEstimator, HandState, Strategy};
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
 use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
 use crate::vision::camera::WebcamSource;
@@ -166,6 +167,11 @@ pub struct Pipeline {
     /// The keyboard glow. Derived from the gesture, not from the window, so the
     /// stage draws a fact about the run instead of maintaining its own history.
     trail: KeyboardTrail,
+    /// The effect chain's parameters, smoothed frame by frame. One writer (this
+    /// loop), one published value, so a sink never has to reconstruct the chain.
+    modulation: Modulation,
+    /// When the chain was last recomputed: the denominator of its fade.
+    last_modulation: Instant,
     metrics: FrameMetrics,
     /// The run recorded frame by frame, when the run was asked to record one or
     /// check itself against one.
@@ -319,6 +325,8 @@ impl Pipeline {
             estimator: HandEstimator::new(),
             gesture_active: false,
             trail: KeyboardTrail::new(fade_ms),
+            modulation: Modulation::neutral(),
+            last_modulation: now,
             trace: Trace::default(),
             trace_out,
             trace_expect,
@@ -349,6 +357,10 @@ impl Pipeline {
             let (model, near, far) = config.volume_settings();
             pipeline.estimator.set_volume(model, near, far);
             pipeline.metrics.status.volume_model = model.name().to_string();
+            // Which stages are in the chain is a runtime knob too, so the neutral
+            // levels start with the enabled mask the run was launched with.
+            pipeline.modulation = Modulation::neutral_with(config.effects);
+            pipeline.metrics.sound.modulation = pipeline.modulation;
         }
         // Seed the instrument so the strategy, the sinks and the published keyboard
         // agree from the very first frame.
@@ -441,6 +453,7 @@ impl Pipeline {
                         .set_volume(model, config.proximity_near, config.proximity_far);
                     self.metrics.status.volume_model = model.name().to_string();
                 }
+                UiCommand::SetEffect(effect, on) => config.effects.set(effect, on),
                 UiCommand::SetInstrument(_) => unreachable!("handled above"),
             }
         }
@@ -502,18 +515,22 @@ impl Pipeline {
                     return;
                 };
                 while let Ok(message) = rx.recv() {
-                    let queued = match message {
-                        BusMessage::Event(queued) => queued,
+                    match message {
+                        BusMessage::Event(queued) => {
+                            // How long the gesture waited in the queue before an output saw
+                            // it: part of the hand-to-sound budget that neither capture nor
+                            // inference accounts for.
+                            let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
+                            if let Ok(mut samples) = dispatch.lock() {
+                                samples.push(age_ms);
+                            }
+                            apply_to_sinks(&sinks, &queued.performance);
+                        }
+                        // Chain parameters are continuous state, not attacks, so they are
+                        // not timed and do not feed the latency sample.
+                        BusMessage::Modulation(modulation) => apply_modulation(&sinks, &modulation),
                         BusMessage::Shutdown => break,
-                    };
-                    // How long the gesture waited in the queue before an output saw
-                    // it: part of the hand-to-sound budget that neither capture nor
-                    // inference accounts for.
-                    let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
-                    if let Ok(mut samples) = dispatch.lock() {
-                        samples.push(age_ms);
                     }
-                    apply_to_sinks(&sinks, &queued.performance);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
                     for sink in sinks.iter_mut() {
@@ -681,6 +698,12 @@ impl Pipeline {
         self.metrics.sound.note = None;
         self.metrics.sound.volume = 0.0;
         self.metrics.sound.frequency = None;
+        // A stopped run is not just silent - the chain goes back to neutral so a
+        // resumed run starts from an unfiltered note rather than wherever the last
+        // hand left it.
+        self.modulation = Modulation::neutral();
+        self.metrics.sound.modulation = self.modulation;
+        self.event_bus.dispatch_modulation(self.modulation);
         self.metrics.hand.landmarks.clear();
         self.metrics.hand.landmark_count = 0;
         self.metrics.hand.hand_box = None;
@@ -764,6 +787,9 @@ impl Pipeline {
         // dashboard would then be lying.
         self.metrics.status.feed = settings.feed;
         self.metrics.status.ascii = settings.ascii;
+        // The chain is smoothed before the gesture is dispatched, so a note attacks
+        // with the filter and wobble already in place rather than catching up to them.
+        self.update_modulation(&state, &settings);
         self.update_tracking(&state);
         self.dispatch_gesture(&state);
         // The keyboard glow follows the gesture, on the frame loop's clock.
@@ -816,6 +842,41 @@ impl Pipeline {
         self.metrics.perf.dropped = self.counters.dropped.load(Ordering::Relaxed);
         self.metrics.perf.detector_us = detection.timings.detector_us;
         self.metrics.perf.landmarker_us = detection.timings.landmarker_us;
+    }
+
+    /// Smooth the effect chain towards what the hand is asking for, and put it on
+    /// the bus only when it actually moved.
+    ///
+    /// The smoothing is the point. A hand held still produces numbers that wobble by
+    /// a percent per frame; without a time constant the filter would shimmer. When no
+    /// hand is present the target is neutral, so the chain fades out over the same
+    /// `--fade-ms` the keyboard trail uses instead of clicking off.
+    fn update_modulation(&mut self, state: &HandState, settings: &RuntimeConfig) {
+        let target = if state.present {
+            // `band_position` is the same inset the keyboard is drawn with, so the
+            // hand's height and width mean the same thing here as they do on stage.
+            let (x, y) = band_position(state.tip.0, state.tip.1, state.frame_size);
+            modulation_from_hand(
+                settings.effects,
+                state.proximity,
+                1.0 - y, // higher in the frame = faster wobble
+                state.geometry.spread,
+                x,
+            )
+        } else {
+            Modulation::neutral_with(settings.effects)
+        };
+
+        let fade_seconds = self.trail.fade_ms().max(1.0) / 1000.0;
+        let alpha = self.last_modulation.elapsed().as_secs_f32() / fade_seconds;
+        let next = blend(self.modulation, target, alpha);
+
+        if is_different(&self.modulation, &next) {
+            self.event_bus.dispatch_modulation(next);
+        }
+        self.modulation = next;
+        self.metrics.sound.modulation = next;
+        self.last_modulation = Instant::now();
     }
 
     /// Where the hand is, copied out of the estimator into the snapshot the
@@ -942,7 +1003,7 @@ impl Pipeline {
                 _ => "silent".to_string(),
             };
             tracing::debug!(
-                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} proximity {:.2} ({:.3} palm/frame) approach {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
+                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} proximity {:.2} ({:.3} palm/frame) approach {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0} chain {} tone {:.0} Hz vibrato {:.0}c@{:.1} delay {:.0} ms fb {:.2}",
                 self.metrics.perf.fps,
                 self.metrics.perf.frame_ms,
                 self.metrics.perf.capture_ms,
@@ -959,6 +1020,12 @@ impl Pipeline {
                 self.metrics.hand.jitter_px,
                 self.metrics.hand.tip_x,
                 self.metrics.hand.tip_y,
+                self.metrics.sound.modulation.enabled.names(),
+                self.metrics.sound.modulation.cutoff_hz,
+                self.metrics.sound.modulation.vibrato_cents,
+                self.metrics.sound.modulation.vibrato_hz,
+                self.metrics.sound.modulation.delay_ms,
+                self.metrics.sound.modulation.feedback,
             );
         }
     }
@@ -1039,8 +1106,18 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
     while let Ok(message) = rx.try_recv() {
         match message {
             BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.performance),
+            BusMessage::Modulation(modulation) => apply_modulation(sinks, &modulation),
             BusMessage::Shutdown => break,
         }
+    }
+}
+
+fn apply_modulation(sinks: &SinkList, modulation: &Modulation) {
+    let Ok(mut sinks) = sinks.lock() else {
+        return;
+    };
+    for sink in sinks.iter_mut() {
+        sink.set_modulation(modulation);
     }
 }
 
@@ -1050,6 +1127,7 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::effects::{Effect, EffectMask, NEUTRAL_CUTOFF_HZ};
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
@@ -1067,6 +1145,9 @@ mod tests {
         /// Timbres the pipeline pushed into the sinks, in order. Without this the
         /// picker wiring is only audible, not testable.
         waveforms: Arc<Mutex<Vec<String>>>,
+        /// Chain parameters the pipeline pushed, in order. Same reason: the effect
+        /// wiring has to be observable, not just audible.
+        modulations: Arc<Mutex<Vec<Modulation>>>,
     }
 
     impl Sink for RecordingSink {
@@ -1085,6 +1166,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(waveform.name().to_string());
+        }
+        fn set_modulation(&mut self, modulation: &Modulation) {
+            self.modulations.lock().unwrap().push(*modulation);
         }
     }
 
@@ -1140,6 +1224,7 @@ mod tests {
         /// sending the same command the UI sends.
         control: Sender<UiCommand>,
         waveforms: Arc<Mutex<Vec<String>>>,
+        modulations: Arc<Mutex<Vec<Modulation>>>,
     }
 
     fn test_pipeline(strategy: Box<dyn Strategy>, max_frames: Option<u32>) -> TestHarness {
@@ -1169,6 +1254,7 @@ mod tests {
         let (control_tx, control_rx) = control_channel();
         let events = Arc::new(Mutex::new(Vec::new()));
         let waveforms = Arc::new(Mutex::new(Vec::new()));
+        let modulations = Arc::new(Mutex::new(Vec::new()));
         let pipeline = Pipeline::new(PipelineConfig {
             source: None,
             tracker: None,
@@ -1176,6 +1262,7 @@ mod tests {
             sinks: Arc::new(Mutex::new(vec![Box::new(RecordingSink {
                 events: events.clone(),
                 waveforms: waveforms.clone(),
+                modulations: modulations.clone(),
             })])),
             event_bus: bus,
             event_rx: Some(rx),
@@ -1198,6 +1285,7 @@ mod tests {
             events,
             control: control_tx,
             waveforms,
+            modulations,
         }
     }
 
@@ -1923,6 +2011,210 @@ mod tests {
         assert!(
             !shared.lock().unwrap().status.ascii,
             "the published state follows the pipeline, not the initial request"
+        );
+    }
+
+    /// A frame with no hand in it at all.
+    fn empty_frame() -> FrameOutcome {
+        FrameOutcome {
+            detection: HandDetectionResult::default(),
+            frame: None,
+            capture_ms: 0.0,
+            inference_ms: 0.0,
+            latency_ms: 0.0,
+        }
+    }
+
+    #[test]
+    /// The chain is driven by the hand, reaches the sinks, and decays when the hand
+    /// leaves rather than switching off. The sleeps are the frame interval: the fade
+    /// is a wall-clock time constant, so a test that advances frames as fast as the
+    /// CPU allows would never see it.
+    fn the_chain_follows_the_hand_and_fades_when_it_leaves() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness {
+            mut pipeline,
+            modulations,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+
+        for frame in 0..20 {
+            pipeline
+                .advance(synthetic_frame(frame as f64 * 0.033))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let driven = pipeline.modulation;
+        assert!(
+            driven.enabled.is_on(Effect::Lowpass),
+            "the run asked for the chain"
+        );
+        assert!(
+            driven.cutoff_hz < NEUTRAL_CUTOFF_HZ,
+            "a hand in view should have closed the filter from neutral, got {}",
+            driven.cutoff_hz
+        );
+        assert!(
+            driven.delay_ms > 0.0,
+            "the hand swept the delay away from zero"
+        );
+        assert!(
+            !modulations.lock().unwrap().is_empty(),
+            "the chain reached the sinks"
+        );
+
+        let before = pipeline.modulation;
+        for _ in 0..20 {
+            pipeline.advance(empty_frame()).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let after = pipeline.modulation;
+        assert!(
+            (after.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs()
+                < (before.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs() * 0.5,
+            "half a second without a hand should have faded most of the way to neutral: {} -> {}",
+            before.cutoff_hz,
+            after.cutoff_hz
+        );
+        assert!(
+            after.enabled == EffectMask::ALL,
+            "the hand left, but the chain the run asked for is still in"
+        );
+    }
+
+    #[test]
+    /// A chain that was never asked for is never sent: with every stage off there is
+    /// nothing continuous to deliver, and the sinks stay idle.
+    fn a_run_with_no_effects_sends_no_modulation() {
+        let TestHarness {
+            pipeline,
+            modulations,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), Some(5));
+        assert_eq!(pipeline.modulation.enabled, EffectMask::NONE);
+        assert!(
+            modulations.lock().unwrap().is_empty(),
+            "no chain, no traffic"
+        );
+    }
+
+    #[test]
+    /// Switching a stage off from the dashboard takes effect on the next frame, and
+    /// the parameter behind it is left alone rather than zeroed.
+    fn a_toggle_flips_the_chain_without_disturbing_the_levels() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness {
+            mut pipeline,
+            control,
+            modulations,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+
+        control
+            .send(UiCommand::SetEffect(Effect::Delay, false))
+            .unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        let after = pipeline.modulation;
+
+        assert!(
+            !after.enabled.is_on(Effect::Delay),
+            "the stage was switched off"
+        );
+        assert!(
+            after.enabled.is_on(Effect::Lowpass),
+            "the others are untouched"
+        );
+        assert!(
+            after.delay_ms > 0.0,
+            "a disabled stage keeps tracking the hand, so switching it back on does not start from zero"
+        );
+        assert!(
+            !modulations.lock().unwrap().is_empty(),
+            "the change was dispatched"
+        );
+    }
+
+    #[test]
+    /// Stopping the run silences the chain as well as the note, so a resumed run does
+    /// not start from whatever the last hand left behind.
+    fn pausing_neutralises_the_chain() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.pause();
+
+        assert_eq!(pipeline.modulation.enabled, EffectMask::NONE);
+        assert_eq!(pipeline.modulation.cutoff_hz, NEUTRAL_CUTOFF_HZ);
+        assert_eq!(
+            pipeline.metrics.sound.modulation.enabled,
+            EffectMask::NONE,
+            "the rail shows a silent chain"
+        );
+    }
+
+    #[test]
+    /// The dashboard shows the chain the frame loop computed, not the buttons someone
+    /// clicked, so the rail cannot drift from the sound.
+    fn the_published_chain_is_the_one_the_loop_computed() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::parse("lowpass,vibrato").expect("valid list");
+        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            shared.clone(),
+        );
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0)).unwrap();
+
+        let published = shared.lock().unwrap().sound.modulation;
+        assert_eq!(
+            published, pipeline.modulation,
+            "the snapshot mirrors the loop"
+        );
+        assert!(published.enabled.is_on(Effect::Vibrato));
+        assert!(
+            !published.enabled.is_on(Effect::Delay),
+            "delay was never asked for"
         );
     }
 

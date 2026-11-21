@@ -28,12 +28,13 @@ the numbers below are from the current tree.
 
 - **37 source files, 12,178 lines.** `pipeline.rs` and `dashboard/skeleton.rs` are the two
   big ones; the iced layer is ~1,950 lines.
-- **181 tests pass, 7 benches are `#[ignore]`d.** Coverage now spans the strategies, the
+- **208 tests pass, 9 benches are `#[ignore]`d.** Coverage now spans the strategies, the
   estimator, the detection gate, the affine sampler, the ROI window, both pose-output
   layouts, the geometry helpers, the mock hand, the release and pause paths, the MIDI note
-  gate, the trail decay, the synthesizer voice lifecycle, the presenter cadence, the
-  keyboard band/cell geometry, the trace differ, the video pacing and B-frame reordering,
-  the `Frame` invariants, the ASCII ramps and the pure-Rust skeleton overlay.
+  gate, the trail decay, the synthesizer voice lifecycle and the effect chain (filter,
+  comb delay, vibrato, the neutral fade), the presenter cadence, the keyboard band/cell
+  geometry, the trace differ, the video pacing and B-frame reordering, the `Frame`
+  invariants, the ASCII ramps and the pure-Rust skeleton overlay.
 - **Still zero tests** in `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs`. The keyboard
   geometry (T4.5) proved the pattern — split the arithmetic from the widget and it becomes testable;
   `gauges.rs` and `metrics.rs` are next.
@@ -123,7 +124,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - **Gesture chords** — combine several gestures into chord/scale selection. **M**
 - **Use `Landmark.z`** — depth is parsed but read by nothing; it is the cheapest way to distinguish "hand near the camera" from "hand far away" for volume. **M**
 - ~~Continuous/theremin strategy~~ **done** (finding 5) — `ThereminStrategy` emits the `Signal` payload the sinks already handled.
-- **Two hands** — NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs modulation). **L**
+- **Two hands** — NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs modulation). The design is worked out in `SECOND_HAND_PLAN.md`; the blocker is a two-hand fixture clip to measure whether the full-frame pass finds hands as reliably as the anchored crop. **L**
 
 ### Output sinks
 - **OSC sink** — implement `Sink` and push it into `sinks` in `main.rs`. **S**
@@ -156,6 +157,17 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 ## Recently done
 
+- **The effect chain** — `src/core/effects.rs` declares the stages (`lowpass`, `vibrato`,
+  `delay`) as source → parameter → curve; the frame loop smooths their parameters with the
+  `--fade-ms` time constant and sends them to the sinks on `BusMessage::Modulation`, which
+  a sink receives through the defaulted `Sink::set_modulation`. The synthesizer runs
+  `glide → vibrato → oscillator → one-pole lowpass → comb delay → soft clip`, the ring
+  buffer is allocated once when the stream opens, and the chain is read once per audio
+  block, not per sample. `--effects` sets it at launch, the EFFECTS card toggles it live,
+  and a hand that leaves the frame fades the chain to neutral instead of switching it off.
+  Cost: ~7 ns per sample (see `bench_chain_cost`). It is deliberately driven by the *one*
+  hand the tracker reports - the sources are the same palm-box signals the second hand will
+  drive later, which is why this lands before two-hand detection.
 - **Housekeeping sweep** — the theremin is real: `--gesture theremin` runs `ThereminStrategy`, which reads the index tip's x through the same `TipSmoother` EMA and maps it logarithmically onto C2..C6 (`--theremin-low-hz`/`--theremin-high-hz`), with thumb-index spread as amplitude. `GestureEvent::new_signal` came back because something finally produces it. Deleted the never-read `EventType` enum and its field, and `FrameMetrics.frame_id`. `--debug` now prints what is actually sounding (`note C4` or `803 Hz`) instead of `note Some(60)`. AGENTS.md's score threshold, dependency list and scaffolding claims are corrected.
 - ~~No rustfmt~~ **done** — the crate is `cargo fmt --check` clean. Worth knowing for the next session: `rustfmt src/main.rs` recurses through every `mod` in the crate, so formatting one file formats the whole tree.
 - **MIDI attack discipline** — `src/midi/mod.rs` now holds a `NoteGate` that owns the voice state. The strategy fires an event every frame (30×/s), so the sink used to send `0x90 note vel` each frame and any synth with a percussive envelope machine-gunned a held note. Now: the first event for a note attacks it, further events with the same note only move CC 7 when the volume actually changed, a cell change sends `note-off` on the old note before attacking the new one, and the pipeline's release event (or a pinched, zero-velocity hand) sends exactly one `note-off` — a second release sends nothing, so there is no orphan note-off. `--min-note-ms` (default 120 ms) is the floor: while the held note is younger than that, a new cell is ignored rather than chopping the note into 33 ms slivers, so a hand sliding across the keyboard sounds every fourth key instead of a blur. `--min-note-ms 0` restores attack-on-every-change. Nine tests in `midi/mod.rs` cover the attack, the CC, the floor, the sweep quantisation and the release; the gate returns the raw messages, so it is testable without a synth attached.

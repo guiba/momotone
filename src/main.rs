@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
+use crate::core::effects::EffectMask;
 use crate::core::event_bus::EventBus;
 use crate::core::frame::Frame;
 use crate::core::runtime::{control_channel, RuntimeConfig};
@@ -154,6 +155,12 @@ struct Args {
     /// The dashboard's RENDER card switches ramp at runtime.
     #[arg(long, default_value = "blocks")]
     ascii_ramp: String,
+
+    /// Which stages are in the effect chain: `lowpass`, `vibrato`, `delay`, or
+    /// `none`. The parameters they use are continuous, so a stage can join a note
+    /// that is already sounding; the dashboard's EFFECTS card flips them live.
+    #[arg(long, default_value = "lowpass")]
+    effects: String,
 
     /// Write each rendered ASCII frame to this file. Handy for checking the art
     /// headlessly, e.g. with `--mode mock --no-ui --ascii-dump art.txt`.
@@ -347,6 +354,19 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let effects = EffectMask::parse(&args.effects).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown effect '{}'; available: {}",
+            args.effects,
+            crate::core::effects::Effect::all()
+                .iter()
+                .map(|effect| effect.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    tracing::info!("effect chain: {}", effects.names());
+
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
         let mut tracker = build_tracker(&args).context("Failed to initialize hand tracker")?;
@@ -485,12 +505,13 @@ fn main() -> Result<()> {
         args.ascii,
         ascii_ramp,
     )));
-    // The loudness model and its band are runtime knobs, so they live in the same
-    // config the dashboard will change later.
+    // The loudness model, its band and the effect chain are runtime knobs, so they
+    // live in the same config the dashboard will change later.
     if let Ok(mut config) = control.lock() {
         config.volume = volume_model;
         config.proximity_near = args.proximity_near;
         config.proximity_far = args.proximity_far;
+        config.effects = effects;
     }
 
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {
