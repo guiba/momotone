@@ -49,6 +49,11 @@ in parentheses are the branches each phase was developed on.
   indexed past the end of the trail (`index out of bounds: the len is 0 but the index is 36`).
   `SoundView::default()` now carries one level per note, `pause` zeroes the buffer instead of
   emptying it, and `keyboard_trail` reads levels through a clamped getter.
+- **A quiet start.** `init_logging` caps `iced_winit`, `iced_wgpu` and `ort::logging` at WARN.
+  Opening the dashboard used to print a dozen lines of library internals - the window
+  attributes struct, the wgpu compositor settings, the adapter and format lists. A run
+  now starts with the seven lines that describe *this* run; ONNX Runtime's single CoreML
+  capability warning still shows, and `RUST_LOG=info,iced_winit=info` gets the detail back.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

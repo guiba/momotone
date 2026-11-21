@@ -288,12 +288,22 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
 /// tracker, the presenter and the pipeline so each could decide whether to print;
 /// a level filter decides that once, at the source, and every module can emit
 /// unconditionally.
+///
+/// Our own modules keep their level; the libraries we do not control are capped
+/// so a plain `make run-release` starts with the handful of lines that describe
+/// the run, not a dump of the UI's internals. `RUST_LOG` overrides everything,
+/// so `RUST_LOG=info,iced_winit=info` gets the detail back.
 fn init_logging(debug: bool) {
     // RUST_LOG wins when set, so a run can be tuned without adding a flag.
     let mut filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(if debug { "debug" } else { "info" }));
-    // ONNX Runtime logs its own allocator chatter at INFO; that is not signal.
-    filter = filter.add_directive("ort::logging=warn".parse().expect("valid directive"));
+    // Startup chatter from the libraries: iced prints its window attributes and
+    // the wgpu compositor settings as multi-line INFO dumps, ONNX Runtime reports
+    // its allocator and CoreML node coverage. None of it says anything about this
+    // run, so it is capped at WARN - a real iced or ort failure still shows up.
+    for target in ["iced_winit", "iced_wgpu", "ort::logging"] {
+        filter = filter.add_directive(format!("{target}=warn").parse().expect("valid directive"));
+    }
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
