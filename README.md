@@ -81,7 +81,9 @@ louder. `Ctrl+C` stops.
 | `--debug` | DEBUG logging, per-frame timings |
 | `--no-ui`, `--ascii`, `--ascii-cols 70` | headless / ASCII renderer |
 
-`--help` lists everything.
+`--help` lists everything. Logging is `tracing`: `INFO` for what the run is doing, `--debug`
+for per-frame detail, and `RUST_LOG` to tune it (`RUST_LOG=info,iced_winit=info` brings back
+iced's window/compositor dumps, which are silenced by default).
 
 ## Tests
 
