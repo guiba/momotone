@@ -117,7 +117,7 @@ impl Dashboard {
             volume_history: Vec::new(),
             confidence_history: Vec::new(),
             proximity_history: Vec::new(),
-            show_box: true,
+            show_box: false,
             show_labels: false,
         }
     }

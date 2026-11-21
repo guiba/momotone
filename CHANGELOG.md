@@ -39,6 +39,9 @@ in parentheses are the branches each phase was developed on.
 - `src/midi/mod.rs` maps `midir::ConnectError` to a message before the `?`. On the ALSA backend
   that error carries a raw pointer, so it is not `Sync` and cannot become an `anyhow::Error`;
   the CI build failed with E0277 while macOS built fine.
+- The detector **box is off by default** in the dashboard (`show_box: false` in `Dashboard::new`).
+  The `box` header button still turns it on; it just starts hidden so the stage opens as the
+  keyboard plus skeleton rather than a rectangle around the hand.
 - **Fix: the stage no longer panics before the first frame is published.** The keyboard glow is
   a per-note buffer, but `main` seeded the snapshot with an empty one and `Pipeline::pause`
   cleared it, while the layout the stage draws is always full. Whichever side won the race -
