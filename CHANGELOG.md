@@ -5,6 +5,14 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
+- **A detector-window probe.** `--detector-window crop|frame|both` chooses the square the
+  palm detector sees. `crop` is the existing behaviour; `frame` letterboxes the whole image
+  into the same 192×192 buffer so every anchor in the frame is scored; `both` keeps the crop
+  as the behaviour and scores the whole frame alongside it, then prints the comparison -
+  detections, mean score, hands per frame at each NMS separation, and µs/frame. `make probe`
+  and `make probe-single` run it on the two fixtures. It is a measuring mode, not a playing
+  mode: two extra detector passes per frame. The measurement it produced is what settled the
+  two-hand design (see `SECOND_HAND_PLAN.md` §16).
 - **An effect chain, driven by the hand.** `src/core/effects.rs` declares the stages
   (`lowpass`, `vibrato`, `delay`) as source -> parameter -> curve, and the frame loop
   smooths their parameters every frame and puts them on the bus as

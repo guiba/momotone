@@ -599,6 +599,13 @@ impl Pipeline {
             perf.inference.count,
         );
 
+        // The crop-vs-frame comparison this run measured, if it was a measuring run.
+        if let Some(tracker) = &self.tracker {
+            if let Some(report) = tracker.probe_report() {
+                tracing::info!("detector probe: {report}");
+            }
+        }
+
         if let Some(path) = &self.trace_out {
             if let Err(error) = crate::core::trace::write(path, &self.trace) {
                 tracing::warn!("could not write trace {path}: {error}");

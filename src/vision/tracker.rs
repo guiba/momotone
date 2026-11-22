@@ -20,7 +20,9 @@ use crate::core::HandDetectionResult;
 use crate::core::Landmark;
 use crate::core::StageTimings;
 use crate::vision::reuse::ReuseCache;
-use crate::vision::sampling::{sample_affine_to_tensor, Affine, StageInput, TensorLayout};
+use crate::vision::sampling::{
+    letterbox_map, sample_affine_to_tensor, Affine, StageInput, TensorLayout,
+};
 use crate::vision::yolo_pose::YoloPoseTracker;
 
 const NUM_KEYPOINTS: usize = 21;
@@ -38,6 +40,38 @@ const ROI_STALE_FRAMES: u32 = 10;
 /// keeps the window steady against landmark jitter.
 const ROI_ANCHOR_WEIGHT: f64 = 0.3;
 
+/// Which square the palm detector sees.
+///
+/// `Anchored` is today's behaviour: a `min(W, H)` square slid to contain the palm
+/// seen last frame. `FullFrame` letterboxes the whole image into the same 192x192
+/// buffer, so every anchor in the frame is scored - the only way to see a second
+/// hand without a second detector run. `Both` keeps the anchored detection as the
+/// behaviour and scores the full frame alongside it, which is how the resolution
+/// trade-off between the two is measured before the choice is made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DetectorWindow {
+    Anchored,
+    FullFrame,
+    Both,
+}
+
+/// Two palm centres this far apart, in units of the larger palm radius, count as
+/// two different hands.
+///
+/// Measured, not guessed. `--detector-window both` sweeps `SEPARATIONS` over the
+/// two-hand clip. On `fixtures/2_hands_640.mp4` the whole-frame window reports 1.90
+/// hands per frame at 0.25, 0.5 and 1.0 and 1.34 at 2.0; the anchored crop reports 1.46,
+/// 1.46, 1.46 and 1.18. So one hand's duplicate anchors are merged at every gate up to
+/// 1.0, and genuinely separate hands only start merging at 2.0. Measured palm-centre
+/// separation in that clip is 1.3-2.6 palm radii. 1.0 is the widest gate that still
+/// separates the hands while leaving margin before they merge.
+const HAND_SEPARATION: f64 = 1.0;
+/// The separation values the probe sweeps, from "clearly one hand" to "clearly two".
+const SEPARATIONS: [f64; 4] = [0.25, 0.5, 1.0, 2.0];
+/// How many hands the detector is allowed to report. The pipeline uses one pitch
+/// hand plus one modulator.
+const MAX_HANDS: usize = 2;
+
 /// The tracker the pipeline talks to, whichever backend the run asked for.
 pub enum HandTracker {
     MediaPipe(Box<MediaPipeTracker>),
@@ -52,6 +86,7 @@ impl HandTracker {
         score_threshold: f32,
         reuse_landmarks: bool,
         ort_threads: usize,
+        window: DetectorWindow,
     ) -> Result<Self> {
         Ok(Self::MediaPipe(Box::new(MediaPipeTracker::new(
             detector_path,
@@ -60,6 +95,7 @@ impl HandTracker {
             score_threshold,
             reuse_landmarks,
             ort_threads,
+            window,
         )?)))
     }
 
@@ -85,6 +121,58 @@ impl HandTracker {
             Self::YoloPose(tracker) => tracker.process_frame(frame),
         }
     }
+
+    /// What the `DetectorWindow::Both` run measured, or `None` if this run was not a
+    /// probe. Printed at the end of a `--detector-window both` run so the choice
+    /// between the two windows is a number rather than an impression.
+    ///
+    /// `hands` is the mean number of distinct hands per frame at each separation in
+    /// `SEPARATIONS`; `two+` is how many frames found more than one. On a one-hand
+    /// clip a non-zero `two+` is NMS splitting one hand into two - the floor under
+    /// `HAND_SEPARATION`. On the two-hand clip it is the ceiling: the widest gate that
+    /// still sees both hands.
+    pub fn probe_report(&self) -> Option<String> {
+        let Self::MediaPipe(tracker) = self else {
+            return None;
+        };
+        if tracker.probe_crop.frames == 0 {
+            return None;
+        }
+        let gates = SEPARATIONS
+            .iter()
+            .map(|gate| format!("{gate}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let row = |name: &str, probe: &WindowProbe| {
+            let over = probe.frames.max(1) as f64;
+            let hands = probe
+                .hands
+                .iter()
+                .map(|total| format!("{:.2}", *total as f64 / over))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let two = probe
+                .multi
+                .iter()
+                .map(|total| total.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let score = format!("{:.3}", probe.conf as f64 / (1000.0 * over));
+            let us = probe.us as f64 / over;
+            format!(
+                "  {name:<6} {}/{} frames with a hand  score {score}  {us:.0} us/frame  hands {hands}  two+ {two}",
+                probe.hits,
+                probe.frames,
+            )
+        };
+        Some(format!(
+            "detector windows over {} frames, hands per frame at separations [{}]:\n{}\n{}",
+            tracker.probe_crop.frames,
+            gates,
+            row("crop", &tracker.probe_crop),
+            row("frame", &tracker.probe_full),
+        ))
+    }
 }
 
 /// The largest axis-aligned square the detector can take from the frame, slid so
@@ -106,7 +194,6 @@ fn detector_crop(palm: Option<(f64, f64)>, fw: f64, fh: f64) -> (f64, f64, f64) 
     }
 }
 
-/// Low-pass the palm anchor so a jittery detection does not shake the window.
 fn smooth_palm(previous: Option<(f64, f64)>, next: (f64, f64)) -> (f64, f64) {
     match previous {
         Some((px, py)) => (
@@ -118,11 +205,69 @@ fn smooth_palm(previous: Option<(f64, f64)>, next: (f64, f64)) -> (f64, f64) {
 }
 
 /// Palm centre and the radius of the x2-expanded hand box, in frame pixels.
+#[derive(Debug, Clone, Copy)]
 struct PalmBox {
     cx: f64,
     cy: f64,
     half: f64,
     score: f32,
+}
+
+/// What one detector pass over one window reports.
+#[derive(Debug)]
+struct WindowReport {
+    /// The highest-scoring anchor's palm box, whether or not it clears the gate.
+    best: PalmBox,
+    /// Anchors that cleared the gate before NMS.
+    above: usize,
+    /// Distinct hands after NMS at `HAND_SEPARATION`, best first.
+    hands: Vec<PalmBox>,
+    /// How many hands the same candidates produce at each swept separation.
+    hands_at: [usize; SEPARATIONS.len()],
+}
+
+/// Convert one anchor's detector output into a palm box in frame pixels.
+///
+/// `boxes` is `[cx, cy, w, h]` in detector pixels, offsets relative to the anchor,
+/// followed by 7 palm keypoint offsets (18 values per anchor). The `x2` expansion
+/// turns the palm box into a box that covers the whole hand.
+fn anchor_palm_box(anchor: (f32, f32), boxes: &[f32], base: usize, map: &Affine) -> PalmBox {
+    let cx = anchor.0 as f64 * DETECTOR_INPUT as f64 + boxes[base] as f64;
+    let cy = anchor.1 as f64 * DETECTOR_INPUT as f64 + boxes[base + 1] as f64;
+    let bw = boxes[base + 2] as f64;
+    let bh = boxes[base + 3] as f64;
+    PalmBox {
+        cx: map.frame_x(cx, cy),
+        cy: map.frame_y(cx, cy),
+        half: bw.max(bh) * 2.0 * 0.5 * map.m00,
+        score: 0.0,
+    }
+}
+
+/// Anchors whose palm boxes are far enough apart to be different hands.
+///
+/// Greedy, best-first: accept a candidate only when its centre is more than
+/// `separation` x the larger radius away from every accepted palm. Anchors that
+/// belong to the same hand predict centres inside one palm box, so they merge
+/// without any special casing. Two palms that genuinely overlap merge too - for a
+/// modulator that is the right answer, since there is no way to tell them apart
+/// from the box alone.
+fn non_overlapping(candidates: &[PalmBox], separation: f64, max: usize) -> Vec<PalmBox> {
+    let mut hands: Vec<PalmBox> = Vec::with_capacity(max);
+    for candidate in candidates {
+        if hands.len() == max {
+            break;
+        }
+        let clear = hands.iter().all(|hand| {
+            let dx = candidate.cx - hand.cx;
+            let dy = candidate.cy - hand.cy;
+            (dx * dx + dy * dy).sqrt() > separation * candidate.half.max(hand.half)
+        });
+        if clear {
+            hands.push(*candidate);
+        }
+    }
+    hands
 }
 
 pub struct MediaPipeTracker {
@@ -135,6 +280,8 @@ pub struct MediaPipeTracker {
     /// frame (see `StageInput`).
     detector_input: StageInput,
     landmarker_input: StageInput,
+    /// Which square the palm detector sees. See `DetectorWindow`.
+    window: DetectorWindow,
     /// Palm centre the detector reported recently, smoothed. The detector's
     /// square window is slid to keep this point inside, so a hand pushed against
     /// the frame edge is still sampled instead of being cropped out of the model
@@ -143,6 +290,47 @@ pub struct MediaPipeTracker {
     roi_stale: u32,
     /// Keypoints reused while the palm is stationary (see `ReuseCache`).
     cache: ReuseCache,
+    /// Palm boxes that cleared the gate this frame, reused across frames so the
+    /// detector stage does not allocate.
+    candidates: Vec<PalmBox>,
+    /// One `WindowProbe` per window the `Both` run scored. These are the numbers that
+    /// decide whether the whole-frame window is good enough to build two-hand
+    /// tracking on, and which `HAND_SEPARATION` to pick.
+    probe_crop: WindowProbe,
+    probe_full: WindowProbe,
+}
+
+/// Tally of one detector window over a probe run.
+#[derive(Debug, Default)]
+struct WindowProbe {
+    frames: u64,
+    /// Frames in which at least one palm cleared the gate.
+    hits: u64,
+    /// Sum of the best palm score, so the report can show the mean.
+    conf: u64,
+    /// Total anchors above the gate across all frames.
+    anchors: u64,
+    /// For each separation in `SEPARATIONS`: the total number of hands found, and the
+    /// number of frames that found more than one. The first says how many hands the
+    /// window sees; the second is the false-positive count - a frame with two "hands"
+    /// where only one exists is NMS failing to merge one hand's duplicate anchors.
+    hands: [u64; SEPARATIONS.len()],
+    multi: [u64; SEPARATIONS.len()],
+    us: u64,
+}
+
+impl WindowProbe {
+    fn observe(&mut self, report: &WindowReport, us: u64) {
+        self.frames += 1;
+        self.hits += report.hands.first().map_or(0, |_| 1);
+        self.conf += (report.best.score * 1000.0) as u64;
+        self.anchors += report.above as u64;
+        self.us += us;
+        for (index, count) in report.hands_at.iter().enumerate() {
+            self.hands[index] += *count as u64;
+            self.multi[index] += (*count > 1) as u64;
+        }
+    }
 }
 
 impl MediaPipeTracker {
@@ -153,6 +341,7 @@ impl MediaPipeTracker {
         score_threshold: f32,
         reuse_landmarks: bool,
         ort_threads: usize,
+        window: DetectorWindow,
     ) -> Result<Self> {
         // `--ort-threads 0` is ONNX Runtime's own default: one thread per core.
         // Measured live with the webcam open, the BlazeHand detector is ~40 % faster
@@ -195,32 +384,28 @@ impl MediaPipeTracker {
             score_threshold: score_threshold.clamp(0.0, 1.0),
             detector_input: StageInput::new(DETECTOR_INPUT, DETECTOR_INPUT),
             landmarker_input: StageInput::new(LANDMARKER_INPUT, LANDMARKER_INPUT),
+            window,
             roi_palm: None,
             roi_stale: 0,
             cache: ReuseCache::new(reuse_landmarks),
+            candidates: Vec::new(),
+            probe_crop: WindowProbe::default(),
+            probe_full: WindowProbe::default(),
         })
     }
 
-    /// Detector stage: returns the palm centre and the x2-expanded hand radius,
-    /// in frame pixels.
-    fn run_detector(&mut self, frame: &Frame) -> Result<Option<PalmBox>> {
-        let fw = frame.width() as f64;
-        let fh = frame.height() as f64;
-
-        // The detector wants a square input. The window follows the palm so a
-        // hand at the frame edge is still fully sampled instead of being cut out
-        // of the model input.
-        let (tx, ty, side) = detector_crop(self.roi_palm, fw, fh);
-        let k = side / DETECTOR_INPUT as f64; // detector pixel -> frame pixel
-
-        tracing::debug!(
-            "detector window x={tx:.0} y={ty:.0} side={side:.0} palm={:?}",
-            self.roi_palm
-        );
-
+    /// Detector stage: runs the palm graph over one window and reports every hand
+    /// it saw in that window.
+    ///
+    /// `map` is the mapping from the 192x192 model input back to frame pixels; it is
+    /// either the palm-anchored square (`detector_crop`) or the letterboxed whole
+    /// frame (`letterbox_map`). Everything else is the same for both: the graph
+    /// scores all 2016 anchors either way, so seeing the whole frame costs nothing
+    /// beyond the resolution the square crop gives a hand.
+    fn run_detector_window(&mut self, frame: &Frame, map: Affine) -> Result<WindowReport> {
         let map = sample_affine_to_tensor(
             frame,
-            Affine::scale_translate(k, tx, ty),
+            map,
             DETECTOR_INPUT,
             DETECTOR_INPUT,
             &mut self.detector_input,
@@ -260,53 +445,137 @@ impl MediaPipeTracker {
 
         let mut best_idx = 0usize;
         let mut best_conf = f32::MIN;
+        // Anchors that clear the gate, best first. The buffer is a tracker field so
+        // this loop does not allocate; usually only a handful of the 2016 anchors
+        // survive, since the detector puts a long tail of near-duplicate anchors on
+        // one hand and those are exactly what the NMS has to merge.
+        self.candidates.clear();
+
         for (i, &s) in scores.iter().enumerate() {
             let conf = sigmoid(s);
             if conf > best_conf {
                 best_conf = conf;
                 best_idx = i;
             }
+            if conf < self.score_threshold {
+                continue;
+            }
+            let palm = anchor_palm_box(self.anchors[i], boxes, i * 18, &map);
+            if palm.half > 0.0 && palm.cx.is_finite() && palm.cy.is_finite() {
+                self.candidates.push(PalmBox {
+                    score: conf,
+                    ..palm
+                });
+            }
+        }
+
+        self.candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let hands = non_overlapping(&self.candidates, HAND_SEPARATION, MAX_HANDS);
+        // The separation sweep: how many hands the same candidates produce under each
+        // gate. Cheap - the candidate list is a handful of anchors - and it is what
+        // turns `HAND_SEPARATION` from a guess into a measured number.
+        let mut hands_at = [0usize; SEPARATIONS.len()];
+        for (index, separation) in SEPARATIONS.iter().enumerate() {
+            hands_at[index] = non_overlapping(&self.candidates, *separation, MAX_HANDS).len();
         }
 
         tracing::debug!(
-            "best anchor {best_idx} conf={best_conf:.3} (threshold {})",
-            self.score_threshold
+            "best anchor {best_idx} conf={best_conf:.3} (threshold {}, {} anchors above, hands at {})",
+            self.score_threshold,
+            self.candidates.len(),
+            SEPARATIONS
+                .iter()
+                .zip(hands_at.iter())
+                .map(|(gate, count)| format!("{gate}={count}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
 
-        if best_conf < self.score_threshold {
-            self.note_miss();
-            return Ok(None);
+        Ok(WindowReport {
+            best: PalmBox {
+                score: best_conf,
+                ..anchor_palm_box(self.anchors[best_idx], boxes, best_idx * 18, &map)
+            },
+            above: self.candidates.len(),
+            hands,
+            hands_at,
+        })
+    }
+
+    /// Choose the window this frame is seen through, and run the detector through it.
+    ///
+    /// `Both` is the measurement mode the two-hand decision needs: it keeps the
+    /// anchored crop as the behaviour and scores the whole frame alongside it, so a
+    /// run can report how many hands and how many anchors the full-frame pass would
+    /// have seen without changing what the instrument does.
+    fn run_detector(&mut self, frame: &Frame) -> Result<Option<PalmBox>> {
+        let fw = frame.width() as f64;
+        let fh = frame.height() as f64;
+
+        // The detector wants a square input. The window follows the palm so a
+        // hand at the frame edge is still fully sampled instead of being cut out
+        // of the model input.
+        let (tx, ty, side) = detector_crop(self.roi_palm, fw, fh);
+        let crop = Affine::scale_translate(side / DETECTOR_INPUT as f64, tx, ty);
+
+        tracing::debug!(
+            "detector window {:?} x={tx:.0} y={ty:.0} side={side:.0} palm={:?}",
+            self.window,
+            self.roi_palm
+        );
+
+        if self.window == DetectorWindow::Both {
+            let boxes = |hands: &[PalmBox]| {
+                hands
+                    .iter()
+                    .map(|p| format!("({:.0},{:.0}) r={:.0} {:.3}", p.cx, p.cy, p.half, p.score))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let started = Instant::now();
+            let anchored = self.run_detector_window(frame, crop)?;
+            let crop_us = started.elapsed().as_micros() as u64;
+            let started = Instant::now();
+            let full = self.run_detector_window(frame, letterbox_map(fw, fh, DETECTOR_INPUT))?;
+            let full_us = started.elapsed().as_micros() as u64;
+            self.probe_crop.observe(&anchored, crop_us);
+            self.probe_full.observe(&full, full_us);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    "crop hands: {}; frame hands: {}",
+                    boxes(&anchored.hands),
+                    boxes(&full.hands),
+                );
+            }
+            // The instrument still runs on the crop; only the numbers are collected.
+            return Ok(self.commit_palm(&anchored));
         }
 
-        // Box is [cx, cy, w, h] in detector pixels, offsets relative to the anchor,
-        // followed by 7 palm keypoint offsets (18 values per anchor).
-        let base = best_idx * 18;
-        let (ax, ay) = self.anchors[best_idx];
-        let cx = ax as f64 * DETECTOR_INPUT as f64 + boxes[base] as f64;
-        let cy = ay as f64 * DETECTOR_INPUT as f64 + boxes[base + 1] as f64;
-        let bw = boxes[base + 2] as f64;
-        let bh = boxes[base + 3] as f64;
+        let map = if self.window == DetectorWindow::FullFrame {
+            letterbox_map(fw, fh, DETECTOR_INPUT)
+        } else {
+            crop
+        };
+        let report = self.run_detector_window(frame, map)?;
+        Ok(self.commit_palm(&report))
+    }
 
-        // Back to frame pixels using the mapping that was actually applied.
-        let frame_cx = map.frame_x(cx, cy);
-        let frame_cy = map.frame_y(cx, cy);
-        let half = bw.max(bh) * 2.0 * 0.5 * map.m00; // expand to cover the whole hand
-
-        if half <= 0.0 || frame_cx.is_nan() || frame_cy.is_nan() {
-            self.note_miss();
-            return Ok(None);
+    /// Take the best hand from a window pass, remember it as the anchor for the next
+    /// frame's crop, and count a miss when there is none.
+    fn commit_palm(&mut self, report: &WindowReport) -> Option<PalmBox> {
+        let palm = report.hands.first().copied();
+        match palm {
+            Some(palm) => {
+                self.roi_palm = Some(smooth_palm(self.roi_palm, (palm.cx, palm.cy)));
+                self.roi_stale = 0;
+            }
+            None => self.note_miss(),
         }
-
-        // Remember where the hand is so the next frame's window contains it.
-        self.roi_palm = Some(smooth_palm(self.roi_palm, (frame_cx, frame_cy)));
-        self.roi_stale = 0;
-
-        Ok(Some(PalmBox {
-            cx: frame_cx,
-            cy: frame_cy,
-            half,
-            score: best_conf,
-        }))
+        palm
     }
 
     /// A missed frame keeps the window where it was; after enough misses the
@@ -498,6 +767,76 @@ mod tests {
         (a - b).abs() < 1e-6
     }
 
+    fn palm(cx: f64, cy: f64, half: f64, score: f32) -> PalmBox {
+        PalmBox {
+            cx,
+            cy,
+            half,
+            score,
+        }
+    }
+
+    #[test]
+    fn palms_inside_one_another_merge_and_palms_apart_do_not() {
+        // Centres 40 px apart with 60 px radii: the second centre sits inside the
+        // first palm box, and the gate asks for more than 1.0 * 60 = 60 px, so this
+        // is one hand written by three anchors, not three hands.
+        let nested = [
+            palm(200.0, 240.0, 60.0, 0.90),
+            palm(240.0, 240.0, 60.0, 0.85),
+            palm(205.0, 236.0, 58.0, 0.80),
+        ];
+        let hands = non_overlapping(&nested, HAND_SEPARATION, MAX_HANDS);
+        assert_eq!(hands.len(), 1);
+        assert!(
+            near(hands[0].score, 0.90),
+            "the strongest anchor takes the slot"
+        );
+
+        // 70 px apart is more than one palm radius, so the gate reads two hands. Where
+        // exactly that line is drawn is what the two-hand clip has to measure.
+        let apart = [
+            palm(200.0, 240.0, 60.0, 0.90),
+            palm(270.0, 240.0, 60.0, 0.70),
+        ];
+        assert_eq!(non_overlapping(&apart, HAND_SEPARATION, MAX_HANDS).len(), 2);
+
+        // The cap is a cap, and an empty candidate list is not a hand.
+        assert_eq!(non_overlapping(&apart, HAND_SEPARATION, 1).len(), 1);
+        assert!(non_overlapping(&[], HAND_SEPARATION, MAX_HANDS).is_empty());
+    }
+
+    #[test]
+    fn a_wider_gate_merges_hands_that_a_narrow_one_keeps_apart() {
+        // The two-hand clip measures palm centres 1.3-2.6 palm radii apart. This pair is
+        // at 1.4 radii, the tightest real case in the recording: 70 px between centres,
+        // 50 px radii.
+        let hands = [
+            palm(200.0, 240.0, 50.0, 0.90),
+            palm(270.0, 240.0, 50.0, 0.80),
+        ];
+        assert_eq!(non_overlapping(&hands, 1.0, MAX_HANDS).len(), 2);
+        assert_eq!(non_overlapping(&hands, 0.25, MAX_HANDS).len(), 2);
+        assert_eq!(non_overlapping(&hands, 2.0, MAX_HANDS).len(), 1);
+    }
+
+    #[test]
+    fn an_anchor_offset_is_added_to_its_prior_in_model_pixels() {
+        // Identity mapping, so model pixels are frame pixels. The prior (0.5, 0.5) of
+        // a 192x192 input sits at (96, 96); the box is [dx, dy, w, h] relative to it.
+        let boxes = [4.0, -2.0, 20.0, 10.0];
+        let palm = anchor_palm_box(
+            (0.5, 0.5),
+            &boxes,
+            0,
+            &Affine::scale_translate(1.0, 0.0, 0.0),
+        );
+        assert!((palm.cx - 100.0).abs() < 1e-9);
+        assert!((palm.cy - 94.0).abs() < 1e-9);
+        // max(w, h) expanded x2, halved: the radius of the box covering the whole hand.
+        assert!((palm.half - 20.0).abs() < 1e-9);
+    }
+
     #[test]
     fn the_detector_window_follows_the_palm() {
         // 640x480: the square window is 480 wide, so a centred crop only ever
@@ -643,6 +982,7 @@ mod tests {
             0.6,
             true,
             0,
+            DetectorWindow::Anchored,
         )
         .expect("the model assets must be present");
 

@@ -31,7 +31,7 @@ use crate::presentation::annotator::Visualizer;
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
 use crate::presentation::presenter::DEFAULT_FEED_FPS;
 use crate::vision::camera::WebcamSource;
-use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
+use crate::vision::tracker::{DetectorWindow, HandTracker, DEFAULT_SCORE_THRESHOLD};
 use crate::vision::video::VideoSource;
 
 #[derive(Parser, Debug)]
@@ -57,6 +57,15 @@ struct Args {
     /// returns the hand box and all 21 keypoints in one pass.
     #[arg(long, value_enum, default_value = "mediapipe")]
     model: Model,
+
+    /// What square the palm detector sees. `crop` is today's behaviour: the
+    /// `min(W,H)` window that follows the palm. `frame` letterboxes the whole image
+    /// into the same 192x192 buffer, so every anchor in the frame is scored. `both`
+    /// runs the crop as usual and scores the whole frame alongside it - the
+    /// measurement the two-hand decision needs, because it reports how many hands
+    /// each window sees without changing what the instrument does.
+    #[arg(long, value_enum, default_value = "crop")]
+    detector_window: Detector,
 
     /// ONNX Runtime intra-op threads. 0 leaves the runtime default (one thread per
     /// core); a positive number pins the pool, which is worth trying if the model's
@@ -251,6 +260,13 @@ struct Args {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
+enum Detector {
+    Crop,
+    Frame,
+    Both,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum Model {
     #[value(name = "mediapipe")]
     MediaPipe,
@@ -280,6 +296,11 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             args.score_threshold,
             !args.landmarker_always,
             args.ort_threads,
+            match args.detector_window {
+                Detector::Crop => DetectorWindow::Anchored,
+                Detector::Frame => DetectorWindow::FullFrame,
+                Detector::Both => DetectorWindow::Both,
+            },
         ),
         Model::Yolo => HandTracker::yolo_pose(
             &args.pose_path,

@@ -734,5 +734,77 @@ Two things the spec left open and the implementation had to decide:
   makes feedback repeat; storing the input would give exactly one echo. Verified by
   `comb_echoes_an_impulse_after_the_configured_delay` and `without_feedback_the_echo_does_not_repeat`.
 
-**Not done, by design:** MIDI modulation (section 12), and any change to the tracker. PR 2
-(the two-hand detection measurement) is still blocked on a two-hand recording.
+**Not done, by design:** MIDI modulation (section 12), and any change to the tracker.
+
+---
+
+## 16. PR 2 status - the detection measurement
+
+`--detector-window both` runs the anchored crop as the behaviour and scores the whole
+frame alongside it, then prints the comparison. `make probe` and `make probe-single`
+run it on the two fixtures. Nothing in the instrument changes: `crop` is still the
+default, and `both` is a measuring mode, not a playing mode.
+
+### The numbers (200 frames each, release build)
+
+| clip | window | frames with a hand | mean best score | hands/frame @ 1.0 | frames with 2+ hands @ 1.0 | detector µs/frame |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| `hand_clip.mp4` (640×480, one hand) | crop | 173 | 0.838 | 0.87 | 1 | 8126 |
+| | frame | **162** | 0.785 | 0.81 | **0** | 7902 |
+| `2_hands_640.mp4` (640×480, two hands) | crop | 200 | 0.953 | 1.46 | 92 | 10486 |
+| | frame | 200 | 0.957 | **1.90** | **179** | 10181 |
+| `2_hands_clip.mp4` (1620×1080, two hands) | crop | 199 | 0.951 | 1.01 | 4 | 8900 |
+| | frame | 198 | 0.949 | **1.84** | **171** | 8436 |
+
+### What that says
+
+**1. The full-frame window costs the same as the crop.** 7.9 ms vs 8.1 ms detector time.
+Both sample the same 192×192 buffer; only the affine differs. The earlier "the frame
+window is 2.5× slower" reading was contention from a second app instance running in
+another terminal, not the sampler.
+
+**2. Only the full frame sees a second hand.** On the 640×480 two-hand clip the anchored
+crop finds a second palm in 92 of 200 frames; the letterboxed frame finds it in 179. At
+native 1620×1080 the crop finds two hands in 4 frames out of 200 and the frame in 171 -
+the crop's `min(W,H)` window simply cannot span two hands that far apart. This is the
+reach problem the plan predicted, and it is decisive: **option 1 (full-frame pass) is the
+route**.
+
+**3. The full frame does lose detections on a single, distant hand - 173 → 162.** It is
+real, but it is not a gate problem. Sweeping `--score-threshold` 0.6 → 0.5 → 0.4 moves
+the frame window 162 → 165 → 169 while the crop goes 173 → 178 → 179 *and its false
+positives grow from 1 frame to 11*. The gap is the 25% resolution loss the letterbox
+ imposes on a hand that the crop could have magnified, not a threshold that is set too
+high. Lowering the threshold buys crop noise, not frame recall.
+
+**4. No false positives from the whole frame.** Across 753 detections on the two-hand
+clips, not one palm centre landed in the top 22% of the frame where the face and torso
+are. The padding bands do not manufacture hands.
+
+### `HAND_SEPARATION`, measured
+
+Hands per frame on `2_hands_640.mp4` as the separation gate widens:
+
+| gate | 0.25 | 0.5 | 1.0 | 2.0 |
+| :--- | ---: | ---: | ---: | ---: |
+| crop | 1.46 | 1.46 | 1.46 | 1.18 |
+| frame | 1.90 | 1.90 | 1.90 | 1.34 |
+
+One hand's duplicate anchors are merged at every gate up to 1.0, and genuinely separate
+hands only start merging at 2.0. The plateau is 0.25-1.0, so **`HAND_SEPARATION = 1.0`**
+is the value - it is the widest gate that still separates the hands while leaving margin
+before they start to merge. Measured palm-centre separation in the clip is 1.3-2.6 palm
+radii, which is consistent with that.
+
+### Decision
+
+Option 1 stands. For PR 3 the pitch hand keeps the anchored crop - it is the more
+sensitive one and pitch reliability is not worth trading for reach the pitch hand does not
+need - and the **modulator** comes from a full-frame pass. That is two detector runs,
+~16 ms of the 33 ms budget, which the probe already proved is affordable: `both` runs
+exactly those two passes side by side in one process and still finishes inside the frame
+interval, and the landmarker adds ~4-5 ms on top.
+
+The alternative - one full-frame pass for everything - is cheaper but loses 11 detections
+in 200 frames on the hand that plays the melody. Losing a note is worse than losing a
+modifier, so the pitch hand keeps the crop.

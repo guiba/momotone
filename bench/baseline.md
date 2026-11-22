@@ -331,6 +331,54 @@ OpenCV vectorises the bilinear tap, our loop does not, so the 224x224 landmarker
 costs ~2.5x more. On a 33 ms frame budget that is noise — the whole capture stage of a
 fixture run is 1.9 ms p50.
 
+## Detector window: anchored crop vs whole frame (PR 2)
+
+`make probe` runs `--detector-window both`, which keeps the anchored crop as the
+behaviour and scores the letterboxed whole frame alongside it. Two windows, one run,
+identical conditions. 200 frames each, release build, quiet machine.
+
+| clip | window | frames with a hand | mean best score | hands/frame | frames with 2+ hands | detector µs/frame |
+| :-- | :-- | --: | --: | --: | --: | --: |
+| `hand_clip.mp4` (640×480, one hand) | crop | 173 | 0.838 | 0.87 | 1 | 8126 |
+| | frame | 162 | 0.785 | 0.81 | **0** | 7902 |
+| `2_hands_640.mp4` (640×480) | crop | 200 | 0.953 | 1.46 | 92 | 10486 |
+| | frame | 200 | 0.957 | **1.90** | **179** | 10181 |
+| `2_hands_clip.mp4` (1620×1080) | crop | 199 | 0.951 | 1.01 | 4 | 8900 |
+| | frame | 198 | 0.949 | **1.84** | **171** | 8436 |
+
+Three things fall out of this:
+
+- **The whole-frame window is not slower.** Both windows sample the same 192×192
+  buffer; only the affine differs. 7.9 ms vs 8.1 ms is within run-to-run noise. A
+  previous reading of "the frame window is 2.5× slower" was contention from a second
+  copy of the app running in another terminal.
+- **Only the frame window sees a second hand.** At native 1620×1080 the anchored crop -
+  a `min(W,H)` = 1080 square - finds two palms in 4 frames out of 200, because the two
+  hands are further apart than the window can span. The letterbox finds them in 171.
+- **The frame window does lose detections on a single distant hand** (173 → 162), and
+  it is not a gate problem: sweeping `--score-threshold` 0.6 → 0.5 → 0.4 moves the
+  frame window 162 → 165 → 169 while the crop goes 173 → 178 → 179 and its false
+  positives grow from 1 frame to 11. Lowering the threshold buys crop noise, not frame
+  recall.
+
+Across 753 detections on the two-hand clips, no palm centre landed in the top 22% of
+the frame where the face and torso are: the letterbox padding does not manufacture
+hands.
+
+### The separation gate
+
+Hands per frame on `2_hands_640.mp4` as the NMS gate widens:
+
+| gate | 0.25 | 0.5 | 1.0 | 2.0 |
+| :-- | --: | --: | --: | --: |
+| crop | 1.46 | 1.46 | 1.46 | 1.18 |
+| frame | 1.90 | 1.90 | 1.90 | 1.34 |
+
+One hand's duplicate anchors merge at any gate up to 1.0; separate hands only start
+merging at 2.0. Measured palm-centre separation in the clip is 1.3-2.6 palm radii.
+`HAND_SEPARATION = 1.0` is the widest gate that still separates the hands while leaving
+margin before they merge.
+
 ## Fixture and trace
 
 `fixtures/hand_clip.mp4` is a recording of a real hand, so it is **not in the repo**
@@ -402,3 +450,4 @@ switched on.
 
 The delay ring is `DELAY_MAX_MS` (600 ms) long, allocated once in `Voice::idle` when the
 stream opens: ~106 KB at 44.1 kHz, never reallocated by the callback.
+

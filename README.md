@@ -78,6 +78,7 @@ louder. `Ctrl+C` stops.
 | `--waveform sine\|triangle\|square\|saw` | synthesiser timbre |
 | `--effects lowpass,vibrato,delay` | which stages are in the sound chain (default: `lowpass`; `none` for a bare note) |
 | `--model mediapipe\|yolo` | which ONNX backend |
+| `--detector-window crop\|frame\|both` | what square the palm detector sees; `both` is a measurement mode that scores both and prints the comparison |
 | `--camera 1`, `--camera-width 1280` | pick the webcam and capture size |
 | `--debug` | DEBUG logging, per-frame timings |
 | `--no-ui`, `--ascii`, `--ascii-cols 70` | headless / ASCII renderer |
@@ -85,6 +86,22 @@ louder. `Ctrl+C` stops.
 `--help` lists everything. Logging is `tracing`: `INFO` for what the run is doing, `--debug`
 for per-frame detail, and `RUST_LOG` to tune it (`RUST_LOG=info,iced_winit=info` brings back
 iced's window/compositor dumps, which are silenced by default).
+
+## Measuring the detector window
+
+The palm detector samples a 192×192 square. Today that square is anchored on the palm
+seen last frame, which is great for one hand and blind to a second one. `--detector-window
+both` runs the anchored crop *and* a letterboxed whole-frame pass over the same frames and
+prints, per window: frames with a hand, mean best score, hands per frame at each NMS
+separation, frames with more than one hand, and µs per detector frame.
+
+```bash
+make probe          # fixtures/2_hands_clip.mp4, 120 frames
+make probe-single   # fixtures/hand_clip.mp4 - the one-hand regression
+```
+
+This is a measuring mode, not a playing mode: `both` runs three detector passes per frame.
+`crop` remains the default.
 
 ## Tests
 

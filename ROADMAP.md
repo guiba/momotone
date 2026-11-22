@@ -124,7 +124,7 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - **Gesture chords** — combine several gestures into chord/scale selection. **M**
 - **Use `Landmark.z`** — depth is parsed but read by nothing; it is the cheapest way to distinguish "hand near the camera" from "hand far away" for volume. **M**
 - ~~Continuous/theremin strategy~~ **done** (finding 5) — `ThereminStrategy` emits the `Signal` payload the sinks already handled.
-- **Two hands** — NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs modulation). The design is worked out in `SECOND_HAND_PLAN.md`; the blocker is a two-hand fixture clip to measure whether the full-frame pass finds hands as reliably as the anchored crop. **L**
+- **Two hands** — the measurement is done (PR 2, `make probe`); the decision is made. Remaining work is the implementation: NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, and pitch/modulator roles. See `SECOND_HAND_PLAN.md` §16. **L**
 
 ### Output sinks
 - **OSC sink** — implement `Sink` and push it into `sinks` in `main.rs`. **S**
