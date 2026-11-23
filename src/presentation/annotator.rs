@@ -59,30 +59,32 @@ impl Visualizer {
         Visualizer
     }
 
-    /// Draw the hand skeleton: a bone between every connected landmark pair and a
-    /// joint dot at each landmark. Landmarks are in frame pixels; nothing is drawn
-    /// when the tracker did not find a hand.
+    /// Draw every hand the tracker found: a bone between every connected landmark
+    /// pair and a joint dot at each landmark. Landmarks are in frame pixels; nothing
+    /// is drawn for a slot the tracker did not fill.
     pub fn draw_skeleton(&self, frame: &mut Frame, detection: &HandDetectionResult) {
-        let landmarks = match &detection.hand_landmarks {
-            Some(l) if l.len() >= 21 => l,
-            _ => return,
-        };
+        for hand in &detection.hands {
+            let landmarks = match &hand.landmarks {
+                Some(l) if l.len() >= 21 => l,
+                _ => continue,
+            };
 
-        for &(a, b) in HAND_CONNECTIONS.iter() {
-            if a >= landmarks.len() || b >= landmarks.len() {
-                continue;
+            for &(a, b) in HAND_CONNECTIONS.iter() {
+                if a >= landmarks.len() || b >= landmarks.len() {
+                    continue;
+                }
+                line(
+                    frame,
+                    (landmarks[a].x, landmarks[a].y),
+                    (landmarks[b].x, landmarks[b].y),
+                    BONE,
+                    BONE_WIDTH,
+                );
             }
-            line(
-                frame,
-                (landmarks[a].x, landmarks[a].y),
-                (landmarks[b].x, landmarks[b].y),
-                BONE,
-                BONE_WIDTH,
-            );
-        }
 
-        for landmark in landmarks {
-            disc(frame, (landmark.x, landmark.y), JOINT_RADIUS, JOINT);
+            for landmark in landmarks {
+                disc(frame, (landmark.x, landmark.y), JOINT_RADIUS, JOINT);
+            }
         }
     }
 }
@@ -128,7 +130,7 @@ fn disc(frame: &mut Frame, centre: (f32, f32), radius: usize, colour: [u8; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Landmark;
+    use crate::core::{HandDetection, Landmark};
 
     #[test]
     fn nothing_is_drawn_without_a_hand() {
@@ -149,7 +151,11 @@ mod tests {
             })
             .collect();
         let detection = HandDetectionResult {
-            hand_landmarks: Some(landmarks),
+            hands: vec![HandDetection {
+                landmarks: Some(landmarks),
+                r#box: Some((0.0, 0.0, 40.0, 40.0)),
+                score: 0.9,
+            }],
             ..HandDetectionResult::default()
         };
         Visualizer::new().draw_skeleton(&mut frame, &detection);
@@ -173,7 +179,11 @@ mod tests {
             })
             .collect();
         let detection = HandDetectionResult {
-            hand_landmarks: Some(landmarks),
+            hands: vec![HandDetection {
+                landmarks: Some(landmarks),
+                r#box: None,
+                score: 0.9,
+            }],
             ..HandDetectionResult::default()
         };
         Visualizer::new().draw_skeleton(&mut frame, &detection);

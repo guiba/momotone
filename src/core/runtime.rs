@@ -80,6 +80,9 @@ pub enum UiCommand {
     SetVolume(VolumeModel),
     /// Switch one stage of the effect chain on or off.
     SetEffect(crate::core::effects::Effect, bool),
+    /// Trade the pitch and modulator roles between the two hand slots. Manual only:
+    /// automatic promotion could hijack the melody in the middle of a sweep.
+    SwapHands,
     /// The pickers changed the instrument: re-key the strategy, retimbre the
     /// sinks and repaint the header.
     SetInstrument(InstrumentConfig),

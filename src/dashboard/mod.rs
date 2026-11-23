@@ -76,6 +76,8 @@ enum Message {
     PickWaveform(Waveform),
     PickVolume(String),
     ToggleEffect(String),
+    /// Trade the pitch and modulator roles between the two hand slots.
+    SwapHands,
 }
 
 pub struct Dashboard {
@@ -216,6 +218,9 @@ impl Dashboard {
                     let _ = self.control.send(UiCommand::SetEffect(effect, on));
                 }
             }
+            Message::SwapHands => {
+                let _ = self.control.send(UiCommand::SwapHands);
+            }
         }
     }
 
@@ -300,12 +305,15 @@ impl Dashboard {
                 ramp: self.ramp,
                 frequency: self.metrics.sound.frequency,
                 landmarks: self.metrics.hand.landmarks.clone(),
+                modulator_landmarks: self.metrics.modulator.landmarks.clone(),
+                modulator_box: self.metrics.modulator.hand_box,
                 frame_size: self.metrics.hand.frame_size,
                 hand_box: self.metrics.hand.hand_box,
                 show_box: self.show_box,
                 show_labels: self.show_labels,
                 detected: self.metrics.hand.detected,
                 lost_ms: self.metrics.hand.lost_ms,
+                modulator_lost_ms: self.metrics.modulator.lost_ms,
                 trail: self.metrics.sound.trail.clone(),
                 layout: self.metrics.scene.layout.clone(),
                 current_note: self.metrics.sound.note,
@@ -339,6 +347,7 @@ impl Dashboard {
             Tab::Basic => column![
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
+                hands_card(&self.metrics),
                 loudness_card(&self.metrics),
                 effects_card(&self.metrics),
                 render_card(self.ramp, ascii),
@@ -874,6 +883,52 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
             kv("landmarks", format!("{}", metrics.hand.landmark_count)),
         ]
         .spacing(4),
+    )
+}
+
+/// The two hands and which is doing what. The modulator's numbers are the raw
+/// sources behind the effect chain, so this card is where a player checks that the
+/// second hand is actually being seen before blaming the sound.
+fn hands_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
+    let modulator = &metrics.modulator;
+    let state = if modulator.detected {
+        format!(
+            "seen ({:.2}) {:.0} px away",
+            modulator.confidence, modulator.gap_px
+        )
+    } else {
+        format!("lost for {} ms", modulator.lost_ms)
+    };
+
+    card(
+        "HANDS",
+        column![
+            kv(
+                "pitch",
+                if metrics.hand.detected {
+                    "playing"
+                } else {
+                    "searching"
+                }
+                .to_string(),
+            ),
+            kv("modulator", state),
+            canvas(Meter {
+                value: modulator.gap_level,
+                color: PROXIMITY,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "gap",
+                format!(
+                    "{:.2}x touching ({:.0} px)",
+                    modulator.gap_ratio, modulator.gap_px
+                ),
+            ),
+            small_button("swap hands", Message::SwapHands),
+        ]
+        .spacing(6),
     )
 }
 

@@ -42,18 +42,59 @@ pub const NOTE_COUNT: usize = (NOTE_HIGH - NOTE_LOW + 1) as usize;
 /// detector loses it.
 pub const NOTE_MARGIN: f32 = 0.10;
 
+/// Centre of an `(x, y, w, h)` box, in the same units as the box.
+pub fn box_centre(b: (f32, f32, f32, f32)) -> (f32, f32) {
+    (b.0 + b.2 / 2.0, b.1 + b.3 / 2.0)
+}
+
+/// A palm the detector found: centre in frame pixels, the radius of the x2-expanded
+/// hand box, and the confidence the winning anchor carried.
+#[derive(Debug, Clone, Copy)]
+pub struct PalmBox {
+    pub cx: f64,
+    pub cy: f64,
+    pub half: f64,
+    pub score: f32,
+}
+
+/// How many hands the instrument can address: one that plays pitch and one that
+/// modulates.
+pub const MAX_HANDS: usize = 2;
+
+/// One hand the tracker resolved this frame.
+#[derive(Debug, Clone, Default)]
+pub struct HandDetection {
+    pub landmarks: Option<Vec<Landmark>>,
+    /// `(x, y, w, h)` bounding box of the detected hand, in frame pixels.
+    pub r#box: Option<(f32, f32, f32, f32)>,
+    /// Detection confidence of the winning anchor (0..1).
+    pub score: f32,
+}
+/// What one frame of tracking produced.
+///
+/// `hands` is in **slot order**: slot 0 is the pitch hand, slot 1 the modulator.
+/// A frame with a single hand has exactly one entry, and it is the pitch hand -
+/// so a one-hand run behaves exactly like it always did.
 #[derive(Debug, Clone, Default)]
 pub struct HandDetectionResult {
-    pub hand_landmarks: Option<Vec<Landmark>>,
-    /// (x, y, w, h) bounding box of the detected hand, in frame pixels.
-    pub r#box: Option<(f32, f32, f32, f32)>,
+    pub hands: Vec<HandDetection>,
     /// Size of the frame those pixels live in, so strategies can normalise
     /// against the whole view rather than the hand box.
     pub frame_size: (usize, usize),
-    /// Detection confidence of the winning anchor (0..1).
-    pub score: f32,
     /// Per-stage inference cost of this frame, in microseconds.
     pub timings: StageTimings,
+}
+
+impl HandDetectionResult {
+    /// The hand that plays pitch, or `None` when no hand was seen.
+    pub fn pitch(&self) -> Option<&HandDetection> {
+        self.hands.first()
+    }
+
+    /// The modulator hand, if a second one was found.
+    pub fn modulator(&self) -> Option<&HandDetection> {
+        self.hands.get(1)
+    }
 }
 
 /// Interface for an output sink (Audio or MIDI).

@@ -16,9 +16,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 
 use crate::core::frame::Frame;
-use crate::core::HandDetectionResult;
-use crate::core::Landmark;
-use crate::core::StageTimings;
+use crate::core::{HandDetection, HandDetectionResult, Landmark, PalmBox, StageTimings, MAX_HANDS};
 use crate::vision::reuse::ReuseCache;
 use crate::vision::sampling::{
     letterbox_map, sample_affine_to_tensor, Affine, StageInput, TensorLayout,
@@ -40,37 +38,100 @@ const ROI_STALE_FRAMES: u32 = 10;
 /// keeps the window steady against landmark jitter.
 const ROI_ANCHOR_WEIGHT: f64 = 0.3;
 
-/// Which square the palm detector sees.
+/// What the palm detector is asked to find.
 ///
-/// `Anchored` is today's behaviour: a `min(W, H)` square slid to contain the palm
-/// seen last frame. `FullFrame` letterboxes the whole image into the same 192x192
-/// buffer, so every anchor in the frame is scored - the only way to see a second
-/// hand without a second detector run. `Both` keeps the anchored detection as the
-/// behaviour and scores the full frame alongside it, which is how the resolution
-/// trade-off between the two is measured before the choice is made.
+/// `Anchored` is the original behaviour: a `min(W, H)` square slid to contain the
+/// palm seen last frame, reporting one hand. `TwoHands` is the two-hand instrument:
+/// the pitch hand still comes from that anchored crop - it is the more sensitive
+/// window and pitch reliability is not worth trading - while a second, whole-frame
+/// pass finds the modulator, which the crop physically cannot reach. `Probe` runs
+/// both windows and reports the comparison without changing what the instrument
+/// does; it is how `HAND_SEPARATION` and the choice of window were measured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DetectorWindow {
     Anchored,
-    FullFrame,
-    Both,
+    TwoHands,
+    Probe,
+}
+
+impl DetectorWindow {
+    /// Every mode that scores the whole frame, which is where the second hand comes
+    /// from.
+    fn looks_at_the_whole_frame(&self) -> bool {
+        matches!(self, DetectorWindow::TwoHands | DetectorWindow::Probe)
+    }
 }
 
 /// Two palm centres this far apart, in units of the larger palm radius, count as
 /// two different hands.
 ///
-/// Measured, not guessed. `--detector-window both` sweeps `SEPARATIONS` over the
-/// two-hand clip. On `fixtures/2_hands_640.mp4` the whole-frame window reports 1.90
-/// hands per frame at 0.25, 0.5 and 1.0 and 1.34 at 2.0; the anchored crop reports 1.46,
-/// 1.46, 1.46 and 1.18. So one hand's duplicate anchors are merged at every gate up to
-/// 1.0, and genuinely separate hands only start merging at 2.0. Measured palm-centre
-/// separation in that clip is 1.3-2.6 palm radii. 1.0 is the widest gate that still
-/// separates the hands while leaving margin before they merge.
+/// Measured, not guessed. `--hands probe` sweeps `SEPARATIONS` over the same anchors
+/// and prints the counts. On `fixtures/2_hands_640.mp4` (120 frames) the whole-frame
+/// window reports 1.88 hands per frame at 0.25, 0.5 and 1.0 and 1.46 at 2.0, with 105
+/// frames showing more than one hand at 1.0 and 55 at 2.0; the anchored crop reports
+/// 1.01 at every gate - it only ever sees the hand it is centred on. So one hand's
+/// duplicate anchors are merged at every gate up to 1.0, and genuinely separate hands
+/// only start merging at 2.0. 1.0 is the widest gate that still separates the hands
+/// while leaving margin before they merge.
 const HAND_SEPARATION: f64 = 1.0;
 /// The separation values the probe sweeps, from "clearly one hand" to "clearly two".
 const SEPARATIONS: [f64; 4] = [0.25, 0.5, 1.0, 2.0];
-/// How many hands the detector is allowed to report. The pipeline uses one pitch
-/// hand plus one modulator.
-const MAX_HANDS: usize = 2;
+/// How far a hand may move between frames and still be the hand that already owns
+/// a slot, as a fraction of the frame's shorter side. A hand cannot teleport more
+/// than this in a 33 ms frame, so anything further away is genuinely a new hand and
+/// gets a free slot.
+const SLOT_MAX_JUMP: f64 = 0.35;
+
+/// Two palms this far apart are different hands.
+fn are_two_hands(a: PalmBox, b: PalmBox) -> bool {
+    let dx = a.cx - b.cx;
+    let dy = a.cy - b.cy;
+    (dx * dx + dy * dy).sqrt() > HAND_SEPARATION * a.half.max(b.half)
+}
+
+/// Greedy nearest-slot matching against the remembered palm positions.
+///
+/// `candidates` is already ordered so that each entry sits in the slot its detector
+/// window implies - the anchored crop found the pitch hand, the whole-frame pass found
+/// the other. The matcher is what keeps that assignment stable when the detector's
+/// scores flip: a hand goes to the free slot whose last palm is closest, provided that
+/// palm is within `jump` pixels; otherwise it takes any free slot. `anchors` is updated
+/// in place so the next frame can recognise the same hands.
+fn match_to_slots(
+    candidates: [Option<PalmBox>; MAX_HANDS],
+    anchors: &mut [Option<(f64, f64)>; MAX_HANDS],
+    jump: f64,
+) -> [Option<PalmBox>; MAX_HANDS] {
+    let mut slots: [Option<PalmBox>; MAX_HANDS] = [None; MAX_HANDS];
+    let mut taken = [false; MAX_HANDS];
+
+    for candidate in candidates.into_iter().flatten() {
+        let distance = |slot: usize| {
+            let (sx, sy) = match anchors[slot] {
+                Some(anchor) => anchor,
+                None => return f64::INFINITY,
+            };
+            ((candidate.cx - sx).powi(2) + (candidate.cy - sy).powi(2)).sqrt()
+        };
+
+        let nearest = (0..MAX_HANDS)
+            .filter(|slot| !taken[*slot])
+            .filter(|slot| distance(*slot) <= jump)
+            .min_by(|a, b| {
+                distance(*a)
+                    .partial_cmp(&distance(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        let slot = nearest.or_else(|| (0..MAX_HANDS).find(|slot| !taken[*slot]));
+        if let Some(slot) = slot {
+            taken[slot] = true;
+            slots[slot] = Some(candidate);
+            anchors[slot] = Some((candidate.cx, candidate.cy));
+        }
+    }
+    slots
+}
 
 /// The tracker the pipeline talks to, whichever backend the run asked for.
 pub enum HandTracker {
@@ -115,16 +176,32 @@ impl HandTracker {
         )?)))
     }
 
-    pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
+    /// Find the hands this frame contains, reported in role order: index 0 is the hand
+    /// playing notes, index 1 the modulator.
+    ///
+    /// Slots are hand identities, not left and right: a hand keeps its slot as long as
+    /// its palm stays within `SLOT_MAX_JUMP` of that slot's anchor, so crossing hands in
+    /// front of the camera does not make them change places. Which slot plays notes is a
+    /// role the player chooses - `pitch_slot` - and the anchored crop is centred on that
+    /// slot's palm, so trading the roles moves the sensitive window to the hand being
+    /// played with. Nothing promotes a hand on its own: automatic promotion could hijack
+    /// the melody in the middle of a sweep, so the trade is explicit.
+    pub fn process_frame(
+        &mut self,
+        frame: &Frame,
+        pitch_slot: usize,
+    ) -> Result<HandDetectionResult> {
         match self {
-            Self::MediaPipe(tracker) => tracker.process_frame(frame),
+            Self::MediaPipe(tracker) => tracker.process_frame(frame, pitch_slot),
+            // The pose model reports a single hand, so there is no second hand to trade
+            // roles with; the one detection is always the pitch hand.
             Self::YoloPose(tracker) => tracker.process_frame(frame),
         }
     }
 
-    /// What the `DetectorWindow::Both` run measured, or `None` if this run was not a
-    /// probe. Printed at the end of a `--detector-window both` run so the choice
-    /// between the two windows is a number rather than an impression.
+    /// What the `DetectorWindow::Probe` run measured, or `None` if this run was not a
+    /// probe. Printed at the end of a `--hands probe` run so the choice between the
+    /// two windows is a number rather than an impression.
     ///
     /// `hands` is the mean number of distinct hands per frame at each separation in
     /// `SEPARATIONS`; `two+` is how many frames found more than one. On a one-hand
@@ -135,7 +212,7 @@ impl HandTracker {
         let Self::MediaPipe(tracker) = self else {
             return None;
         };
-        if tracker.probe_crop.frames == 0 {
+        if tracker.window != DetectorWindow::Probe || tracker.probe_crop.frames == 0 {
             return None;
         }
         let gates = SEPARATIONS
@@ -202,15 +279,6 @@ fn smooth_palm(previous: Option<(f64, f64)>, next: (f64, f64)) -> (f64, f64) {
         ),
         None => next,
     }
-}
-
-/// Palm centre and the radius of the x2-expanded hand box, in frame pixels.
-#[derive(Debug, Clone, Copy)]
-struct PalmBox {
-    cx: f64,
-    cy: f64,
-    half: f64,
-    score: f32,
 }
 
 /// What one detector pass over one window reports.
@@ -288,8 +356,14 @@ pub struct MediaPipeTracker {
     /// input (see `detector_crop`).
     roi_palm: Option<(f64, f64)>,
     roi_stale: u32,
-    /// Keypoints reused while the palm is stationary (see `ReuseCache`).
-    cache: ReuseCache,
+    /// Last palm centre per hand slot, used to keep a hand in the role it already
+    /// owns from frame to frame. Slot 0 is the pitch hand, slot 1 the modulator; a hand
+    /// keeps its slot as long as its palm stays within `SLOT_MAX_JUMP` of that slot's
+    /// anchor, so crossing hands does not make them trade identities.
+    slots: [Option<(f64, f64)>; MAX_HANDS],
+    /// Keypoints reused while the palm is stationary (see `ReuseCache`), one cache
+    /// per hand so a still modulator cannot serve the pitch hand's keypoints.
+    caches: [ReuseCache; MAX_HANDS],
     /// Palm boxes that cleared the gate this frame, reused across frames so the
     /// detector stage does not allocate.
     candidates: Vec<PalmBox>,
@@ -387,7 +461,11 @@ impl MediaPipeTracker {
             window,
             roi_palm: None,
             roi_stale: 0,
-            cache: ReuseCache::new(reuse_landmarks),
+            slots: [None; MAX_HANDS],
+            caches: [
+                ReuseCache::new(reuse_landmarks),
+                ReuseCache::new(reuse_landmarks),
+            ],
             candidates: Vec::new(),
             probe_crop: WindowProbe::default(),
             probe_full: WindowProbe::default(),
@@ -506,19 +584,31 @@ impl MediaPipeTracker {
         })
     }
 
-    /// Choose the window this frame is seen through, and run the detector through it.
+    /// Find the hands this frame contains, ordered by role: slot 0 of the result is the
+    /// pitch hand, slot 1 the modulator.
     ///
-    /// `Both` is the measurement mode the two-hand decision needs: it keeps the
-    /// anchored crop as the behaviour and scores the whole frame alongside it, so a
-    /// run can report how many hands and how many anchors the full-frame pass would
-    /// have seen without changing what the instrument does.
-    fn run_detector(&mut self, frame: &Frame) -> Result<Option<PalmBox>> {
+    /// The pitch hand comes from the anchored crop, which magnifies the hand and is
+    /// the more sensitive of the two windows. The modulator comes from a whole-frame
+    /// pass, because a `min(W, H)` square slid to one hand cannot span two hands that
+    /// are far apart - on the 1620x1080 clip the crop saw two hands in 4 frames of 200
+    /// and the letterbox in 171. Both hands then run the same landmarker, so the second
+    /// hand is detected exactly like the first.
+    ///
+    /// `pitch_slot` is the hand identity the player has chosen for notes. The crop is
+    /// centred on it, so trading the roles moves the sensitive window to the hand being
+    /// played with. Nothing promotes a hand on its own - automatic promotion could
+    /// hijack the melody in the middle of a sweep - so the trade is explicit.
+    fn detect_hands(
+        &mut self,
+        frame: &Frame,
+        pitch_slot: usize,
+    ) -> Result<[Option<PalmBox>; MAX_HANDS]> {
         let fw = frame.width() as f64;
         let fh = frame.height() as f64;
 
-        // The detector wants a square input. The window follows the palm so a
-        // hand at the frame edge is still fully sampled instead of being cut out
-        // of the model input.
+        // The detector wants a square input. The window follows the pitch palm so a
+        // hand at the frame edge is still fully sampled instead of being cut out of
+        // the model input.
         let (tx, ty, side) = detector_crop(self.roi_palm, fw, fh);
         let crop = Affine::scale_translate(side / DETECTOR_INPUT as f64, tx, ty);
 
@@ -528,46 +618,78 @@ impl MediaPipeTracker {
             self.roi_palm
         );
 
-        if self.window == DetectorWindow::Both {
-            let boxes = |hands: &[PalmBox]| {
-                hands
-                    .iter()
-                    .map(|p| format!("({:.0},{:.0}) r={:.0} {:.3}", p.cx, p.cy, p.half, p.score))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            let started = Instant::now();
-            let anchored = self.run_detector_window(frame, crop)?;
-            let crop_us = started.elapsed().as_micros() as u64;
+        let started = Instant::now();
+        let anchored = self.run_detector_window(frame, crop)?;
+        let crop_us = started.elapsed().as_micros() as u64;
+
+        let mut pitch = anchored.hands.first().copied();
+        let mut modulator = None;
+
+        if self.window.looks_at_the_whole_frame() {
             let started = Instant::now();
             let full = self.run_detector_window(frame, letterbox_map(fw, fh, DETECTOR_INPUT))?;
             let full_us = started.elapsed().as_micros() as u64;
             self.probe_crop.observe(&anchored, crop_us);
             self.probe_full.observe(&full, full_us);
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                tracing::debug!(
-                    "crop hands: {}; frame hands: {}",
-                    boxes(&anchored.hands),
-                    boxes(&full.hands),
-                );
+
+            if self.window == DetectorWindow::TwoHands {
+                // A whole-frame hand far enough from the pitch palm is a different
+                // hand. If the crop saw nothing, the best frame hand becomes the pitch
+                // hand instead: a run with one hand behaves like a run that always had
+                // one hand.
+                modulator = full
+                    .hands
+                    .iter()
+                    .copied()
+                    .find(|hand| pitch.is_none_or(|palm| are_two_hands(palm, *hand)));
+                if pitch.is_none() {
+                    pitch = modulator.take();
+                }
             }
-            // The instrument still runs on the crop; only the numbers are collected.
-            return Ok(self.commit_palm(&anchored));
         }
 
-        let map = if self.window == DetectorWindow::FullFrame {
-            letterbox_map(fw, fh, DETECTOR_INPUT)
-        } else {
-            crop
-        };
-        let report = self.run_detector_window(frame, map)?;
-        Ok(self.commit_palm(&report))
+        let hands = self.assign_slots(pitch, modulator, pitch_slot, fw, fh);
+        self.commit_palm(hands[pitch_slot]);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let boxes = hands
+                .iter()
+                .map(|palm| {
+                    palm.map_or("none".to_string(), |p| {
+                        format!("({:.0},{:.0}) r={:.0} {:.3}", p.cx, p.cy, p.half, p.score)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            tracing::debug!("hands: {boxes}");
+        }
+        Ok(hands)
     }
 
-    /// Take the best hand from a window pass, remember it as the anchor for the next
-    /// frame's crop, and count a miss when there is none.
-    fn commit_palm(&mut self, report: &WindowReport) -> Option<PalmBox> {
-        let palm = report.hands.first().copied();
+    /// Put this frame's hands in the slots they belong to.
+    ///
+    /// The crop was centred on the hand that played pitch last frame, so that candidate
+    /// is offered to the pitch slot and the whole-frame candidate to the other one.
+    /// `match_to_slots` then keeps identities stable: two hands whose detector scores
+    /// swap do not trade roles just because one scored higher this frame.
+    fn assign_slots(
+        &mut self,
+        pitch: Option<PalmBox>,
+        other: Option<PalmBox>,
+        pitch_slot: usize,
+        fw: f64,
+        fh: f64,
+    ) -> [Option<PalmBox>; MAX_HANDS] {
+        // The crop was centred on the hand that played pitch last frame, so that
+        // candidate belongs to the pitch slot and the frame candidate to the other one.
+        let mut candidates = [None; MAX_HANDS];
+        candidates[pitch_slot] = pitch;
+        candidates[1 - pitch_slot] = other;
+        match_to_slots(candidates, &mut self.slots, SLOT_MAX_JUMP * fw.min(fh))
+    }
+
+    /// Remember where the pitch hand is so the next frame's crop contains it, and
+    /// count a miss when there is none.
+    fn commit_palm(&mut self, palm: Option<PalmBox>) {
         match palm {
             Some(palm) => {
                 self.roi_palm = Some(smooth_palm(self.roi_palm, (palm.cx, palm.cy)));
@@ -575,7 +697,6 @@ impl MediaPipeTracker {
             }
             None => self.note_miss(),
         }
-        palm
     }
 
     /// A missed frame keeps the window where it was; after enough misses the
@@ -650,86 +771,106 @@ impl MediaPipeTracker {
         Ok(landmarks)
     }
 
-    pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
+    pub fn process_frame(
+        &mut self,
+        frame: &Frame,
+        pitch_slot: usize,
+    ) -> Result<HandDetectionResult> {
         let mut result = HandDetectionResult {
-            hand_landmarks: None,
-            r#box: None,
+            hands: Vec::new(),
             frame_size: (frame.width(), frame.height()),
-            score: 0.0,
             timings: StageTimings::default(),
         };
 
         let detector_start = Instant::now();
-        let detection = self.run_detector(frame)?;
+        let palms = self.detect_hands(frame, pitch_slot)?;
         result.timings.detector_us = detector_start.elapsed().as_secs_f64() * 1e6;
 
-        if let Some(detection) = detection {
-            // The palm box is reported unclamped: a constant 2 x half square keeps
-            // the strategy's spread normalisation stable even when the hand is
-            // clipped by the edge of the view (the canvas/ OpenCV clip the overlay
-            // when it is drawn).
-            result.r#box = Some((
-                (detection.cx - detection.half) as f32,
-                (detection.cy - detection.half) as f32,
-                (2.0 * detection.half) as f32,
-                (2.0 * detection.half) as f32,
-            ));
-            result.score = detection.score;
-
-            let palm = (detection.cx, detection.cy, detection.half);
-            if let Some(landmarks) = self.cache.reuse(palm) {
-                // Same palm, same crop: the keypoints from the previous run are
-                // still valid, so the 224x224 model is not executed this frame.
-                result.hand_landmarks = Some(landmarks);
-                result.timings.landmarker_us = 0.0;
-                tracing::debug!(
-                    "palm steady, reusing landmarks ({} frame{} in a row)",
-                    self.cache.streak(),
-                    if self.cache.streak() > 1 { "s" } else { "" }
-                );
-            } else {
-                let landmarker_start = Instant::now();
-                match self.run_landmarks(frame, detection.cx, detection.cy, detection.half) {
-                    Ok(landmarks) => {
-                        result.timings.landmarker_us =
-                            landmarker_start.elapsed().as_secs_f64() * 1e6;
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            let (mut minx, mut miny, mut maxx, mut maxy) =
-                                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                            for lm in &landmarks {
-                                minx = minx.min(lm.x);
-                                maxx = maxx.max(lm.x);
-                                miny = miny.min(lm.y);
-                                maxy = maxy.max(lm.y);
-                            }
-                            tracing::debug!(
-                                "landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
-                            );
-                            for (i, lm) in landmarks.iter().enumerate() {
-                                tracing::debug!(
-                                    "lm[{i}] = ({:.1}, {:.1}, {:.3})",
-                                    lm.x,
-                                    lm.y,
-                                    lm.z
-                                );
-                            }
-                        }
-                        self.cache.refresh(palm, &landmarks);
-                        result.hand_landmarks = Some(landmarks);
-                    }
-                    Err(e) => {
-                        tracing::warn!("landmarker stage skipped: {e}");
-                        self.cache.clear();
-                    }
-                }
+        // Every hand goes through the same landmarker, with its own reuse cache. The
+        // modulator gets full keypoints too: the effect chain only needs the palm box,
+        // but a hand that has them can drive richer gestures later without a second
+        // pass. Hands are emitted in role order - pitch first, modulator second - so
+        // `pitch()` and `modulator()` mean the same thing for every backend.
+        let landmarker_start = Instant::now();
+        for slot in [pitch_slot, 1 - pitch_slot] {
+            match palms[slot] {
+                Some(palm) => result.hands.push(self.track_hand(frame, palm, slot)?),
+                None => self.caches[slot].clear(),
             }
-        } else {
-            // No hand: the cache is worthless and must not be reused on the next
-            // sighting.
-            self.cache.clear();
         }
+        result.timings.landmarker_us = landmarker_start.elapsed().as_secs_f64() * 1e6;
 
         Ok(result)
+    }
+
+    /// Landmark one hand and package it, reusing the previous keypoints when that
+    /// palm has not moved.
+    fn track_hand(&mut self, frame: &Frame, palm: PalmBox, slot: usize) -> Result<HandDetection> {
+        // The palm box is reported unclamped: a constant 2 x half square keeps the
+        // strategy's spread normalisation stable even when the hand is clipped by the
+        // edge of the view (the canvas clips the overlay when it is drawn).
+        let hand_box = (
+            (palm.cx - palm.half) as f32,
+            (palm.cy - palm.half) as f32,
+            (2.0 * palm.half) as f32,
+            (2.0 * palm.half) as f32,
+        );
+        let anchor = (palm.cx, palm.cy, palm.half);
+
+        if let Some(landmarks) = self.caches[slot].reuse(anchor) {
+            // Same palm, same crop: the keypoints from the previous run are still
+            // valid, so the 224x224 model is not executed this frame.
+            tracing::debug!(
+                "hand {slot} steady, reusing landmarks ({} frame{} in a row)",
+                self.caches[slot].streak(),
+                if self.caches[slot].streak() > 1 {
+                    "s"
+                } else {
+                    ""
+                }
+            );
+            return Ok(HandDetection {
+                landmarks: Some(landmarks),
+                r#box: Some(hand_box),
+                score: palm.score,
+            });
+        }
+
+        match self.run_landmarks(frame, palm.cx, palm.cy, palm.half) {
+            Ok(landmarks) => {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let (mut minx, mut miny, mut maxx, mut maxy) =
+                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for lm in &landmarks {
+                        minx = minx.min(lm.x);
+                        maxx = maxx.max(lm.x);
+                        miny = miny.min(lm.y);
+                        maxy = maxy.max(lm.y);
+                    }
+                    tracing::debug!(
+                        "hand {slot} landmarks bbox x={minx:.1}..{maxx:.1} y={miny:.1}..{maxy:.1}"
+                    );
+                    for (i, lm) in landmarks.iter().enumerate() {
+                        tracing::debug!("lm[{i}] = ({:.1}, {:.1}, {:.3})", lm.x, lm.y, lm.z);
+                    }
+                }
+                self.caches[slot].refresh(anchor, &landmarks);
+                Ok(HandDetection {
+                    landmarks: Some(landmarks),
+                    r#box: Some(hand_box),
+                    score: palm.score,
+                })
+            }
+            Err(e) => {
+                tracing::warn!("landmarker stage skipped for hand {slot}: {e}");
+                self.caches[slot].clear();
+                Ok(HandDetection {
+                    landmarks: None,
+                    r#box: Some(hand_box),
+                    score: palm.score,
+                })
+            }
+        }
     }
 }
 
@@ -818,6 +959,72 @@ mod tests {
         assert_eq!(non_overlapping(&hands, 1.0, MAX_HANDS).len(), 2);
         assert_eq!(non_overlapping(&hands, 0.25, MAX_HANDS).len(), 2);
         assert_eq!(non_overlapping(&hands, 2.0, MAX_HANDS).len(), 1);
+    }
+
+    #[test]
+    /// A hand keeps the slot its palm is nearest to, so the pitch hand and the
+    /// modulator do not trade identities when the detector's scores swap.
+    fn a_hand_stays_in_the_slot_it_is_nearest_to() {
+        let mut anchors = [Some((200.0, 240.0)), Some((500.0, 240.0))];
+        let slots = match_to_slots(
+            [
+                Some(palm(410.0, 240.0, 50.0, 0.70)),
+                Some(palm(210.0, 240.0, 50.0, 0.95)),
+            ],
+            &mut anchors,
+            200.0,
+        );
+        assert!(
+            (slots[0].unwrap().cx - 210.0).abs() < 1e-9,
+            "the near hand kept slot 0"
+        );
+        assert!(
+            (slots[1].unwrap().cx - 410.0).abs() < 1e-9,
+            "the far hand kept slot 1"
+        );
+    }
+
+    #[test]
+    /// A hand that appears nowhere near either anchor cannot steal a slot from the
+    /// hand that has been there all along; it takes the free one.
+    fn a_new_hand_takes_a_free_slot_rather_than_the_occupied_one() {
+        let mut anchors = [Some((200.0, 240.0)), None];
+        let slots = match_to_slots(
+            [
+                Some(palm(205.0, 240.0, 50.0, 0.95)),
+                Some(palm(600.0, 240.0, 50.0, 0.60)),
+            ],
+            &mut anchors,
+            168.0,
+        );
+        assert!(slots[0].is_some(), "the original hand keeps slot 0");
+        assert!(slots[1].is_some(), "the newcomer fills the empty slot");
+        assert!((anchors[0].unwrap().0 - 205.0).abs() < 1e-9);
+        assert!((anchors[1].unwrap().0 - 600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    /// With nothing remembered, hands land in slot order, and a frame with one hand
+    /// fills exactly one slot.
+    fn the_first_frame_seats_hands_in_order() {
+        let mut anchors = [None; MAX_HANDS];
+        let slots = match_to_slots(
+            [
+                Some(palm(300.0, 240.0, 50.0, 0.9)),
+                Some(palm(100.0, 240.0, 50.0, 0.7)),
+            ],
+            &mut anchors,
+            168.0,
+        );
+        assert_eq!(slots.iter().filter(|s| s.is_some()).count(), 2);
+
+        let mut fresh = [None; MAX_HANDS];
+        let one = match_to_slots(
+            [Some(palm(300.0, 240.0, 50.0, 0.9)), None],
+            &mut fresh,
+            168.0,
+        );
+        assert!(one[0].is_some() && one[1].is_none(), "one hand, one slot");
     }
 
     #[test]
@@ -996,12 +1203,14 @@ mod tests {
                 Err(_) => break,
             };
             frames += 1;
-            let result = tracker.process_frame(&frame).unwrap();
-            if let Some(landmarks) = &result.hand_landmarks {
-                seen += 1;
-                landmark_counts.push(landmarks.len());
-                if let Some(b) = result.r#box {
-                    boxes.push((b, result.frame_size));
+            let result = tracker.process_frame(&frame, 0).unwrap();
+            if let Some(hand) = result.pitch() {
+                if let Some(landmarks) = &hand.landmarks {
+                    seen += 1;
+                    landmark_counts.push(landmarks.len());
+                    if let Some(b) = hand.r#box {
+                        boxes.push((b, result.frame_size));
+                    }
                 }
             }
         }

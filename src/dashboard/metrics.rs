@@ -151,6 +151,31 @@ pub struct HandView {
     pub geometry: HandGeometry,
 }
 
+/// The modulator hand: where it is, how close it looks, and how far it is from the
+/// hand playing pitch. Written by the frame loop out of the second estimator.
+#[derive(Debug, Clone, Default)]
+pub struct ModulatorView {
+    pub detected: bool,
+    pub confidence: f32,
+    pub landmarks: Vec<Landmark>,
+    pub hand_box: Option<(f32, f32, f32, f32)>,
+    /// Palm centre, frame pixels.
+    pub centre: (f32, f32),
+    /// How close the modulator looks, 0.0 (far) .. 1.0 (at the lens).
+    pub proximity: f32,
+    /// Palm-centre distance to the pitch hand, in pixels.
+    pub gap_px: f32,
+    /// That distance divided by the distance at which the two hand boxes touch: 1.0 is
+    /// touching, and `GAP_WIDE` is the top of the effect band.
+    pub gap_ratio: f32,
+    /// That ratio through the inter-hand band, 0.0 (boxes touching) .. 1.0 (the top of
+    /// the band) - the number the vibrato depth and echo feedback read. It is normalised
+    /// by the hands' own sizes, so it is the same at any resolution or distance.
+    pub gap_level: f32,
+    /// Milliseconds since the modulator was last seen.
+    pub lost_ms: u64,
+}
+
 /// What is sounding, including the keyboard glow. Owned by the frame loop.
 #[derive(Debug, Clone)]
 pub struct SoundView {
@@ -258,6 +283,7 @@ pub struct StatusView {
 #[derive(Debug, Clone, Default)]
 pub struct FrameMetrics {
     pub hand: HandView,
+    pub modulator: ModulatorView,
     pub sound: SoundView,
     pub perf: PerfView,
     pub scene: SceneView,

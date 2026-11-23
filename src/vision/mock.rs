@@ -9,7 +9,7 @@
 //!
 //! Everything here is geometry only - no pixels, no model, no I/O.
 
-use crate::core::{HandDetectionResult, Landmark};
+use crate::core::{HandDetection, HandDetectionResult, Landmark};
 
 /// Mock mode emulates a 30 fps camera so the telemetry looks real. The loop uses a
 /// deadline rather than a flat sleep: macOS `thread::sleep(33 ms)` actually returns
@@ -18,15 +18,11 @@ pub const MOCK_CADENCE: std::time::Duration = std::time::Duration::from_millis(3
 
 /// A synthetic, moving hand shaped like a real one: a wrist, a thumb and four
 /// fingers, each a chain of joints that curls together over time.
-pub fn synthetic_detection(seconds: f64) -> HandDetectionResult {
-    let t = seconds as f32;
-    // The centre sweeps almost the full 640 px view so the mock hand walks the
-    // whole keyboard, low notes on the left and high notes on the right.
-    let cx = 320.0 + 240.0 * (t * 0.7).sin();
-    let cy = 250.0 + 50.0 * (t * 0.45).cos();
-    let curl = 0.45 + 0.45 * (t * 1.1).sin();
-    let thumb_angle = 55.0 + 25.0 * (t * 0.8).cos();
-
+///
+/// `cx`/`cy` place the hand in the frame, so the same generator can produce the
+/// pitch hand and the modulator hand - the second hand is built by the same code,
+/// just at a different position and phase.
+fn synthetic_hand(cx: f32, cy: f32, t: f32, curl: f32, thumb_angle: f32) -> HandDetection {
     let wrist = Landmark {
         x: cx,
         y: cy + 140.0,
@@ -60,11 +56,53 @@ pub fn synthetic_detection(seconds: f64) -> HandDetectionResult {
         maxy = maxy.max(landmark.y);
     }
 
-    HandDetectionResult {
-        hand_landmarks: Some(landmarks),
+    HandDetection {
+        landmarks: Some(landmarks),
         r#box: Some((minx, miny, maxx - minx, maxy - miny)),
-        frame_size: (640, 480),
         score: 0.85 + 0.12 * (t * 0.6).sin(),
+    }
+}
+
+/// The mock run's two hands.
+///
+/// The pitch hand sweeps almost the full 640 px view so the mock walk covers the
+/// whole keyboard, low notes on the left and high notes on the right. The modulator
+/// hand sits low in the frame and moves on a slower, different phase, so the two
+/// hands are unambiguously distinct and their separation changes over the run -
+/// which is what the inter-hand effect sources need to be exercised by the tests.
+///
+/// `pitch_slot` is which of the two hands plays notes; `UiCommand::SwapHands` trades
+/// them, so the hands come back in role order rather than the order they were built in.
+pub fn synthetic_detection(seconds: f64, pitch_slot: usize) -> HandDetectionResult {
+    let t = seconds as f32;
+    let pitch_x = 320.0 + 240.0 * (t * 0.7).sin();
+    let pitch_y = 250.0 + 50.0 * (t * 0.45).cos();
+    let modulator_x = 480.0 + 120.0 * (t * 0.31).cos();
+    let modulator_y = 380.0 + 60.0 * (t * 0.9).sin();
+
+    let mut hands = vec![
+        synthetic_hand(
+            pitch_x,
+            pitch_y,
+            t,
+            0.45 + 0.45 * (t * 1.1).sin(),
+            55.0 + 25.0 * (t * 0.8).cos(),
+        ),
+        synthetic_hand(
+            modulator_x,
+            modulator_y,
+            t * 1.3,
+            0.45 + 0.45 * (t * 0.7 + 1.0).sin(),
+            55.0 + 25.0 * (t * 1.1 + 2.0).cos(),
+        ),
+    ];
+    if pitch_slot == 1 {
+        hands.reverse();
+    }
+
+    HandDetectionResult {
+        hands,
+        frame_size: (640, 480),
         timings: Default::default(),
     }
 }
@@ -102,19 +140,44 @@ mod tests {
 
     #[test]
     fn synthetic_hand_has_21_landmarks() {
-        let detection = synthetic_detection(1.0);
-        let landmarks = detection.hand_landmarks.as_ref().unwrap();
+        let detection = synthetic_detection(1.0, 0);
+        let landmarks = detection.pitch().unwrap().landmarks.as_ref().unwrap();
         assert_eq!(
             landmarks.len(),
             21,
             "MediaPipe order: wrist, thumb x5, then 4 x 4"
         );
-        assert!(detection.r#box.is_some(), "the mock hand carries a box");
+        assert!(
+            detection.pitch().unwrap().r#box.is_some(),
+            "the mock hand carries a box"
+        );
+    }
+
+    #[test]
+    /// The mock run has two hands, and they are not the same hand: the modulator is
+    /// far enough from the pitch hand that the slot assignment cannot confuse them.
+    fn the_mock_run_reports_two_distinct_hands() {
+        let detection = synthetic_detection(1.0, 0);
+        assert_eq!(detection.hands.len(), 2, "mock mode drives both slots");
+        let pitch = detection.pitch().unwrap().r#box.unwrap();
+        let modulator = detection.modulator().unwrap().r#box.unwrap();
+        let (px, py) = crate::core::box_centre(pitch);
+        let (mx, my) = crate::core::box_centre(modulator);
+        let distance = ((px - mx).powi(2) + (py - my).powi(2)).sqrt();
+        assert!(
+            distance > 60.0,
+            "the mock hands sit at ({px:.0}, {py:.0}) and ({mx:.0}, {my:.0})"
+        );
     }
 
     #[test]
     fn synthetic_hand_geometry_is_sane() {
-        let landmarks = synthetic_detection(2.0).hand_landmarks.unwrap();
+        let landmarks = synthetic_detection(2.0, 0)
+            .pitch()
+            .unwrap()
+            .landmarks
+            .clone()
+            .unwrap();
         let geometry = hand_geometry(&landmarks).unwrap();
         assert!(geometry.palm_length > 0.0);
         assert!(geometry.spread > 0.0);
@@ -126,10 +189,24 @@ mod tests {
     fn the_synthetic_hand_curls_over_time() {
         // The whole point of the mock is that it moves: a curling finger changes the
         // thumb-index spread, which is what the volume is derived from.
-        let open =
-            hand_geometry(synthetic_detection(0.4).hand_landmarks.as_ref().unwrap()).unwrap();
-        let closed =
-            hand_geometry(synthetic_detection(1.9).hand_landmarks.as_ref().unwrap()).unwrap();
+        let open = hand_geometry(
+            synthetic_detection(0.4, 0)
+                .pitch()
+                .unwrap()
+                .landmarks
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let closed = hand_geometry(
+            synthetic_detection(1.9, 0)
+                .pitch()
+                .unwrap()
+                .landmarks
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
         assert!(
             (open.spread - closed.spread).abs() > 0.05,
             "the mock hand has to actually move, or the tests prove nothing"
@@ -140,8 +217,18 @@ mod tests {
     fn the_same_frame_number_gives_the_same_hand() {
         // `Landmark` is not `PartialEq` - the coordinates are floats - so the
         // comparison is on the numbers themselves.
-        let a = synthetic_detection(2.0).hand_landmarks.unwrap();
-        let b = synthetic_detection(2.0).hand_landmarks.unwrap();
+        let a = synthetic_detection(2.0, 0)
+            .pitch()
+            .unwrap()
+            .landmarks
+            .clone()
+            .unwrap();
+        let b = synthetic_detection(2.0, 0)
+            .pitch()
+            .unwrap()
+            .landmarks
+            .clone()
+            .unwrap();
         for (left, right) in a.iter().zip(b.iter()) {
             assert_eq!((left.x, left.y), (right.x, right.y));
         }

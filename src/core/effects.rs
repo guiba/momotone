@@ -33,6 +33,20 @@ pub const VIBRATO_MAX_CENTS: f32 = 50.0;
 pub const DELAY_MAX_MS: f32 = 600.0;
 pub const FEEDBACK_MAX: f32 = 0.6;
 
+/// Two hand boxes whose centres are this many "touching distances" apart are touching:
+/// `touching` is the sum of the two palm radii, i.e. the distance at which the boxes
+/// just meet. One hand's box overlapping the other's reads zero.
+pub const GAP_TOUCHING: f32 = 1.0;
+/// ... and this many times further apart saturates the inter-hand band.
+///
+/// Measured, not guessed. Across `fixtures/2_hands_640.mp4` and the native 1620x1080
+/// recording of the same clip the palm centres run 0.8-1.4 times the sum of the two palm
+/// radii (mean 1.1, p95 1.36) - the two are the same numbers at both resolutions, which
+/// is the point of normalising by the hands rather than the frame. 1.5 covers the whole
+/// observed sweep with headroom for a hand pushed to the far edge of the view, without
+/// making the band so wide that it never saturates.
+pub const GAP_WIDE: f32 = 1.5;
+
 /// Thumb-tip to index-tip distance, normalised by palm length, that counts as a
 /// fully open hand. A pinched hand sits near `SPREAD_CLOSED`; a relaxed hand at
 /// desk distance lands around 0.7.
@@ -202,34 +216,57 @@ pub fn openness(spread: f32) -> f32 {
     ((spread - SPREAD_CLOSED) / (SPREAD_OPEN - SPREAD_CLOSED)).clamp(0.0, 1.0)
 }
 
+/// How far apart two hands are, on the 0..1 band the inter-hand sources read.
+///
+/// The distance is normalised by the sum of the two palm radii rather than by the
+/// frame size, which makes it scale-free: hands at the same physical separation read
+/// the same level whether the camera is 640x480 or 1620x1080, and whether the player
+/// sits close or far. `0.0` is the boxes touching, `1.0` is `GAP_WIDE` times that apart.
+pub fn gap_level(distance_px: f32, touching_px: f32) -> f32 {
+    let ratio = distance_px / touching_px.max(1.0);
+    ((ratio - GAP_TOUCHING) / (GAP_WIDE - GAP_TOUCHING)).clamp(0.0, 1.0)
+}
+
 /// Sources in, parameters out.
 ///
-/// In this iteration the pitch hand stands in for the modulator: proximity, height,
-/// openness and horizontal position all come from the one hand the tracker reports.
-/// When a second hand arrives, these sources move to it and the inter-hand gap
-/// replaces `spread` as the vibrato depth - the mapping stays the same shape.
-pub fn modulation_from_hand(
+/// Each effect has exactly one source, so moving one hand does not drag three
+/// unrelated parameters with it:
+///
+/// | effect | source |
+/// | :--- | :--- |
+/// | lowpass cutoff | driver proximity (near = bright) |
+/// | vibrato rate | driver height in the frame (high = faster) |
+/// | vibrato depth | how far apart the two hands are |
+/// | delay time | driver horizontal position |
+/// | delay feedback | how far apart the two hands are |
+///
+/// `gap` is already a 0..1 level. A run with one hand has no inter-hand distance to
+/// read, so the caller passes the pitch hand's openness instead - which is exactly
+/// what the single-hand instrument used before the second hand existed.
+pub fn modulation_from_hands(
     enabled: EffectMask,
     proximity: f32,
     height: f32,
-    spread: f32,
+    gap: f32,
     x_position: f32,
 ) -> Modulation {
     let proximity = proximity.clamp(0.0, 1.0);
     let height = height.clamp(0.0, 1.0);
     let x_position = x_position.clamp(0.0, 1.0);
-    let open = openness(spread);
+    let gap = gap.clamp(0.0, 1.0);
 
     Modulation {
         enabled,
         // A hand pushed towards the lens opens the filter; one backing off darkens it.
         cutoff_hz: CUTOFF_MIN_HZ + (CUTOFF_MAX_HZ - CUTOFF_MIN_HZ) * proximity,
-        // Higher in the frame = faster wobble; a wider-open hand = deeper wobble.
+        // Higher in the frame = faster wobble.
         vibrato_hz: VIBRATO_RATE_MIN_HZ + (VIBRATO_RATE_MAX_HZ - VIBRATO_RATE_MIN_HZ) * height,
-        vibrato_cents: VIBRATO_MAX_CENTS * open,
+        // Hands spread wide = deeper wobble; hands together = none.
+        vibrato_cents: VIBRATO_MAX_CENTS * gap,
         // Sweeping the hand across the frame walks the delay time.
         delay_ms: DELAY_MAX_MS * x_position,
-        feedback: FEEDBACK_MAX * proximity,
+        // Widening the gap also feeds the echo back further.
+        feedback: FEEDBACK_MAX * gap,
     }
 }
 
@@ -335,19 +372,19 @@ mod tests {
 
     #[test]
     fn the_band_saturates_at_both_ends() {
-        let far = modulation_from_hand(EffectMask::ALL, 0.0, 0.0, 0.0, 0.0);
+        let far = modulation_from_hands(EffectMask::ALL, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(far.cutoff_hz, CUTOFF_MIN_HZ);
         assert_eq!(far.vibrato_cents, 0.0);
         assert_eq!(far.delay_ms, 0.0);
 
         // Out-of-range inputs clamp instead of running past the band.
-        let beyond = modulation_from_hand(EffectMask::ALL, 4.0, 2.0, 9.0, 2.0);
+        let beyond = modulation_from_hands(EffectMask::ALL, 4.0, 2.0, 9.0, 2.0);
         assert_eq!(beyond.cutoff_hz, CUTOFF_MAX_HZ);
         assert_eq!(beyond.vibrato_hz, VIBRATO_RATE_MAX_HZ);
         assert_eq!(beyond.vibrato_cents, VIBRATO_MAX_CENTS);
         assert_eq!(beyond.delay_ms, DELAY_MAX_MS);
 
-        let behind = modulation_from_hand(EffectMask::ALL, -1.0, -1.0, -1.0, -1.0);
+        let behind = modulation_from_hands(EffectMask::ALL, -1.0, -1.0, -1.0, -1.0);
         assert_eq!(
             behind.cutoff_hz, CUTOFF_MIN_HZ,
             "a hand below the band sits at the bottom of it"
@@ -357,25 +394,56 @@ mod tests {
 
     #[test]
     fn each_source_moves_exactly_one_parameter() {
-        let baseline = modulation_from_hand(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
+        let baseline = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
 
-        let closer = modulation_from_hand(EffectMask::ALL, 0.9, 0.5, 0.7, 0.5);
+        let closer = modulation_from_hands(EffectMask::ALL, 0.9, 0.5, 0.7, 0.5);
         assert!(closer.cutoff_hz > baseline.cutoff_hz);
         assert_eq!(
             closer.delay_ms, baseline.delay_ms,
             "proximity must not move delay time"
         );
 
-        let wider = modulation_from_hand(EffectMask::ALL, 0.5, 0.5, 0.7, 0.9);
+        let wider = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.9);
         assert!(wider.delay_ms > baseline.delay_ms);
         assert_eq!(wider.cutoff_hz, baseline.cutoff_hz);
+    }
+
+    #[test]
+    /// The inter-hand band is measured in the hands' own sizes, not in pixels, so the
+    /// same gesture reads the same level at any resolution or distance.
+    fn the_gap_band_is_scale_free() {
+        // Boxes 100 px wide each touch at 100 px centre-to-centre.
+        assert_eq!(
+            gap_level(80.0, 100.0),
+            0.0,
+            "overlapping hands are not apart"
+        );
+        assert_eq!(
+            gap_level(100.0, 100.0),
+            0.0,
+            "touching is the bottom of the band"
+        );
+        assert_eq!(
+            gap_level(100.0 * GAP_WIDE, 100.0),
+            1.0,
+            "the band saturates at GAP_WIDE times the touching distance"
+        );
+        assert_eq!(
+            gap_level(125.0, 100.0),
+            0.5,
+            "half way to saturation is half the band"
+        );
+        assert_eq!(gap_level(90.0, 100.0), 0.0, "still inside the boxes");
+
+        // Same physical gesture, double the resolution: double the pixels, same level.
+        assert_eq!(gap_level(400.0, 200.0), gap_level(200.0, 100.0));
     }
 
     #[test]
     fn blending_slides_to_neutral_rather_than_snapping() {
         // One second of frames at the default 450 ms time constant: alpha is
         // frame_interval / fade, so 30 frames is about two time constants.
-        let mut current = modulation_from_hand(EffectMask::ALL, 1.0, 1.0, 1.0, 1.0);
+        let mut current = modulation_from_hands(EffectMask::ALL, 1.0, 1.0, 1.0, 1.0);
         let target = Modulation::neutral_with(EffectMask::ALL);
         for _ in 0..30 {
             current = blend(current, target, 0.073);
@@ -393,7 +461,7 @@ mod tests {
     #[test]
     fn an_enabled_stage_is_adopted_at_once_while_its_level_fades() {
         let current = Modulation::neutral();
-        let target = modulation_from_hand(EffectMask::from_bits(2), 0.5, 0.5, 0.5, 0.5);
+        let target = modulation_from_hands(EffectMask::from_bits(2), 0.5, 0.5, 0.5, 0.5);
         let blended = blend(current, target, 0.1);
         assert!(
             blended.enabled.is_on(Effect::Vibrato),
@@ -407,14 +475,14 @@ mod tests {
 
     #[test]
     fn noise_does_not_ping_the_bus() {
-        let a = modulation_from_hand(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
-        let b = modulation_from_hand(EffectMask::ALL, 0.5002, 0.5002, 0.7001, 0.5001);
+        let a = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
+        let b = modulation_from_hands(EffectMask::ALL, 0.5002, 0.5002, 0.7001, 0.5001);
         assert!(
             !is_different(&a, &b),
             "sub-threshold jitter is not a change"
         );
 
-        let moved = modulation_from_hand(EffectMask::ALL, 0.6, 0.5, 0.7, 0.5);
+        let moved = modulation_from_hands(EffectMask::ALL, 0.6, 0.5, 0.7, 0.5);
         assert!(is_different(&a, &moved), "a real move is a change");
     }
 
@@ -423,8 +491,8 @@ mod tests {
     /// a wobble that moves the echo by less than a rounding error, or the vibrato by
     /// less than a cent, is not a change worth sending.
     fn the_deadbands_ignore_jitter_smaller_than_a_cent_or_a_millisecond() {
-        let steady = modulation_from_hand(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
-        let wobbling = modulation_from_hand(
+        let steady = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
+        let wobbling = modulation_from_hands(
             EffectMask::ALL,
             0.5 + 0.0002,
             0.5 + 0.0002,

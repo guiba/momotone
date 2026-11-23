@@ -58,14 +58,15 @@ struct Args {
     #[arg(long, value_enum, default_value = "mediapipe")]
     model: Model,
 
-    /// What square the palm detector sees. `crop` is today's behaviour: the
-    /// `min(W,H)` window that follows the palm. `frame` letterboxes the whole image
-    /// into the same 192x192 buffer, so every anchor in the frame is scored. `both`
-    /// runs the crop as usual and scores the whole frame alongside it - the
-    /// measurement the two-hand decision needs, because it reports how many hands
-    /// each window sees without changing what the instrument does.
-    #[arg(long, value_enum, default_value = "crop")]
-    detector_window: Detector,
+    /// How many hands the tracker looks for. `one` is the original behaviour: a
+    /// `min(W,H)` square slid to the palm seen last frame, reporting a single hand.
+    /// `two` is the instrument: the pitch hand still comes from that anchored crop,
+    /// which is the more sensitive window, and a second whole-frame pass finds the
+    /// modulator the crop physically cannot reach. `probe` runs both windows and
+    /// prints the comparison without changing what the instrument does - it is how
+    /// the two-hand decision was measured.
+    #[arg(long, value_enum, default_value = "two")]
+    hands: Hands,
 
     /// ONNX Runtime intra-op threads. 0 leaves the runtime default (one thread per
     /// core); a positive number pins the pool, which is worth trying if the model's
@@ -260,10 +261,10 @@ struct Args {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
-enum Detector {
-    Crop,
-    Frame,
-    Both,
+enum Hands {
+    One,
+    Two,
+    Probe,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
@@ -296,10 +297,10 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             args.score_threshold,
             !args.landmarker_always,
             args.ort_threads,
-            match args.detector_window {
-                Detector::Crop => DetectorWindow::Anchored,
-                Detector::Frame => DetectorWindow::FullFrame,
-                Detector::Both => DetectorWindow::Both,
+            match args.hands {
+                Hands::One => DetectorWindow::Anchored,
+                Hands::Two => DetectorWindow::TwoHands,
+                Hands::Probe => DetectorWindow::Probe,
             },
         ),
         Model::Yolo => HandTracker::yolo_pose(
@@ -393,7 +394,8 @@ fn main() -> Result<()> {
         let mut tracker = build_tracker(&args).context("Failed to initialize hand tracker")?;
 
         let mut frame = Frame::read(path)?;
-        let detection = tracker.process_frame(&frame)?;
+        // Single image: no UI to trade roles with, so slot 0 plays pitch.
+        let detection = tracker.process_frame(&frame, 0)?;
         Visualizer::new().draw_skeleton(&mut frame, &detection);
 
         let out = args
@@ -403,10 +405,14 @@ fn main() -> Result<()> {
         frame.write(&out)?;
 
         tracing::info!(
-            "detection: box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",
-            detection.r#box,
-            detection.score,
-            detection.hand_landmarks.as_ref().map_or(0, |l| l.len()),
+            "detection: {} hand(s); pitch box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",
+            detection.hands.len(),
+            detection.pitch().and_then(|h| h.r#box),
+            detection.pitch().map_or(0.0, |h| h.score),
+            detection
+                .pitch()
+                .and_then(|h| h.landmarks.as_ref())
+                .map_or(0, |l| l.len()),
             detection.timings.detector_us,
             detection.timings.landmarker_us,
         );

@@ -21,6 +21,12 @@ pub struct TraceFrame {
     pub frequency: Option<f32>,
     pub volume: f32,
     pub detected: bool,
+    /// How many hands the tracker resolved this frame, 0..MAX_HANDS. The pitch hand
+    /// is what is heard, so a run that gains a second hand must show it here or the
+    /// two-hand feature is invisible to the golden trace. `#[serde(default)]` keeps
+    /// traces recorded before the field existed readable.
+    #[serde(default)]
+    pub hands: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,6 +42,7 @@ impl Trace {
             frequency: snapshot.sound.frequency,
             volume: round2(snapshot.sound.volume),
             detected: snapshot.hand.detected,
+            hands: usize::from(snapshot.hand.detected) + usize::from(snapshot.modulator.detected),
         });
     }
 
@@ -91,6 +98,7 @@ mod tests {
             frequency: None,
             volume,
             detected: true,
+            hands: 1,
         }
     }
 
@@ -113,6 +121,24 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("frame 1"));
         assert!(lines[0].contains("67") && lines[0].contains("69"));
+    }
+
+    #[test]
+    /// A second hand in view is recorded, so the golden trace can tell a two-hand run
+    /// from a one-hand one without a screenshot.
+    fn a_second_hand_shows_up_in_the_trace() {
+        let mut snapshot = FrameMetrics::default();
+        snapshot.hand.detected = true;
+        snapshot.modulator.detected = false;
+        let mut one = Trace::default();
+        one.push(&snapshot);
+        assert_eq!(one.frames[0].hands, 1);
+
+        snapshot.modulator.detected = true;
+        let mut two = Trace::default();
+        two.push(&snapshot);
+        assert_eq!(two.frames[0].hands, 2);
+        assert!(!diff(&one, &two).is_empty(), "the extra hand is a diff");
     }
 
     #[test]

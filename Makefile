@@ -35,7 +35,8 @@ CLIP_FRAMES ?= 120
 
 .PHONY: help verify lint check clippy clippy-fix fmt fmt-check test bench build run \
         run-release mock ascii headless budget yolo image fixture trace-check record trace \
-        probe probe-single \
+        probe probe-single probe-640 \
+        hands-640 hands-trace hands-check \
         mock-trace mock-trace-check \
         stats clean
 
@@ -54,6 +55,7 @@ help:
 	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
 	@echo "  fixture  fixture | trace-check | record | trace"
 	@echo "  probe    probe | probe-single | probe-640   (crop vs whole-frame detection counts)"
+	@echo "  hands    hands-640 | hands-trace | hands-check  (the two-hand fixture)"
 	@echo "  mock     mock-trace | mock-trace-check"
 	@echo "  misc     stats | budget | clean"
 
@@ -149,15 +151,14 @@ trace:
 
 ## --- detection probe ------------------------------------------------------
 
-## Measure the palm detector's two windows on one clip: the palm-anchored crop stays
-## the behaviour, the whole frame is scored alongside it, and the run ends with the
-## counts - detections, anchors above the gate, and hands found at each separation.
-## Costs one extra detector pass per frame, so it is a measurement tool, not a mode
-## to run while playing.
+## Measure the palm detector's two windows on one clip: the anchored crop and the whole
+## frame are both scored, and the run ends with the counts - detections, anchors above
+## the gate, and hands found at each separation. Costs two detector passes per frame, so
+## it is a measurement tool, not a mode to run while playing.
 HAND_CLIP ?= fixtures/2_hands_clip.mp4
 probe:
 	@test -f $(HAND_CLIP) || { echo "no $(HAND_CLIP)"; exit 1; }
-	$(CARGO) run --release -- --no-ui --video $(HAND_CLIP) --max-frames $(CLIP_FRAMES) --detector-window both
+	$(CARGO) run --release -- --no-ui --video $(HAND_CLIP) --max-frames $(CLIP_FRAMES) --hands probe
 
 ## Same, on the one-hand clip: the number that decides whether the whole-frame window
 ## loses detections compared with the crop.
@@ -171,6 +172,26 @@ probe-640:
 	@test -f $(HAND_CLIP) || { echo "no $(HAND_CLIP)"; exit 1; }
 	ffmpeg -y -i $(HAND_CLIP) -vf scale=640:480 -pix_fmt yuv420p fixtures/2_hands_640.mp4
 	$(MAKE) probe HAND_CLIP=fixtures/2_hands_640.mp4
+
+## --- two-hand fixture -----------------------------------------------------
+
+## The native two-hand recording is 1620x1080; the pipeline captures at 640x480. This
+## downscales it into `fixtures/2_hands_640.mp4`, the resolution the instrument runs at.
+HANDS_CLIP ?= fixtures/2_hands_640.mp4
+HANDS_TRACE ?= fixtures/hands_trace.json
+hands-640:
+	@test -f $(HAND_CLIP) || { echo "no $(HAND_CLIP)"; exit 1; }
+	ffmpeg -y -i $(HAND_CLIP) -vf scale=640:480 -pix_fmt yuv420p $(HANDS_CLIP)
+
+## Run the two-hand clip headlessly and write its golden trace.
+hands-trace:
+	@test -f $(HANDS_CLIP) || { echo "no $(HANDS_CLIP) - run \`make hands-640\` first"; exit 1; }
+	$(CARGO) run --release -- --no-ui --video $(HANDS_CLIP) --max-frames $(CLIP_FRAMES) --trace $(HANDS_TRACE)
+
+hands-check:
+	@test -f $(HANDS_CLIP) || { echo "no $(HANDS_CLIP) - run \`make hands-640\` first"; exit 1; }
+	@test -f $(HANDS_TRACE) || { echo "no $(HANDS_TRACE) - run \`make hands-trace\` first"; exit 1; }
+	$(CARGO) run --release -- --no-ui --video $(HANDS_CLIP) --max-frames $(CLIP_FRAMES) --expect $(HANDS_TRACE)
 
 ## --- mock trace -----------------------------------------------------------
 
