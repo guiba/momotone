@@ -78,7 +78,7 @@ louder. `Ctrl+C` stops.
 | `--waveform sine\|triangle\|square\|saw` | synthesiser timbre |
 | `--effects lowpass,vibrato,delay` | which stages are in the sound chain (default: `lowpass`; `none` for a bare note) |
 | `--model mediapipe\|yolo` | which ONNX backend |
-| `--detector-window crop\|frame\|both` | what square the palm detector sees; `both` is a measurement mode that scores both and prints the comparison |
+| `--hands one\|two\|probe` | how many hands the tracker looks for. `two` is the default: the anchored crop tracks the hand playing notes and a whole-frame pass finds the second one. `one` is the single-hand instrument; `probe` is the measurement mode below |
 | `--camera 1`, `--camera-width 1280` | pick the webcam and capture size |
 | `--debug` | DEBUG logging, per-frame timings |
 | `--no-ui`, `--ascii`, `--ascii-cols 70` | headless / ASCII renderer |
@@ -89,23 +89,46 @@ iced's window/compositor dumps, which are silenced by default).
 
 ## Measuring the detector window
 
-The palm detector samples a 192×192 square. Today that square is anchored on the palm
-seen last frame, which is great for one hand and blind to a second one. `--detector-window
-both` runs the anchored crop *and* a letterboxed whole-frame pass over the same frames and
-prints, per window: frames with a hand, mean best score, hands per frame at each NMS
-separation, frames with more than one hand, and µs per detector frame.
+The palm detector samples a 192×192 square. Anchoring that square on the palm seen last
+frame is great for one hand and blind to a second one, so `--hands probe` runs the anchored
+crop *and* a letterboxed whole-frame pass over the same frames and prints, per window:
+frames with a hand, mean best score, hands per frame at each NMS separation, frames with
+more than one hand, and µs per detector frame.
 
 ```bash
 make probe          # fixtures/2_hands_clip.mp4, 120 frames
 make probe-single   # fixtures/hand_clip.mp4 - the one-hand regression
 ```
 
-This is a measuring mode, not a playing mode: `both` runs three detector passes per frame.
-`crop` remains the default.
+This is a measuring mode, not a playing mode: `probe` runs two detector passes per frame.
+`--hands two` is the default for playing.
+
+## Two hands
+
+The tracker reports two hands: the **pitch hand**, which plays notes, and the **modulator
+hand**, which shapes the sound. `--hands one` returns to the single-hand instrument.
+
+The pitch hand is found by the palm-anchored crop - the window that magnifies the hand -
+and the modulator by a letterboxed whole-frame pass, because a `min(W, H)` square slid to
+one hand cannot span two hands that are far apart. Both then run the same landmark model
+with their own reuse cache, so the second hand is detected exactly like the first.
+
+With one hand in view the instrument behaves exactly as it always did: that hand plays
+pitch *and* drives the whole effect chain. With two, the modulator's proximity, height and
+horizontal position drive the chain, and the distance between the palms drives vibrato
+depth and echo feedback. Hands keep their identities across frames, and the dashboard's
+HANDS card has a **swap hands** button to trade the roles - nothing promotes a hand
+automatically, which could hijack the melody mid-sweep.
+
+```bash
+make hands-640      # downscale fixtures/2_hands_clip.mp4 to the capture resolution
+make hands-trace    # record the two-hand golden trace
+make hands-check    # fail if the two-hand run drifts
+```
 
 ## Tests
 
-`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (208 tests),
+`make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (220 tests),
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ```bash

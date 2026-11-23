@@ -1,7 +1,12 @@
 # Two-Hand Design Analysis — momotone
 
 *A plan for adding a second hand, and for what that second hand could do to the sound.*
-No code touched. Options, trade-offs, measured costs, and a recommended sequence.
+Options, trade-offs, measured costs, and a recommended sequence.
+
+**Status:** all three PRs in §11 are built. PR 1 (`feat/effect-chain`) shipped the effect
+chain; PR 2 (`feat/detector-window-probe`) measured the two detector windows (§16); PR 3
+(`feat/two-hand-detection`) implements two-hand detection (§17). Where the build differed
+from this plan, §15 and §17 say so and why.
 
 Grounded in the current tree: `src/pipeline.rs` (1962 lines), `src/vision/tracker.rs` (697),
 `src/vision/yolo_pose.rs` (486), `src/gesture/estimator.rs` (480), `src/audio/synthesizer.rs` (486),
@@ -808,3 +813,59 @@ interval, and the landmarker adds ~4-5 ms on top.
 The alternative - one full-frame pass for everything - is cheaper but loses 11 detections
 in 200 frames on the hand that plays the melody. Losing a note is worse than losing a
 modifier, so the pitch hand keeps the crop.
+
+---
+
+## 17. PR 3 status - two hands, implemented
+
+Built on `feat/two-hand-detection`, verified with `make verify` (220 tests) and the three
+golden traces: `make mock-trace-check`, `make trace-check` and `make hands-check`.
+
+### What the code does
+
+| Piece | Where | What it does |
+| :--- | :--- | :--- |
+| Hand count | `src/core/mod.rs` | `MAX_HANDS = 2`; `HandDetection { landmarks, r#box, score }`; `HandDetectionResult.hands` in **role order**, with `pitch()` and `modulator()` |
+| Which window | `src/vision/tracker.rs` | `DetectorWindow { Anchored, TwoHands, Probe }`, chosen by `--hands one\|two\|probe`; default `two` |
+| Finding hands | `run_detector_window` + `non_overlapping` | every anchor above `--score-threshold` is collected best-first and merged by spatial NMS at the measured `HAND_SEPARATION = 1.0` |
+| Keeping identity | `match_to_slots` | a hand stays in the slot whose remembered palm is within `SLOT_MAX_JUMP = 0.35` of the frame's short side, so crossing hands does not swap roles |
+| Landmarking | `track_hand(frame, palm, slot)` | one function, run once per hand, each with its own `ReuseCache` - the second hand is processed exactly like the first |
+| Estimating | `src/gesture/estimator.rs` | `update(Option<&HandDetection>, frame_size)`; the pipeline holds `[HandEstimator; MAX_HANDS]` |
+| Roles | `src/pipeline.rs` | `pitch_slot: usize`, flipped by `UiCommand::SwapHands`; the anchored crop re-seeds from the pitch slot's palm |
+| Modulation | `src/core/effects.rs` | `modulation_from_hands(enabled, proximity, height, gap, x)`; `gap_level(distance, touching)` normalises palm distance by the sum of the palm radii so it is scale-free |
+| One-hand fallback | `update_modulation` | no second hand -> the pitch hand drives the chain and `gap` is that hand's openness - the pre-PR-3 behaviour, unchanged |
+| Drawing | `src/dashboard/skeleton.rs` | `draw_hand` with a `HandStyle`; the modulator uses `MODULATOR_COLORS` at 0.55 strength and carries a "mod" label on the palm |
+
+### Measurements
+
+Two-hand fixture, 120 frames, release build:
+
+| | one hand (`--hands one`) | two hands (`--hands two`) |
+| :--- | ---: | ---: |
+| inference p50 | 11.8 ms | 16.9 ms |
+| inference p95 | 14.8 ms | 19.2 ms |
+| inference max | 15.9 ms | 23.6 ms |
+
+The second hand costs about 5 ms per frame - one extra detector pass plus a landmarker run,
+both mostly hidden by the reuse cache - and the run still sits inside the 33 ms frame
+budget, so the budget guard never sheds the feed or the ASCII art.
+
+### The inter-hand band, measured
+
+`gap_level` divides the palm-centre distance by the sum of the two palm radii. Across both
+two-hand clips (108 sampled frames each) that ratio runs **0.8 - 1.4**, mean 1.1, p95 1.36 -
+and it is the *same* numbers at 640x480 and at the native 1620x1080, which is the point of
+normalising by the hands rather than the frame. `GAP_TOUCHING = 1.0` and `GAP_WIDE = 1.5`
+therefore put the whole observed sweep inside the band with headroom, instead of a 2.0 top
+that a real pair of hands at a desk never reaches.
+
+### What is deliberately not done yet
+
+- **Performance.** Two detector passes are the expensive part. A single full-frame pass
+  feeding both hands, or a palm-box-only modulator that skips the landmarker, are both
+  available next - the plan's measurements say the crop is worth keeping for the pitch hand,
+  so the cheap win is the modulator's landmark stage, not the detector.
+- **Polyphony.** Deferred, as in PR 1.
+- **MIDI modulation.** The audio chain has to be proven first.
+- **Automatic role assignment.** Deliberately manual: promotion on the fly would hijack the
+  melody mid-sweep.

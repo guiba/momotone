@@ -451,3 +451,22 @@ switched on.
 The delay ring is `DELAY_MAX_MS` (600 ms) long, allocated once in `Voice::idle` when the
 stream opens: ~106 KB at 44.1 kHz, never reallocated by the callback.
 
+
+## Two hands costs five milliseconds
+
+`--hands two` is the default, so these are the numbers the instrument actually runs with.
+Two-hand fixture (`fixtures/2_hands_640.mp4`, 120 frames, release build, MediaPipe):
+
+| Window | inference p50 | p95 | p99 | max |
+| :-- | --: | --: | --: | --: |
+| `--hands one` (anchored crop) | 11.8 ms | 14.8 ms | 15.4 ms | 15.9 ms |
+| `--hands two` (crop + whole frame) | 16.9 ms | 19.2 ms | 20.3 ms | 23.6 ms |
+
+The extra detector pass plus a second landmarker run costs ~5 ms per frame - under a sixth
+of the 33 ms budget. The whole-frame pass is not intrinsically more expensive than the crop
+(both sample into the same 192x192 buffer); the probe measured 9.7 ms vs 8.9 ms per pass on
+the native-resolution clip. Landmark reuse covers the modulator as well, so a still second
+hand costs no landmarker time at all.
+
+Detected hand counts on the two-hand clip, 120 frames: the crop reports a second hand in 1
+frame, the whole-frame pass in 105. That is the measurement PR 3 is built on.

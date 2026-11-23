@@ -89,10 +89,11 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 1. **Make the pose model cheap** — the HF export is frozen at 640×640. Re-export with `yolo export --imgsz 320 --dynamic` (needs torch/ultralytics, not installed here) or find a nano export; at 320 the FLOPs drop ~4×. **M**
 2. **Try RTMPose** — RTMDet-nano (76 AP, 0.31 GFLOPs, 320×320) + RTMPose-m hand5 (256×256) is the accuracy/latency sweet spot and already downloads to `/tmp/handbench`. Its SimCC heatmap head needs a different decoder than `decode_pose`. **M**
-3. **Multi-hand** — the pose decoder keeps only the highest-scoring detection; the strategy and dashboard assume one hand. **M**
+3. ~~Multi-hand~~ **done for MediaPipe** — the tracker reports two hands and the pipeline handles both. The pose decoder still keeps only the highest-scoring detection, so `--model yolo` is a one-hand instrument; `decode_pose` has the array in front of it and would need the same slot logic.
 
 ## Performance
 
+- **Make the second detector pass cheap** — `--hands two` runs two 192×192 detector passes per frame, which measured 16.9 ms p50 inference vs 11.8 ms with one hand. The modulator only needs its palm box for the current effect mapping, so skipping its landmarker (or running the whole-frame pass once and deriving both hands from it when the pitch hand is steady) is the obvious next saving. `bench/baseline.md` has the numbers. **S**
 - ~~Skip the landmarker when the hand is static~~ **done** — `ReuseCache` reuses the previous keypoints while the palm is within 3 px and 3 % of its last size, capped at 3 consecutive frames so a hand that reshapes without moving its palm is never served stale landmarks for long, and cleared whenever the detector loses the hand. The landmarker stage costs ~4-5.4 ms when it runs, so a still hand saves most of it. Verify with `cargo run -- --debug` (`palm steady, reusing landmarks`) and compare against `--landmarker-always`. **Note:** fps is camera-paced at ~30, so the win is latency and CPU headroom, not frame rate.
 - ~~Mirror flip in place~~ **done, but it was never a bottleneck** — the bindings take two separate borrows, so `flip(frame, frame, 1)` is not expressible; `WebcamSource` now carries a scratch `Mat` and swaps it with the captured frame, so the destination allocation happens once instead of every frame. Measured 0.0176 ms/frame (fresh Mat) vs 0.0174 ms/frame (reused scratch): the allocator recycles the 920 KB block, so the saving is ~0.0002 ms/frame. Flipping the landmarks' x instead of the pixels would skip the memcpy too, but that is at most 0.018 ms of a 31 ms frame — inference and the camera read are where the time is. Verified by `mirroring_reverses_the_columns` and `a_second_flip_reuses_the_scratch_buffer_instead_of_allocating`.
 - ~~Split capture, inference and sinks onto their own threads~~ **done** — `Pipeline::run` now runs three stages: the capture thread reads the webcam into a capacity-1 channel (a frame inference has not reached yet is dropped and counted, so inference never works on stale pixels), the pipeline thread does tracker → strategy → publish, and a sink thread owns the event receiver and drives the audio/MIDI outputs. `frame_ms` in `FrameMetrics` is now inference time only; `capture_ms`, `latency_ms`, `captured` and `dropped` sit next to it and the Advanced tab's Performance card shows them. `fps` is measured from the gap between published frames rather than the sum of the stages, since the stages now overlap. `Pipeline::tick` remains the single-frame inline path (mock mode and the tests use it). Run with `cargo run --release -- --debug --no-ui` and compare `inference` against `capture`: the loop is paced by whichever stage is slower.
@@ -124,7 +125,13 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - **Gesture chords** — combine several gestures into chord/scale selection. **M**
 - **Use `Landmark.z`** — depth is parsed but read by nothing; it is the cheapest way to distinguish "hand near the camera" from "hand far away" for volume. **M**
 - ~~Continuous/theremin strategy~~ **done** (finding 5) — `ThereminStrategy` emits the `Signal` payload the sinks already handled.
-- **Two hands** — the measurement is done (PR 2, `make probe`); the decision is made. Remaining work is the implementation: NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, and pitch/modulator roles. See `SECOND_HAND_PLAN.md` §16. **L**
+- ~~Two hands~~ **done** (PR 3) — two hand slots, one pitch hand and one modulator, detected
+  through the same code path: the anchored crop magnifies the pitch hand, a whole-frame pass
+  finds the modulator, and both run the identical landmarker with their own reuse cache. The
+  modulator drives the effect chain; the inter-hand gap drives vibrato depth and echo
+  feedback. Remaining: performance (two detector passes, ~16 ms of the 33 ms budget), polyphony,
+  and MIDI CC mapping. See `SECOND_HAND_PLAN.md` §17.
+- **Modulator gestures** — the modulator already has 21 landmarks and its own geometry; nothing reads them yet beyond proximity and palm distance. Finger extension on the modulator hand (open hand = more echo, fist = none) is the next obvious layer. **S**
 
 ### Output sinks
 - **OSC sink** — implement `Sink` and push it into `sinks` in `main.rs`. **S**

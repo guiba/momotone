@@ -5,14 +5,30 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
-- **A detector-window probe.** `--detector-window crop|frame|both` chooses the square the
-  palm detector sees. `crop` is the existing behaviour; `frame` letterboxes the whole image
-  into the same 192×192 buffer so every anchor in the frame is scored; `both` keeps the crop
-  as the behaviour and scores the whole frame alongside it, then prints the comparison -
-  detections, mean score, hands per frame at each NMS separation, and µs/frame. `make probe`
-  and `make probe-single` run it on the two fixtures. It is a measuring mode, not a playing
-  mode: two extra detector passes per frame. The measurement it produced is what settled the
-  two-hand design (see `SECOND_HAND_PLAN.md` §16).
+- **Two hands.** `--hands one|two|probe` (default `two`) turns the instrument into a
+  pitch hand plus a modulator hand. The pitch hand still comes from the palm-anchored
+  192×192 crop - the more sensitive window - and a second letterboxed whole-frame pass
+  finds the modulator, which the crop physically cannot reach. Both hands run the same
+  landmarker with their own reuse cache, so the second hand is detected exactly like the
+  first. `HandDetectionResult` now carries `hands: Vec<HandDetection>` in role order with
+  `MAX_HANDS = 2`, and `HandEstimator` is instantiated twice. Palm anchors above the score
+  gate are merged by greedy spatial NMS (`non_overlapping`) at the measured
+  `HAND_SEPARATION = 1.0`, and hands keep their slot across frames (`match_to_slots`,
+  `SLOT_MAX_JUMP = 0.35`) so the two hands do not trade identities when the detector's
+  scores flip. The modulator drives the effect chain - its proximity, height and horizontal
+  position - and the distance between the palms drives vibrato depth and echo feedback; with
+  one hand in view that hand drives everything, exactly as before. The gap is normalised by
+  the hands' own sizes (`gap_level(distance, touching)`), so it reads the same at 640×480
+  and 1620×1080. The dashboard gains a HANDS card with a **swap hands** button, and the
+  modulator skeleton is drawn in a cooler, dimmer palette labelled "mod". Measured on the
+  two-hand fixture: inference p50 16.9 ms with two detector passes and two landmarker runs,
+  against 11.8 ms with one hand - still inside the 33 ms frame budget.
+- **A detector-window probe.** `--hands probe` runs the anchored crop and the whole-frame
+  pass over the same frames and prints the comparison - detections, mean score, hands per
+  frame at each NMS separation, and µs per detector pass. `make probe`, `make probe-single`
+  and `make probe-640` run it on the fixtures. It is a measuring mode, not a playing mode.
+  The measurement it produced is what settled the two-hand design (see `SECOND_HAND_PLAN.md`
+  §16).
 - **An effect chain, driven by the hand.** `src/core/effects.rs` declares the stages
   (`lowpass`, `vibrato`, `delay`) as source -> parameter -> curve, and the frame loop
   smooths their parameters every frame and puts them on the bus as
