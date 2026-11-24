@@ -28,12 +28,13 @@ the numbers below are from the current tree.
 
 - **37 source files, 12,178 lines.** `pipeline.rs` and `dashboard/skeleton.rs` are the two
   big ones; the iced layer is ~1,950 lines.
-- **181 tests pass, 7 benches are `#[ignore]`d.** Coverage now spans the strategies, the
+- **208 tests pass, 9 benches are `#[ignore]`d.** Coverage now spans the strategies, the
   estimator, the detection gate, the affine sampler, the ROI window, both pose-output
   layouts, the geometry helpers, the mock hand, the release and pause paths, the MIDI note
-  gate, the trail decay, the synthesizer voice lifecycle, the presenter cadence, the
-  keyboard band/cell geometry, the trace differ, the video pacing and B-frame reordering,
-  the `Frame` invariants, the ASCII ramps and the pure-Rust skeleton overlay.
+  gate, the trail decay, the synthesizer voice lifecycle and the effect chain (filter,
+  comb delay, vibrato, the neutral fade), the presenter cadence, the keyboard band/cell
+  geometry, the trace differ, the video pacing and B-frame reordering, the `Frame`
+  invariants, the ASCII ramps and the pure-Rust skeleton overlay.
 - **Still zero tests** in `dashboard/mod.rs`, `dashboard/gauges.rs` and `main.rs`. The keyboard
   geometry (T4.5) proved the pattern — split the arithmetic from the widget and it becomes testable;
   `gauges.rs` and `metrics.rs` are next.
@@ -88,10 +89,11 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 1. **Make the pose model cheap** — the HF export is frozen at 640×640. Re-export with `yolo export --imgsz 320 --dynamic` (needs torch/ultralytics, not installed here) or find a nano export; at 320 the FLOPs drop ~4×. **M**
 2. **Try RTMPose** — RTMDet-nano (76 AP, 0.31 GFLOPs, 320×320) + RTMPose-m hand5 (256×256) is the accuracy/latency sweet spot and already downloads to `/tmp/handbench`. Its SimCC heatmap head needs a different decoder than `decode_pose`. **M**
-3. **Multi-hand** — the pose decoder keeps only the highest-scoring detection; the strategy and dashboard assume one hand. **M**
+3. ~~Multi-hand~~ **done for MediaPipe** — the tracker reports two hands and the pipeline handles both. The pose decoder still keeps only the highest-scoring detection, so `--model yolo` is a one-hand instrument; `decode_pose` has the array in front of it and would need the same slot logic.
 
 ## Performance
 
+- **Make the second detector pass cheap** — `--hands two` runs two 192×192 detector passes per frame, which measured 16.9 ms p50 inference vs 11.8 ms with one hand. The modulator only needs its palm box for the current effect mapping, so skipping its landmarker (or running the whole-frame pass once and deriving both hands from it when the pitch hand is steady) is the obvious next saving. `bench/baseline.md` has the numbers. **S**
 - ~~Skip the landmarker when the hand is static~~ **done** — `ReuseCache` reuses the previous keypoints while the palm is within 3 px and 3 % of its last size, capped at 3 consecutive frames so a hand that reshapes without moving its palm is never served stale landmarks for long, and cleared whenever the detector loses the hand. The landmarker stage costs ~4-5.4 ms when it runs, so a still hand saves most of it. Verify with `cargo run -- --debug` (`palm steady, reusing landmarks`) and compare against `--landmarker-always`. **Note:** fps is camera-paced at ~30, so the win is latency and CPU headroom, not frame rate.
 - ~~Mirror flip in place~~ **done, but it was never a bottleneck** — the bindings take two separate borrows, so `flip(frame, frame, 1)` is not expressible; `WebcamSource` now carries a scratch `Mat` and swaps it with the captured frame, so the destination allocation happens once instead of every frame. Measured 0.0176 ms/frame (fresh Mat) vs 0.0174 ms/frame (reused scratch): the allocator recycles the 920 KB block, so the saving is ~0.0002 ms/frame. Flipping the landmarks' x instead of the pixels would skip the memcpy too, but that is at most 0.018 ms of a 31 ms frame — inference and the camera read are where the time is. Verified by `mirroring_reverses_the_columns` and `a_second_flip_reuses_the_scratch_buffer_instead_of_allocating`.
 - ~~Split capture, inference and sinks onto their own threads~~ **done** — `Pipeline::run` now runs three stages: the capture thread reads the webcam into a capacity-1 channel (a frame inference has not reached yet is dropped and counted, so inference never works on stale pixels), the pipeline thread does tracker → strategy → publish, and a sink thread owns the event receiver and drives the audio/MIDI outputs. `frame_ms` in `FrameMetrics` is now inference time only; `capture_ms`, `latency_ms`, `captured` and `dropped` sit next to it and the Advanced tab's Performance card shows them. `fps` is measured from the gap between published frames rather than the sum of the stages, since the stages now overlap. `Pipeline::tick` remains the single-frame inline path (mock mode and the tests use it). Run with `cargo run --release -- --debug --no-ui` and compare `inference` against `capture`: the loop is paced by whichever stage is slower.
@@ -123,7 +125,13 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 - **Gesture chords** — combine several gestures into chord/scale selection. **M**
 - **Use `Landmark.z`** — depth is parsed but read by nothing; it is the cheapest way to distinguish "hand near the camera" from "hand far away" for volume. **M**
 - ~~Continuous/theremin strategy~~ **done** (finding 5) — `ThereminStrategy` emits the `Signal` payload the sinks already handled.
-- **Two hands** — NMS over top-k anchors instead of a single argmax, `Vec<HandDetectionResult>`, left/right roles (pitch vs modulation). **L**
+- ~~Two hands~~ **done** (PR 3) — two hand slots, one pitch hand and one modulator, detected
+  through the same code path: the anchored crop magnifies the pitch hand, a whole-frame pass
+  finds the modulator, and both run the identical landmarker with their own reuse cache. The
+  modulator drives the effect chain; the inter-hand gap drives vibrato depth and echo
+  feedback. Remaining: performance (two detector passes, ~16 ms of the 33 ms budget), polyphony,
+  and MIDI CC mapping. See `SECOND_HAND_PLAN.md` §17.
+- **Modulator gestures** — the modulator already has 21 landmarks and its own geometry; nothing reads them yet beyond proximity and palm distance. Finger extension on the modulator hand (open hand = more echo, fist = none) is the next obvious layer. **S**
 
 ### Output sinks
 - **OSC sink** — implement `Sink` and push it into `sinks` in `main.rs`. **S**
@@ -156,6 +164,17 @@ So: the Ultralytics pose model is a single pass and gets the whole hand in one s
 
 ## Recently done
 
+- **The effect chain** — `src/core/effects.rs` declares the stages (`lowpass`, `vibrato`,
+  `delay`) as source → parameter → curve; the frame loop smooths their parameters with the
+  `--fade-ms` time constant and sends them to the sinks on `BusMessage::Modulation`, which
+  a sink receives through the defaulted `Sink::set_modulation`. The synthesizer runs
+  `glide → vibrato → oscillator → one-pole lowpass → comb delay → soft clip`, the ring
+  buffer is allocated once when the stream opens, and the chain is read once per audio
+  block, not per sample. `--effects` sets it at launch, the EFFECTS card toggles it live,
+  and a hand that leaves the frame fades the chain to neutral instead of switching it off.
+  Cost: ~7 ns per sample (see `bench_chain_cost`). It is deliberately driven by the *one*
+  hand the tracker reports - the sources are the same palm-box signals the second hand will
+  drive later, which is why this lands before two-hand detection.
 - **Housekeeping sweep** — the theremin is real: `--gesture theremin` runs `ThereminStrategy`, which reads the index tip's x through the same `TipSmoother` EMA and maps it logarithmically onto C2..C6 (`--theremin-low-hz`/`--theremin-high-hz`), with thumb-index spread as amplitude. `GestureEvent::new_signal` came back because something finally produces it. Deleted the never-read `EventType` enum and its field, and `FrameMetrics.frame_id`. `--debug` now prints what is actually sounding (`note C4` or `803 Hz`) instead of `note Some(60)`. AGENTS.md's score threshold, dependency list and scaffolding claims are corrected.
 - ~~No rustfmt~~ **done** — the crate is `cargo fmt --check` clean. Worth knowing for the next session: `rustfmt src/main.rs` recurses through every `mod` in the crate, so formatting one file formats the whole tree.
 - **MIDI attack discipline** — `src/midi/mod.rs` now holds a `NoteGate` that owns the voice state. The strategy fires an event every frame (30×/s), so the sink used to send `0x90 note vel` each frame and any synth with a percussive envelope machine-gunned a held note. Now: the first event for a note attacks it, further events with the same note only move CC 7 when the volume actually changed, a cell change sends `note-off` on the old note before attacking the new one, and the pipeline's release event (or a pinched, zero-velocity hand) sends exactly one `note-off` — a second release sends nothing, so there is no orphan note-off. `--min-note-ms` (default 120 ms) is the floor: while the held note is younger than that, a new cell is ignored rather than chopping the note into 33 ms slivers, so a hand sliding across the keyboard sounds every fourth key instead of a blur. `--min-note-ms 0` restores attack-on-every-change. Nine tests in `midi/mod.rs` cover the attack, the CC, the floor, the sweep quantisation and the release; the gate returns the raw messages, so it is testable without a synth attached.

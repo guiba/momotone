@@ -10,6 +10,7 @@
 //! `InstrumentConfig.version` counter that used to spread the same state across
 //! `main.rs`, `pipeline.rs` and `dashboard/mod.rs`.
 
+use crate::core::effects::EffectMask;
 use crate::core::instrument::{InstrumentConfig, VolumeModel};
 use crate::gesture::{PROXIMITY_FAR, PROXIMITY_NEAR};
 use crate::presentation::ascii::Ramp;
@@ -34,6 +35,9 @@ pub struct RuntimeConfig {
     /// What decides loudness this run: how close the hand is, how open it is, or a
     /// mix of the two.
     pub volume: VolumeModel,
+    /// Which stages are in the effect chain. The parameters are continuous, so a
+    /// stage can join a note that is already sounding.
+    pub effects: EffectMask,
     /// Palm-length-per-frame ratios that bound the proximity band: `far` is silence,
     /// `near` is full volume.
     pub proximity_near: f32,
@@ -50,6 +54,9 @@ impl RuntimeConfig {
             ascii_fps,
             ramp,
             volume: VolumeModel::Proximity,
+            // A config built without a chain runs the plain note; `--effects` and the
+            // dashboard decide what is added.
+            effects: EffectMask::NONE,
             proximity_near: PROXIMITY_NEAR,
             proximity_far: PROXIMITY_FAR,
         }
@@ -71,6 +78,11 @@ pub enum UiCommand {
     SetRamp(Ramp),
     /// Swap the loudness source: proximity, pinch or a blend.
     SetVolume(VolumeModel),
+    /// Switch one stage of the effect chain on or off.
+    SetEffect(crate::core::effects::Effect, bool),
+    /// Trade the pitch and modulator roles between the two hand slots. Manual only:
+    /// automatic promotion could hijack the melody in the middle of a sweep.
+    SwapHands,
     /// The pickers changed the instrument: re-key the strategy, retimbre the
     /// sinks and repaint the header.
     SetInstrument(InstrumentConfig),

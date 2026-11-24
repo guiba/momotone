@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::effects::{
+    blend, gap_level, is_different, modulation_from_hands, openness, Modulation,
+};
 use crate::core::event_bus::{BusMessage, EventBus};
 use crate::core::frame::Frame;
 use crate::core::instrument::InstrumentConfig;
@@ -24,12 +27,12 @@ use crate::core::runtime::{RuntimeConfig, UiCommand};
 use crate::core::telemetry::{shed_subsystems, RunStats, PROFILE_REFRESH_FRAMES};
 use crate::core::trace::Trace;
 use crate::core::types::Performance;
-use crate::core::{HandDetectionResult, Sink};
+use crate::core::{box_centre, HandDetectionResult, Sink, MAX_HANDS};
 use crate::dashboard::metrics::{
-    cell_index, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView, SoundView,
-    LOG_CAPACITY,
+    cell_index, note_frequency, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView,
+    SoundView, LOG_CAPACITY,
 };
-use crate::gesture::{HandEstimator, HandState, Strategy};
+use crate::gesture::{band_position, HandEstimator, HandState, Strategy};
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
 use crate::presentation::presenter::{PresentJob, Presenter, DEFAULT_FEED_FPS};
 use crate::vision::camera::WebcamSource;
@@ -113,9 +116,9 @@ enum FrameRead {
 }
 
 /// A mock frame: synthetic landmarks, no pixels, no model.
-fn synthetic_frame(seconds: f64) -> FrameOutcome {
+fn synthetic_frame(seconds: f64, pitch_slot: usize) -> FrameOutcome {
     FrameOutcome {
-        detection: synthetic_detection(seconds),
+        detection: synthetic_detection(seconds, pitch_slot),
         frame: None,
         capture_ms: 0.0,
         inference_ms: 0.0,
@@ -155,10 +158,15 @@ pub struct Pipeline {
     /// Commands from the UI, drained at the top of every frame.
     control_rx: Option<Receiver<UiCommand>>,
 
-    // --- what the hand is doing ---------------------------------------------
-    /// The single source of truth about the hand: hysteresis, the grace window, the
-    /// smoothed fingertip, the loudness and the geometry all live here.
-    estimator: HandEstimator,
+    // --- what the hands are doing ---------------------------------------------
+    /// The single source of truth about each hand slot: hysteresis, the grace
+    /// window, the smoothed fingertip, the loudness and the geometry all live here.
+    /// Slot 0 and slot 1 run the identical estimator; which of the two plays pitch is
+    /// the role the player picks, and `UiCommand::SwapHands` trades it.
+    estimators: [HandEstimator; MAX_HANDS],
+    /// Which hand slot plays notes. The other one modulates. Both the tracker and the
+    /// mock generator report hands in role order, so index 0 is always this slot.
+    pitch_slot: usize,
     /// True while a gesture is actively driving the sinks. Used to send exactly
     /// one release event when it stops, so the audio/MIDI sinks do not latch the
     /// last note and keep sounding after the hand leaves the frame.
@@ -166,6 +174,11 @@ pub struct Pipeline {
     /// The keyboard glow. Derived from the gesture, not from the window, so the
     /// stage draws a fact about the run instead of maintaining its own history.
     trail: KeyboardTrail,
+    /// The effect chain's parameters, smoothed frame by frame. One writer (this
+    /// loop), one published value, so a sink never has to reconstruct the chain.
+    modulation: Modulation,
+    /// When the chain was last recomputed: the denominator of its fade.
+    last_modulation: Instant,
     metrics: FrameMetrics,
     /// The run recorded frame by frame, when the run was asked to record one or
     /// check itself against one.
@@ -179,6 +192,8 @@ pub struct Pipeline {
     stats: RunStats,
     /// When a hand was last seen, for the "lost for N ms" readout.
     last_detection: Instant,
+    /// The same, for the modulator hand.
+    last_modulator: Instant,
     /// Deadline of the next synthetic frame, for mock mode's paced clock.
     next_mock: Instant,
     presentation: Presentation,
@@ -316,9 +331,12 @@ impl Pipeline {
             control,
             control_rx: Some(control_rx),
             metrics: context,
-            estimator: HandEstimator::new(),
+            estimators: [HandEstimator::new(), HandEstimator::new()],
+            pitch_slot: 0,
             gesture_active: false,
             trail: KeyboardTrail::new(fade_ms),
+            modulation: Modulation::neutral(),
+            last_modulation: now,
             trace: Trace::default(),
             trace_out,
             trace_expect,
@@ -333,6 +351,7 @@ impl Pipeline {
             },
             stats: RunStats::new(),
             last_detection: now,
+            last_modulator: now,
             next_mock: now,
             presentation: Presentation {
                 jobs: Some(jobs_tx),
@@ -347,8 +366,13 @@ impl Pipeline {
         // than from a second default.
         if let Ok(config) = pipeline.control.lock() {
             let (model, near, far) = config.volume_settings();
-            pipeline.estimator.set_volume(model, near, far);
+            pipeline.estimators[0].set_volume(model, near, far);
+            pipeline.estimators[1].set_volume(model, near, far);
             pipeline.metrics.status.volume_model = model.name().to_string();
+            // Which stages are in the chain is a runtime knob too, so the neutral
+            // levels start with the enabled mask the run was launched with.
+            pipeline.modulation = Modulation::neutral_with(config.effects);
+            pipeline.metrics.sound.modulation = pipeline.modulation;
         }
         // Seed the instrument so the strategy, the sinks and the published keyboard
         // agree from the very first frame.
@@ -359,7 +383,7 @@ impl Pipeline {
     /// Hand the frame to the presenter. The channel holds one frame: a presenter
     /// still drawing the previous one drops this frame rather than drifting behind
     /// the camera, which is exactly right for a picture nobody is measuring.
-    fn hand_over(&mut self, frame: Option<Frame>, state: &HandState, settings: &RuntimeConfig) {
+    fn hand_over(&mut self, frame: Option<Frame>, pitch: &HandState, settings: &RuntimeConfig) {
         let Some(jobs) = &self.presentation.jobs else {
             return;
         };
@@ -373,8 +397,8 @@ impl Pipeline {
         }
         let _ = jobs.try_send(PresentJob {
             frame,
-            landmarks: state.landmarks.clone(),
-            frame_size: state.frame_size,
+            landmarks: pitch.landmarks.clone(),
+            frame_size: pitch.frame_size,
         });
     }
 
@@ -437,9 +461,17 @@ impl Pipeline {
                 UiCommand::SetRamp(ramp) => config.ramp = ramp,
                 UiCommand::SetVolume(model) => {
                     config.volume = model;
-                    self.estimator
-                        .set_volume(model, config.proximity_near, config.proximity_far);
+                    for estimator in &mut self.estimators {
+                        estimator.set_volume(model, config.proximity_near, config.proximity_far);
+                    }
                     self.metrics.status.volume_model = model.name().to_string();
+                }
+                UiCommand::SetEffect(effect, on) => config.effects.set(effect, on),
+                UiCommand::SwapHands => {
+                    // The roles live here; the tracker is told which slot plays pitch so
+                    // its anchored crop - the sensitive window - follows the right hand.
+                    self.pitch_slot = 1 - self.pitch_slot;
+                    tracing::debug!("hand roles swapped; pitch is now slot {}", self.pitch_slot);
                 }
                 UiCommand::SetInstrument(_) => unreachable!("handled above"),
             }
@@ -502,18 +534,22 @@ impl Pipeline {
                     return;
                 };
                 while let Ok(message) = rx.recv() {
-                    let queued = match message {
-                        BusMessage::Event(queued) => queued,
+                    match message {
+                        BusMessage::Event(queued) => {
+                            // How long the gesture waited in the queue before an output saw
+                            // it: part of the hand-to-sound budget that neither capture nor
+                            // inference accounts for.
+                            let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
+                            if let Ok(mut samples) = dispatch.lock() {
+                                samples.push(age_ms);
+                            }
+                            apply_to_sinks(&sinks, &queued.performance);
+                        }
+                        // Chain parameters are continuous state, not attacks, so they are
+                        // not timed and do not feed the latency sample.
+                        BusMessage::Modulation(modulation) => apply_modulation(&sinks, &modulation),
                         BusMessage::Shutdown => break,
-                    };
-                    // How long the gesture waited in the queue before an output saw
-                    // it: part of the hand-to-sound budget that neither capture nor
-                    // inference accounts for.
-                    let age_ms = queued.dispatched_at.elapsed().as_secs_f64() * 1000.0;
-                    if let Ok(mut samples) = dispatch.lock() {
-                        samples.push(age_ms);
                     }
-                    apply_to_sinks(&sinks, &queued.performance);
                 }
                 if let Ok(mut sinks) = sinks.lock() {
                     for sink in sinks.iter_mut() {
@@ -581,6 +617,13 @@ impl Pipeline {
             perf.dispatch.p50, perf.dispatch.p95, perf.dispatch.p99, perf.dispatch.max,
             perf.inference.count,
         );
+
+        // The crop-vs-frame comparison this run measured, if it was a measuring run.
+        if let Some(tracker) = &self.tracker {
+            if let Some(report) = tracker.probe_report() {
+                tracing::info!("detector probe: {report}");
+            }
+        }
 
         if let Some(path) = &self.trace_out {
             if let Err(error) = crate::core::trace::write(path, &self.trace) {
@@ -681,11 +724,18 @@ impl Pipeline {
         self.metrics.sound.note = None;
         self.metrics.sound.volume = 0.0;
         self.metrics.sound.frequency = None;
+        // A stopped run is not just silent - the chain goes back to neutral so a
+        // resumed run starts from an unfiltered note rather than wherever the last
+        // hand left it.
+        self.modulation = Modulation::neutral();
+        self.metrics.sound.modulation = self.modulation;
+        self.event_bus.dispatch_modulation(self.modulation);
         self.metrics.hand.landmarks.clear();
         self.metrics.hand.landmark_count = 0;
         self.metrics.hand.hand_box = None;
         self.metrics.hand.tip_x = 0.0;
         self.metrics.hand.tip_y = 0.0;
+        self.metrics.modulator = crate::dashboard::metrics::ModulatorView::default();
         self.trail.clear();
         self.sync_trail();
         // Keep the published picture state truthful while stopped too, so the header
@@ -714,13 +764,16 @@ impl Pipeline {
             // is what makes a golden trace test possible. The deadline clock above
             // still paces the loop, so the telemetry stays honest.
             let nominal_seconds = self.metrics.perf.frames as f64 * MOCK_CADENCE.as_secs_f64();
-            return Ok(FrameRead::Frame(synthetic_frame(nominal_seconds)));
+            return Ok(FrameRead::Frame(synthetic_frame(
+                nominal_seconds,
+                self.pitch_slot,
+            )));
         };
 
         match frames.recv_timeout(Duration::from_millis(FRAME_POLL_MS)) {
             Ok(captured) => {
                 let inference_start = Instant::now();
-                let detection = tracker.process_frame(&captured.frame)?;
+                let detection = tracker.process_frame(&captured.frame, self.pitch_slot)?;
                 Ok(FrameRead::Frame(FrameOutcome {
                     detection,
                     frame: Some(captured.frame),
@@ -752,8 +805,11 @@ impl Pipeline {
             latency_ms,
         } = outcome;
 
-        // One resolution of the raw detection, shared by every stage below.
-        let state = self.estimator.update(&detection);
+        // One resolution of the raw detection, shared by every stage below. Each slot
+        // runs the same estimator, so the second hand is tracked exactly like the first.
+        let states = self.resolve_hands(&detection);
+        let pitch = states[0].clone();
+        let modulator = states[1].clone();
 
         self.record_timing(&detection, capture_ms, inference_ms, latency_ms);
         // Read the UI's wishes *after* the timing, so a shed that fires on this
@@ -764,12 +820,15 @@ impl Pipeline {
         // dashboard would then be lying.
         self.metrics.status.feed = settings.feed;
         self.metrics.status.ascii = settings.ascii;
-        self.update_tracking(&state);
-        self.dispatch_gesture(&state);
+        // The chain is smoothed before the gesture is dispatched, so a note attacks
+        // with the filter and wobble already in place rather than catching up to them.
+        self.update_modulation(&pitch, &modulator, &settings);
+        self.update_tracking(&pitch, &modulator);
+        self.dispatch_gesture(&pitch);
         // The keyboard glow follows the gesture, on the frame loop's clock.
         self.update_trail();
         // Last, and off this thread: nothing a human looks at can delay a frame.
-        self.hand_over(frame, &state, &settings);
+        self.hand_over(frame, &pitch, &settings);
 
         // Inline mode: this thread still owns the receiver. Once `run` has spawned
         // the sink thread it is gone, and that stage is the only consumer.
@@ -818,19 +877,107 @@ impl Pipeline {
         self.metrics.perf.landmarker_us = detection.timings.landmarker_us;
     }
 
-    /// Where the hand is, copied out of the estimator into the snapshot the
+    /// Resolve every hand slot this frame into a `HandState`.
+    ///
+    /// Slot 0 is the pitch hand and slot 1 the modulator; the tracker keeps them that
+    /// way, so this stage is a plain per-slot pass through identical estimators.
+    fn resolve_hands(&mut self, detection: &HandDetectionResult) -> [HandState; MAX_HANDS] {
+        [
+            self.estimators[0].update(detection.pitch(), detection.frame_size),
+            self.estimators[1].update(detection.modulator(), detection.frame_size),
+        ]
+    }
+
+    /// Distance between the two palm centres, in pixels, together with the centre-to-centre
+    /// distance at which the two hand boxes would touch. `None` when either hand has no
+    /// box, which is what makes the inter-hand sources fall back to their single-hand
+    /// values rather than read a meaningless zero.
+    ///
+    /// The touching distance comes from the hands' own sizes, so dividing one by the other
+    /// makes the gap reading independent of resolution and of how far the player sits.
+    fn palm_distance(&self, pitch: &HandState, modulator: &HandState) -> Option<(f32, f32)> {
+        let a = pitch.hand_box?;
+        let b = modulator.hand_box?;
+        let (ax, ay) = box_centre(a);
+        let (bx, by) = box_centre(b);
+        let distance = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
+        Some((distance, (a.2 + b.2) / 2.0))
+    }
+
+    /// Smooth the effect chain towards what the hands are asking for, and put it on
+    /// the bus only when it actually moved.
+    ///
+    /// The smoothing is the point. A hand held still produces numbers that wobble by
+    /// a percent per frame; without a time constant the filter would shimmer. When no
+    /// hand is present the target is neutral, so the chain fades out over the same
+    /// `--fade-ms` the keyboard trail uses instead of clicking off.
+    fn update_modulation(
+        &mut self,
+        pitch: &HandState,
+        modulator: &HandState,
+        settings: &RuntimeConfig,
+    ) {
+        // The hand that drives the chain is the modulator when there is one, and the
+        // pitch hand when there is not - so a one-hand run behaves exactly as it did
+        // before the second hand existed.
+        let driver = if modulator.present { modulator } else { pitch };
+        // What feeds vibrato depth and echo feedback. With two hands it is the distance
+        // between them; with one it is that hand's openness.
+        let gap = match self.palm_distance(pitch, modulator) {
+            Some((distance, touching)) => gap_level(distance, touching),
+            None => openness(driver.geometry.spread),
+        };
+
+        let target = if driver.present {
+            // `band_position` is the same inset the keyboard is drawn with, so the
+            // hand's height and width mean the same thing here as they do on stage.
+            let (x, y) = band_position(driver.tip.0, driver.tip.1, driver.frame_size);
+            // The filter's knee is a multiple of the pitch that is actually sounding,
+            // so the same hand position darkens C2 and C6 equally. Before a note has
+            // ever sounded, `cutoff_for` uses the middle of the keyboard.
+            let sounding = self
+                .metrics
+                .sound
+                .frequency
+                .or_else(|| self.metrics.sound.note.map(note_frequency))
+                .unwrap_or(0.0);
+            modulation_from_hands(
+                settings.effects,
+                driver.proximity,
+                1.0 - y, // higher in the frame = faster wobble
+                gap,
+                x,
+                sounding,
+            )
+        } else {
+            Modulation::neutral_with(settings.effects)
+        };
+
+        let fade_seconds = self.trail.fade_ms().max(1.0) / 1000.0;
+        let alpha = self.last_modulation.elapsed().as_secs_f32() / fade_seconds;
+        let next = blend(self.modulation, target, alpha);
+
+        if is_different(&self.modulation, &next) {
+            self.event_bus.dispatch_modulation(next);
+        }
+        self.modulation = next;
+        self.metrics.sound.modulation = next;
+        self.last_modulation = Instant::now();
+    }
+
+    /// Where the hands are, copied out of the estimators into the snapshot the
     /// dashboard reads.
-    fn update_tracking(&mut self, state: &HandState) {
-        self.metrics.hand.detected = state.present;
-        self.metrics.hand.confidence = state.confidence;
-        self.metrics.hand.hand_box = state.hand_box;
+    fn update_tracking(&mut self, pitch: &HandState, modulator: &HandState) {
+        self.metrics.hand.detected = pitch.present;
+        self.metrics.hand.confidence = pitch.confidence;
+        self.metrics.hand.hand_box = pitch.hand_box;
         // `clone_from` keeps the Vec's capacity, so the landmark list stops
         // reallocating every frame.
-        self.metrics.hand.landmarks.clone_from(&state.landmarks);
-        self.metrics.hand.landmark_count = state.landmarks.len();
+        self.metrics.hand.landmarks.clone_from(&pitch.landmarks);
+        self.metrics.hand.landmark_count = pitch.landmarks.len();
         // The note anchor: the smoothed index fingertip the pitch is read from.
-        self.metrics.hand.tip_x = state.tip.0;
-        self.metrics.hand.tip_y = state.tip.1;
+        self.metrics.hand.tip_x = pitch.tip.0;
+        self.metrics.hand.tip_y = pitch.tip.1;
         // Which cell the sounding note belongs to, for the crosshair and the
         // cell highlight. Notes are unique in the grid, so this is exact.
         if let Some(note) = self.metrics.sound.note {
@@ -840,21 +987,48 @@ impl Pipeline {
             }
         }
 
-        if state.present {
+        if pitch.present {
             self.last_detection = Instant::now();
         }
-        self.metrics.hand.lost_ms = self.last_detection.elapsed().as_millis() as u64;
-        self.metrics.hand.jitter_px = state.jitter_px;
 
-        self.metrics.hand.geometry.spread = state.geometry.spread;
-        self.metrics.hand.geometry.extension = state.geometry.extension;
-        self.metrics.hand.geometry.tilt_deg = state.geometry.tilt_deg;
-        self.metrics.hand.geometry.palm_length = state.geometry.palm_length;
+        // The modulator gets its own view so the stage can draw it and the rail can
+        // show the inter-hand numbers without recomputing them in the UI.
+        if modulator.present {
+            self.last_modulator = Instant::now();
+        }
+        let gap = self.palm_distance(pitch, modulator);
+        let view = &mut self.metrics.modulator;
+        view.detected = modulator.present;
+        view.confidence = modulator.confidence;
+        view.landmarks.clone_from(&modulator.landmarks);
+        view.hand_box = modulator.hand_box;
+        view.proximity = modulator.proximity;
+        view.centre = modulator.hand_box.map(box_centre).unwrap_or((0.0, 0.0));
+        match gap {
+            Some((distance, touching)) => {
+                view.gap_px = distance;
+                view.gap_ratio = distance / touching.max(1.0);
+                view.gap_level = gap_level(distance, touching);
+            }
+            None => {
+                view.gap_px = 0.0;
+                view.gap_ratio = 0.0;
+                view.gap_level = 0.0;
+            }
+        }
+        view.lost_ms = self.last_modulator.elapsed().as_millis() as u64;
+        self.metrics.hand.lost_ms = self.last_detection.elapsed().as_millis() as u64;
+        self.metrics.hand.jitter_px = pitch.jitter_px;
+
+        self.metrics.hand.geometry.spread = pitch.geometry.spread;
+        self.metrics.hand.geometry.extension = pitch.geometry.extension;
+        self.metrics.hand.geometry.tilt_deg = pitch.geometry.tilt_deg;
+        self.metrics.hand.geometry.palm_length = pitch.geometry.palm_length;
         // How close the hand looks, independent of which model is currently driving
         // the volume: the HUD needs it even when loudness comes from the pinch.
-        self.metrics.sound.proximity = state.proximity;
-        self.metrics.sound.proximity_ratio = state.proximity_ratio;
-        self.metrics.sound.approach = state.approach;
+        self.metrics.sound.proximity = pitch.proximity;
+        self.metrics.sound.proximity_ratio = pitch.proximity_ratio;
+        self.metrics.sound.approach = pitch.approach;
     }
 
     /// Fade the keyboard trail and light the key that is sounding. The trail is
@@ -942,12 +1116,13 @@ impl Pipeline {
                 _ => "silent".to_string(),
             };
             tracing::debug!(
-                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} proximity {:.2} ({:.3} palm/frame) approach {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0}",
+                "fps {:.1} inference {:.2} ms (capture {:.2} ms, latency {:.2} ms, dropped {}) hands {} detector {:.0} us, landmarker {:.0} us conf {:.2} {sounding} vol {:.2} proximity {:.2} ({:.3} palm/frame) approach {:.2} spread {:.2} jitter {:.1} px tip {:.0},{:.0} gap {:.0} px ({:.2}) chain {} tone {:.0} Hz vibrato {:.0}c@{:.1} delay {:.0} ms fb {:.2}",
                 self.metrics.perf.fps,
                 self.metrics.perf.frame_ms,
                 self.metrics.perf.capture_ms,
                 self.metrics.perf.latency_ms,
                 self.metrics.perf.dropped,
+                self.metrics.modulator.detected as usize + self.metrics.hand.detected as usize,
                 self.metrics.perf.detector_us,
                 self.metrics.perf.landmarker_us,
                 self.metrics.hand.confidence,
@@ -959,6 +1134,14 @@ impl Pipeline {
                 self.metrics.hand.jitter_px,
                 self.metrics.hand.tip_x,
                 self.metrics.hand.tip_y,
+                self.metrics.modulator.gap_px,
+                self.metrics.modulator.gap_level,
+                self.metrics.sound.modulation.enabled.names(),
+                self.metrics.sound.modulation.cutoff_hz,
+                self.metrics.sound.modulation.vibrato_cents,
+                self.metrics.sound.modulation.vibrato_hz,
+                self.metrics.sound.modulation.delay_ms,
+                self.metrics.sound.modulation.feedback,
             );
         }
     }
@@ -1039,8 +1222,18 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
     while let Ok(message) = rx.try_recv() {
         match message {
             BusMessage::Event(queued) => apply_to_sinks(sinks, &queued.performance),
+            BusMessage::Modulation(modulation) => apply_modulation(sinks, &modulation),
             BusMessage::Shutdown => break,
         }
+    }
+}
+
+fn apply_modulation(sinks: &SinkList, modulation: &Modulation) {
+    let Ok(mut sinks) = sinks.lock() else {
+        return;
+    };
+    for sink in sinks.iter_mut() {
+        sink.set_modulation(modulation);
     }
 }
 
@@ -1050,6 +1243,7 @@ fn drain_events(rx: &Receiver<BusMessage>, sinks: &SinkList) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::effects::{Effect, EffectMask, NEUTRAL_CUTOFF_HZ};
     use crate::core::grid::GridLayout;
     use crate::core::instrument::Waveform;
     use crate::core::runtime::control_channel;
@@ -1067,6 +1261,9 @@ mod tests {
         /// Timbres the pipeline pushed into the sinks, in order. Without this the
         /// picker wiring is only audible, not testable.
         waveforms: Arc<Mutex<Vec<String>>>,
+        /// Chain parameters the pipeline pushed, in order. Same reason: the effect
+        /// wiring has to be observable, not just audible.
+        modulations: Arc<Mutex<Vec<Modulation>>>,
     }
 
     impl Sink for RecordingSink {
@@ -1085,6 +1282,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(waveform.name().to_string());
+        }
+        fn set_modulation(&mut self, modulation: &Modulation) {
+            self.modulations.lock().unwrap().push(*modulation);
         }
     }
 
@@ -1140,6 +1340,7 @@ mod tests {
         /// sending the same command the UI sends.
         control: Sender<UiCommand>,
         waveforms: Arc<Mutex<Vec<String>>>,
+        modulations: Arc<Mutex<Vec<Modulation>>>,
     }
 
     fn test_pipeline(strategy: Box<dyn Strategy>, max_frames: Option<u32>) -> TestHarness {
@@ -1169,6 +1370,7 @@ mod tests {
         let (control_tx, control_rx) = control_channel();
         let events = Arc::new(Mutex::new(Vec::new()));
         let waveforms = Arc::new(Mutex::new(Vec::new()));
+        let modulations = Arc::new(Mutex::new(Vec::new()));
         let pipeline = Pipeline::new(PipelineConfig {
             source: None,
             tracker: None,
@@ -1176,6 +1378,7 @@ mod tests {
             sinks: Arc::new(Mutex::new(vec![Box::new(RecordingSink {
                 events: events.clone(),
                 waveforms: waveforms.clone(),
+                modulations: modulations.clone(),
             })])),
             event_bus: bus,
             event_rx: Some(rx),
@@ -1198,6 +1401,7 @@ mod tests {
             events,
             control: control_tx,
             waveforms,
+            modulations,
         }
     }
 
@@ -1297,8 +1501,8 @@ mod tests {
             events,
             ..
         } = test_pipeline(Box::new(AlwaysSignal), None);
-        pipeline.advance(synthetic_frame(0.0)).unwrap(); // first sighting: the gate is still confirming
-        pipeline.advance(synthetic_frame(0.0)).unwrap(); // second sighting: the gesture is live
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap(); // first sighting: the gate is still confirming
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap(); // second sighting: the gesture is live
 
         // The OUTPUT card reads `frequency` when there is no note, so a theremin
         // run must publish the hertz and not leave a stale note behind.
@@ -1324,7 +1528,7 @@ mod tests {
             control,
             ..
         } = test_pipeline(Box::new(FingerPositionStrategy::default()), None);
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert_eq!(
             pipeline.metrics.scene.layout.len(),
             15,
@@ -1335,7 +1539,7 @@ mod tests {
         let instrument = InstrumentConfig::new("chromatic", "C", 4, Waveform::Saw).unwrap();
         control.send(UiCommand::SetInstrument(instrument)).unwrap();
 
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert_eq!(pipeline.metrics.scene.layout.rows, 4);
         assert_eq!(pipeline.metrics.scene.layout.cols, 12);
         assert_eq!(pipeline.metrics.status.scale, "chromatic");
@@ -1410,12 +1614,12 @@ mod tests {
 
         // Nothing is on, so the frame is dropped rather than copied to a thread that
         // has nowhere to draw it.
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert!(jobs.try_recv().is_err(), "no audience, no job");
 
         // The dashboard turns the feed on; now the frame goes over.
         control.send(UiCommand::SetFeed(true)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         let job = jobs.try_recv().unwrap();
         assert!(job.frame.is_none(), "a mock frame carries no pixels");
         assert_eq!(job.landmarks.len(), 21, "but it does carry the hand");
@@ -1447,7 +1651,7 @@ mod tests {
             0.0,
             shared.clone(),
         );
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
 
         let snapshot = shared.lock().unwrap();
         assert_eq!(snapshot.perf.frames, 1, "the telemetry moved");
@@ -1484,8 +1688,8 @@ mod tests {
             0.0,
             shared.clone(),
         );
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
 
         let snapshot = shared.lock().unwrap();
         assert_eq!(snapshot.status.scale, "major pentatonic");
@@ -1534,8 +1738,8 @@ mod tests {
 
         // With no camera the pipeline synthesises a hand, so the strategy fires once
         // the gate has confirmed the gesture.
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
 
         control.send(UiCommand::Stop).unwrap();
         pipeline.apply_commands();
@@ -1566,9 +1770,9 @@ mod tests {
             None,
         );
 
-        pipeline.advance(synthetic_frame(0.0)).unwrap(); // hand present -> note
-        pipeline.advance(synthetic_frame(0.0)).unwrap(); // hand gone   -> release
-        pipeline.advance(synthetic_frame(0.0)).unwrap(); // still gone  -> nothing more
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap(); // hand present -> note
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap(); // hand gone   -> release
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap(); // still gone  -> nothing more
 
         let sent = events.lock().unwrap();
         assert_eq!(sent.len(), 2, "exactly one note and one release");
@@ -1597,8 +1801,8 @@ mod tests {
             }),
             None,
         );
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(pipeline.metrics.sound.volume, 0.0);
         assert!(!pipeline.gesture_active);
@@ -1620,7 +1824,7 @@ mod tests {
             latency_ms: 0.0,
         };
         let found = || {
-            let mut detection = synthetic_detection(0.0);
+            let mut detection = synthetic_detection(0.0, 0);
             detection.frame_size = (640, 480);
             frame(detection)
         };
@@ -1839,7 +2043,7 @@ mod tests {
     /// can be exercised without a model that is actually slow.
     fn slow_frame(seconds: f64, inference_ms: f64) -> FrameOutcome {
         FrameOutcome {
-            detection: synthetic_detection(seconds),
+            detection: synthetic_detection(seconds, 0),
             frame: None,
             capture_ms: 0.0,
             inference_ms,
@@ -1889,7 +2093,7 @@ mod tests {
         );
         // The user can still turn it back on: the guard fires once, not forever.
         control.send(UiCommand::SetAscii(true)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert!(
             pipeline.control.lock().unwrap().ascii,
             "a manual toggle beats the guard"
@@ -1915,14 +2119,327 @@ mod tests {
             0.0,
             shared.clone(),
         );
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert!(shared.lock().unwrap().status.ascii, "asked for, so on");
 
         control.send(UiCommand::SetAscii(false)).unwrap();
-        pipeline.advance(synthetic_frame(0.0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
         assert!(
             !shared.lock().unwrap().status.ascii,
             "the published state follows the pipeline, not the initial request"
+        );
+    }
+
+    /// A frame with no hand in it at all.
+    fn empty_frame() -> FrameOutcome {
+        FrameOutcome {
+            detection: HandDetectionResult::default(),
+            frame: None,
+            capture_ms: 0.0,
+            inference_ms: 0.0,
+            latency_ms: 0.0,
+        }
+    }
+
+    #[test]
+    /// The chain is driven by the hand, reaches the sinks, and decays when the hand
+    /// leaves rather than switching off. The sleeps are the frame interval: the fade
+    /// is a wall-clock time constant, so a test that advances frames as fast as the
+    /// CPU allows would never see it.
+    fn the_chain_follows_the_hand_and_fades_when_it_leaves() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness {
+            mut pipeline,
+            modulations,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+
+        for frame in 0..20 {
+            pipeline
+                .advance(synthetic_frame(frame as f64 * 0.033, 0))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let driven = pipeline.modulation;
+        assert!(
+            driven.enabled.is_on(Effect::Lowpass),
+            "the run asked for the chain"
+        );
+        assert!(
+            driven.cutoff_hz < NEUTRAL_CUTOFF_HZ,
+            "a hand in view should have closed the filter from neutral, got {}",
+            driven.cutoff_hz
+        );
+        assert!(
+            driven.delay_ms > 0.0,
+            "the hand swept the delay away from zero"
+        );
+        assert!(
+            !modulations.lock().unwrap().is_empty(),
+            "the chain reached the sinks"
+        );
+
+        let before = pipeline.modulation;
+        for _ in 0..20 {
+            pipeline.advance(empty_frame()).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let after = pipeline.modulation;
+        assert!(
+            (after.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs()
+                < (before.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs() * 0.5,
+            "half a second without a hand should have faded most of the way to neutral: {} -> {}",
+            before.cutoff_hz,
+            after.cutoff_hz
+        );
+        assert!(
+            after.enabled == EffectMask::ALL,
+            "the hand left, but the chain the run asked for is still in"
+        );
+    }
+
+    #[test]
+    /// A chain that was never asked for is never sent: with every stage off there is
+    /// nothing continuous to deliver, and the sinks stay idle.
+    fn a_run_with_no_effects_sends_no_modulation() {
+        let TestHarness {
+            pipeline,
+            modulations,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), Some(5));
+        assert_eq!(pipeline.modulation.enabled, EffectMask::NONE);
+        assert!(
+            modulations.lock().unwrap().is_empty(),
+            "no chain, no traffic"
+        );
+    }
+
+    #[test]
+    /// Switching a stage off from the dashboard takes effect on the next frame, and
+    /// the parameter behind it is left alone rather than zeroed.
+    fn a_toggle_flips_the_chain_without_disturbing_the_levels() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness {
+            mut pipeline,
+            control,
+            modulations,
+            ..
+        } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+
+        control
+            .send(UiCommand::SetEffect(Effect::Delay, false))
+            .unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        let after = pipeline.modulation;
+
+        assert!(
+            !after.enabled.is_on(Effect::Delay),
+            "the stage was switched off"
+        );
+        assert!(
+            after.enabled.is_on(Effect::Lowpass),
+            "the others are untouched"
+        );
+        assert!(
+            after.delay_ms > 0.0,
+            "a disabled stage keeps tracking the hand, so switching it back on does not start from zero"
+        );
+        assert!(
+            !modulations.lock().unwrap().is_empty(),
+            "the change was dispatched"
+        );
+    }
+
+    #[test]
+    /// The mock run has two hands, so the second slot is filled and the inter-hand
+    /// gap is published. Without a second hand the modulator view reads as lost.
+    fn both_hand_slots_are_published() {
+        let TestHarness {
+            mut pipeline,
+            modulations,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), Some(3));
+        let _ = modulations;
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+
+        assert!(
+            pipeline.metrics.modulator.detected,
+            "the mock run drives two hands"
+        );
+        assert!(
+            pipeline.metrics.modulator.gap_px > 0.0,
+            "the hands are apart"
+        );
+        assert!(pipeline.metrics.modulator.lost_ms == 0);
+
+        pipeline.advance(empty_frame()).unwrap();
+        pipeline.advance(empty_frame()).unwrap();
+        pipeline.advance(empty_frame()).unwrap();
+        pipeline.advance(empty_frame()).unwrap();
+        assert!(
+            !pipeline.metrics.modulator.detected,
+            "with nothing in view the modulator is lost"
+        );
+        assert!(pipeline.metrics.modulator.gap_px == 0.0, "no hands, no gap");
+    }
+
+    #[test]
+    /// Swapping hands changes which slot plays pitch, and the tracker's identity
+    /// survives the swap: the same physical hand keeps its slot across frames.
+    fn swapping_hands_moves_the_pitch_to_the_other_slot() {
+        let TestHarness {
+            mut pipeline,
+            control,
+            ..
+        } = test_pipeline(Box::new(AlwaysOn), None);
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        let before_tip = pipeline.metrics.hand.tip_x;
+        let before_mod = pipeline.metrics.modulator.centre.0;
+
+        control.send(UiCommand::SwapHands).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+
+        assert!(
+            (pipeline.metrics.hand.tip_x - before_mod).abs() > 1.0,
+            "the pitch hand is now the one that was modulating: {before_tip} -> {}",
+            pipeline.metrics.hand.tip_x
+        );
+        assert!(
+            pipeline.metrics.modulator.detected,
+            "both hands are still tracked"
+        );
+    }
+
+    #[test]
+    /// A single hand is a complete instrument: with the modulator slot empty the pitch
+    /// hand drives the whole chain, and the inter-hand sources fall back to that hand's
+    /// openness rather than reading a gap of zero.
+    fn one_hand_drives_the_chain_by_itself() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+
+        let only_pitch = {
+            let mut detection = synthetic_detection(0.0, 0);
+            detection.hands.truncate(1);
+            detection
+        };
+        for _ in 0..8 {
+            pipeline
+                .advance(FrameOutcome {
+                    detection: only_pitch.clone(),
+                    frame: None,
+                    capture_ms: 0.0,
+                    inference_ms: 0.0,
+                    latency_ms: 0.0,
+                })
+                .unwrap();
+        }
+
+        assert!(pipeline.metrics.hand.detected, "the pitch hand is live");
+        assert!(
+            !pipeline.metrics.modulator.detected,
+            "the second slot stayed empty"
+        );
+        assert!(
+            pipeline.modulation.vibrato_cents > 0.0,
+            "with no second hand the wobble comes from the pitch hand's own openness"
+        );
+    }
+
+    #[test]
+    /// Stopping the run silences the chain as well as the note, so a resumed run does
+    /// not start from whatever the last hand left behind.
+    fn pausing_neutralises_the_chain() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::ALL;
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            Arc::new(Mutex::new(FrameMetrics::default())),
+        );
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.pause();
+
+        assert_eq!(pipeline.modulation.enabled, EffectMask::NONE);
+        assert_eq!(pipeline.modulation.cutoff_hz, NEUTRAL_CUTOFF_HZ);
+        assert_eq!(
+            pipeline.metrics.sound.modulation.enabled,
+            EffectMask::NONE,
+            "the rail shows a silent chain"
+        );
+    }
+
+    #[test]
+    /// The dashboard shows the chain the frame loop computed, not the buttons someone
+    /// clicked, so the rail cannot drift from the sound.
+    fn the_published_chain_is_the_one_the_loop_computed() {
+        let mut config =
+            RuntimeConfig::new(DEFAULT_FEED_FPS, DEFAULT_ASCII_FPS, false, Ramp::Blocks);
+        config.effects = EffectMask::parse("lowpass,vibrato").expect("valid list");
+        let shared = Arc::new(Mutex::new(FrameMetrics::default()));
+        let TestHarness { mut pipeline, .. } = test_pipeline_with(
+            Box::new(AlwaysOn),
+            None,
+            config,
+            false,
+            DEFAULT_COLS,
+            0.0,
+            shared.clone(),
+        );
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+        pipeline.advance(synthetic_frame(0.0, 0)).unwrap();
+
+        let published = shared.lock().unwrap().sound.modulation;
+        assert_eq!(
+            published, pipeline.modulation,
+            "the snapshot mirrors the loop"
+        );
+        assert!(published.enabled.is_on(Effect::Vibrato));
+        assert!(
+            !published.enabled.is_on(Effect::Delay),
+            "delay was never asked for"
         );
     }
 

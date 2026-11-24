@@ -23,17 +23,20 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, canvas, column, container, pick_list, row, rule, space, text, Column, Scrollable,
+    button, canvas, column, container, pick_list, row, rule, space, text, Column, Row, Scrollable,
 };
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
+use crate::core::effects::{
+    Effect, CUTOFF_MAX_HARMONICS, CUTOFF_MIN_HARMONICS, DELAY_MAX_MS, VIBRATO_MAX_CENTS,
+};
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, VolumeModel, Waveform};
 use crate::core::runtime::UiCommand;
 use crate::core::telemetry::Latency;
 use crate::dashboard::gauges::{Meter, Sparkline};
-use crate::dashboard::metrics::{note_name, FrameMetrics};
+use crate::dashboard::metrics::{note_frequency, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
 use crate::presentation::ascii::Ramp;
 
@@ -74,6 +77,9 @@ enum Message {
     PickOctaves(usize),
     PickWaveform(Waveform),
     PickVolume(String),
+    ToggleEffect(String),
+    /// Trade the pitch and modulator roles between the two hand slots.
+    SwapHands,
 }
 
 pub struct Dashboard {
@@ -204,6 +210,19 @@ impl Dashboard {
                     let _ = self.control.send(UiCommand::SetVolume(model));
                 }
             }
+            // The chain's parameters are continuous, so switching a stage on or off
+            // joins a note that is already sounding rather than waiting for the next
+            // attack. The state shown here is the pipeline's, not a local copy: the
+            // budget guard and the frame loop are the ones that decide.
+            Message::ToggleEffect(name) => {
+                if let Some(effect) = Effect::parse(&name) {
+                    let on = !self.metrics.sound.modulation.enabled.is_on(effect);
+                    let _ = self.control.send(UiCommand::SetEffect(effect, on));
+                }
+            }
+            Message::SwapHands => {
+                let _ = self.control.send(UiCommand::SwapHands);
+            }
         }
     }
 
@@ -288,12 +307,15 @@ impl Dashboard {
                 ramp: self.ramp,
                 frequency: self.metrics.sound.frequency,
                 landmarks: self.metrics.hand.landmarks.clone(),
+                modulator_landmarks: self.metrics.modulator.landmarks.clone(),
+                modulator_box: self.metrics.modulator.hand_box,
                 frame_size: self.metrics.hand.frame_size,
                 hand_box: self.metrics.hand.hand_box,
                 show_box: self.show_box,
                 show_labels: self.show_labels,
                 detected: self.metrics.hand.detected,
                 lost_ms: self.metrics.hand.lost_ms,
+                modulator_lost_ms: self.metrics.modulator.lost_ms,
                 trail: self.metrics.sound.trail.clone(),
                 layout: self.metrics.scene.layout.clone(),
                 current_note: self.metrics.sound.note,
@@ -327,7 +349,9 @@ impl Dashboard {
             Tab::Basic => column![
                 instrument_card(&self.instrument),
                 note_card(&self.metrics),
+                hands_card(&self.metrics),
                 loudness_card(&self.metrics),
+                effects_card(&self.metrics),
                 render_card(self.ramp, ascii),
                 meter_card("Volume", self.metrics.sound.volume, VOLUME),
                 meter_card("Confidence", self.metrics.hand.confidence, CONFIDENCE),
@@ -401,6 +425,119 @@ fn small_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
             text_color: TEXT,
             border: Border {
                 color: CARD_BORDER,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        })
+        .into()
+}
+
+/// The effect chain, as the frame loop last computed it: which stages are in, and
+/// how far the hand has taken each one. The parameters keep tracking the hand even
+/// when a stage is switched off - the mask decides what the voice runs, not what is
+/// measured - so the bars show what the stage *would* do, and the label says whether
+/// it is in the chain at all.
+fn effects_card(metrics: &FrameMetrics) -> Element<'_, Message> {
+    let modulation = metrics.sound.modulation;
+    let bar = |value: f32, low: f32, high: f32| (value - low) / (high - low);
+    // The knee is a multiple of the pitch that is sounding, so the meter is more
+    // useful in harmonics than in hertz: 2x means "everything above the second
+    // harmonic is gone", whichever note is playing.
+    let reference = metrics
+        .sound
+        .frequency
+        .or_else(|| metrics.sound.note.map(note_frequency))
+        .unwrap_or(261.6);
+    let harmonics = modulation.cutoff_hz / reference;
+    let buttons = Effect::all()
+        .into_iter()
+        .map(|effect| {
+            effect_button(
+                effect.name(),
+                modulation.enabled.is_on(effect),
+                Message::ToggleEffect(effect.name().to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    card(
+        "EFFECTS",
+        column![
+            Row::with_children(buttons).spacing(6),
+            canvas(Meter {
+                value: bar(harmonics, CUTOFF_MIN_HARMONICS, CUTOFF_MAX_HARMONICS),
+                color: PROXIMITY,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "tone",
+                format!(
+                    "{:.1}x harmonics ({:.0} Hz) {}",
+                    harmonics,
+                    modulation.cutoff_hz,
+                    if modulation.enabled.is_on(Effect::Lowpass) {
+                        ""
+                    } else {
+                        "(off)"
+                    }
+                ),
+            ),
+            canvas(Meter {
+                value: modulation.vibrato_cents / VIBRATO_MAX_CENTS,
+                color: NOTE,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "vibrato",
+                format!(
+                    "{:.0} cents @ {:.1} Hz{}",
+                    modulation.vibrato_cents,
+                    modulation.vibrato_hz,
+                    if modulation.enabled.is_on(Effect::Vibrato) {
+                        ""
+                    } else {
+                        " (off)"
+                    }
+                ),
+            ),
+            canvas(Meter {
+                value: modulation.delay_ms / DELAY_MAX_MS,
+                color: CONFIDENCE,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "delay",
+                format!(
+                    "{:.0} ms · feedback {:.2}{}",
+                    modulation.delay_ms,
+                    modulation.feedback,
+                    if modulation.enabled.is_on(Effect::Delay) {
+                        ""
+                    } else {
+                        " (off)"
+                    }
+                ),
+            ),
+        ]
+        .spacing(6),
+    )
+}
+
+/// Effect toggles: lit when the stage is in the chain, dimmed when it is not.
+fn effect_button<'a>(label: &'a str, on: bool, message: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .on_press(message)
+        .padding(8)
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(if on { VOLUME } else { CARD })),
+            text_color: if on { TEXT } else { MUTED },
+            border: Border {
+                color: if on { VOLUME } else { CARD_BORDER },
                 width: 1.0,
                 radius: 8.0.into(),
             },
@@ -758,6 +895,52 @@ fn status_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
             kv("landmarks", format!("{}", metrics.hand.landmark_count)),
         ]
         .spacing(4),
+    )
+}
+
+/// The two hands and which is doing what. The modulator's numbers are the raw
+/// sources behind the effect chain, so this card is where a player checks that the
+/// second hand is actually being seen before blaming the sound.
+fn hands_card<'a>(metrics: &'a FrameMetrics) -> Element<'a, Message> {
+    let modulator = &metrics.modulator;
+    let state = if modulator.detected {
+        format!(
+            "seen ({:.2}) {:.0} px away",
+            modulator.confidence, modulator.gap_px
+        )
+    } else {
+        format!("lost for {} ms", modulator.lost_ms)
+    };
+
+    card(
+        "HANDS",
+        column![
+            kv(
+                "pitch",
+                if metrics.hand.detected {
+                    "playing"
+                } else {
+                    "searching"
+                }
+                .to_string(),
+            ),
+            kv("modulator", state),
+            canvas(Meter {
+                value: modulator.gap_level,
+                color: PROXIMITY,
+            })
+            .width(Length::Fill)
+            .height(14),
+            kv(
+                "gap",
+                format!(
+                    "{:.2}x touching ({:.0} px)",
+                    modulator.gap_ratio, modulator.gap_px
+                ),
+            ),
+            small_button("swap hands", Message::SwapHands),
+        ]
+        .spacing(6),
     )
 }
 

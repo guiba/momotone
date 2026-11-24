@@ -344,8 +344,11 @@ mod tests {
     fn mock_mode_draws_ascii_from_the_synthetic_hand() {
         let mut presenter = Presenter::new(40, false, None);
         let mut metrics = FrameMetrics::default();
-        let landmarks = crate::vision::mock::synthetic_detection(0.0)
-            .hand_landmarks
+        let landmarks = crate::vision::mock::synthetic_detection(0.0, 0)
+            .pitch()
+            .unwrap()
+            .landmarks
+            .clone()
             .unwrap();
         let job = PresentJob {
             frame: None,

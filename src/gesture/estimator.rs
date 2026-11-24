@@ -20,7 +20,7 @@
 use crate::core::detection_gate::DetectionGate;
 use crate::core::geometry::{hand_geometry, HandGeometry};
 use crate::core::instrument::VolumeModel;
-use crate::core::{HandDetectionResult, Landmark};
+use crate::core::{HandDetection, Landmark};
 use crate::gesture::{
     proximity_level, proximity_ratio, spread_volume, volume_for, APPROACH_EMA_ALPHA,
     APPROACH_FULL_BAND_FRAMES, PITCH_EMA_ALPHA, PROXIMITY_EMA_ALPHA,
@@ -114,35 +114,44 @@ impl HandEstimator {
         self.far = far;
     }
 
-    /// Resolve one frame's raw detection into the state the strategies read.
-    pub fn update(&mut self, detection: &HandDetectionResult) -> HandState {
-        let present = self.gate.observe(detection.hand_landmarks.is_some());
+    /// Resolve one hand of a frame into the state the strategies read.
+    ///
+    /// `hand` is `None` when the detector found no hand in this slot this frame: the
+    /// gate then runs out its grace window, which is how a one-frame dropout stays
+    /// inaudible.
+    pub fn update(
+        &mut self,
+        hand: Option<&HandDetection>,
+        frame_size: (usize, usize),
+    ) -> HandState {
+        let present = self
+            .gate
+            .observe(hand.and_then(|h| h.landmarks.as_ref()).is_some());
         if !present {
             self.reset();
             return HandState {
                 present: false,
-                frame_size: detection.frame_size,
+                frame_size,
                 ..HandState::default()
             };
         }
 
         // Either sighted this frame, or inside the grace window and carried over
         // from the last one.
-        let landmarks = match &detection.hand_landmarks {
+        let landmarks = match hand.and_then(|h| h.landmarks.as_ref()) {
             Some(landmarks) => landmarks.clone(),
             None => self.previous_landmarks.clone(),
         };
-        let hand_box = detection.r#box.or(self.previous_box);
-        let confidence = if detection.hand_landmarks.is_some() {
-            detection.score
-        } else {
-            self.previous_confidence
+        let hand_box = hand.and_then(|h| h.r#box).or(self.previous_box);
+        let confidence = match hand {
+            Some(hand) if hand.landmarks.is_some() => hand.score,
+            _ => self.previous_confidence,
         };
 
         let jitter_px = landmark_jitter(&self.previous_landmarks, &landmarks);
         let tip = self.smooth_tip(landmarks.get(8));
         let geometry = hand_geometry(&landmarks).unwrap_or_default();
-        let ratio = proximity_ratio(&geometry, detection.frame_size);
+        let ratio = proximity_ratio(&geometry, frame_size);
         let proximity = self.smooth_proximity(proximity_level(ratio, self.near, self.far));
         let pinch = spread_volume(&landmarks, hand_box);
         let volume = volume_for(self.volume_model, proximity, pinch);
@@ -155,7 +164,7 @@ impl HandEstimator {
             present: true,
             landmarks,
             hand_box,
-            frame_size: detection.frame_size,
+            frame_size,
             confidence,
             tip,
             volume,
@@ -246,7 +255,7 @@ mod tests {
     /// A 21-point hand whose index tip (8) is at `(tip_x, tip_y)`, thumb tip (4)
     /// at `thumb_x`, wrist at `(300, 340 + palm)` and middle knuckle (9) at
     /// `(300, 340)` - so `palm` is exactly the palm length the proximity model reads.
-    fn hand_with_palm(tip_x: f32, tip_y: f32, thumb_x: f32, palm: f32) -> HandDetectionResult {
+    fn hand_with_palm(tip_x: f32, tip_y: f32, thumb_x: f32, palm: f32) -> HandDetection {
         let landmarks = (0..21)
             .map(|i| match i {
                 0 => landmark(300.0, 340.0 + palm),           // wrist
@@ -256,35 +265,39 @@ mod tests {
                 _ => landmark(300.0 + i as f32 * 4.0, 340.0), // the other knuckles
             })
             .collect();
-        HandDetectionResult {
-            hand_landmarks: Some(landmarks),
+        HandDetection {
+            landmarks: Some(landmarks),
             r#box: Some((200.0, 140.0, 200.0, 200.0)),
-            frame_size: (640, 480),
             score: 0.9,
-            timings: Default::default(),
         }
     }
 
-    fn hand(tip_x: f32, tip_y: f32, thumb_x: f32) -> HandDetectionResult {
+    fn hand(tip_x: f32, tip_y: f32, thumb_x: f32) -> HandDetection {
         hand_with_palm(tip_x, tip_y, thumb_x, 80.0)
     }
 
+    const FRAME: (usize, usize) = (640, 480);
+
     /// Two sightings, because the gate needs two before a gesture counts as live.
     fn seen(estimator: &mut HandEstimator, palm: f32) -> HandState {
-        estimator.update(&hand_with_palm(300.0, 240.0, 440.0, palm));
-        estimator.update(&hand_with_palm(300.0, 240.0, 440.0, palm))
-    }
-
-    fn empty() -> HandDetectionResult {
-        HandDetectionResult::default()
+        estimator.update(Some(&hand_with_palm(300.0, 240.0, 440.0, palm)), FRAME);
+        estimator.update(Some(&hand_with_palm(300.0, 240.0, 440.0, palm)), FRAME)
     }
 
     #[test]
     /// A single blip is not a gesture; two sightings in a row are.
     fn a_blip_is_not_a_hand_but_two_sightings_are() {
         let mut estimator = HandEstimator::new();
-        assert!(!estimator.update(&hand(300.0, 240.0, 440.0)).present);
-        assert!(estimator.update(&hand(300.0, 240.0, 440.0)).present);
+        assert!(
+            !estimator
+                .update(Some(&hand(300.0, 240.0, 440.0)), FRAME)
+                .present
+        );
+        assert!(
+            estimator
+                .update(Some(&hand(300.0, 240.0, 440.0)), FRAME)
+                .present
+        );
     }
 
     #[test]
@@ -292,20 +305,20 @@ mod tests {
     /// the synthesizer stutter; after it the hand is gone.
     fn the_grace_window_carries_the_last_keypoints() {
         let mut estimator = HandEstimator::new();
-        estimator.update(&hand(300.0, 240.0, 440.0));
-        let live = estimator.update(&hand(300.0, 240.0, 440.0));
+        estimator.update(Some(&hand(300.0, 240.0, 440.0)), FRAME);
+        let live = estimator.update(Some(&hand(300.0, 240.0, 440.0)), FRAME);
         assert!(live.present && live.landmarks.len() == 21);
 
-        let carried = estimator.update(&empty());
+        let carried = estimator.update(None, FRAME);
         assert!(carried.present, "one missed frame is still a gesture");
         assert_eq!(carried.landmarks.len(), 21, "carried over, not cleared");
 
-        let gone = estimator.update(&empty());
+        let gone = estimator.update(None, FRAME);
         assert!(gone.present, "still inside the three frame grace window");
 
-        estimator.update(&empty());
-        estimator.update(&empty());
-        let released = estimator.update(&empty());
+        estimator.update(None, FRAME);
+        estimator.update(None, FRAME);
+        let released = estimator.update(None, FRAME);
         assert!(!released.present, "the grace window ran out");
         assert!(released.landmarks.is_empty());
     }
@@ -315,13 +328,13 @@ mod tests {
     /// average than the raw samples, and a deliberate sweep still arrives.
     fn smoothing_steadies_the_tip_but_still_follows_a_sweep() {
         let mut estimator = HandEstimator::new();
-        estimator.update(&hand(300.0, 240.0, 440.0));
-        estimator.update(&hand(300.0, 240.0, 440.0));
+        estimator.update(Some(&hand(300.0, 240.0, 440.0)), FRAME);
+        estimator.update(Some(&hand(300.0, 240.0, 440.0)), FRAME);
 
         let jitter = [280.0, 320.0, 280.0, 320.0, 280.0, 320.0, 280.0, 320.0];
         let smoothed: Vec<f32> = jitter
             .iter()
-            .map(|&x| estimator.update(&hand(x, 240.0, 440.0)).tip.0)
+            .map(|&x| estimator.update(Some(&hand(x, 240.0, 440.0)), FRAME).tip.0)
             .collect();
         let spread_of = |values: &[f32]| {
             values.iter().max_by(|a, b| a.total_cmp(b)).unwrap()
@@ -337,10 +350,13 @@ mod tests {
         // A real sweep across the frame gets there, lag and all.
         let mut x = 320.0;
         while x <= 640.0 {
-            estimator.update(&hand(x, 240.0, 440.0));
+            estimator.update(Some(&hand(x, 240.0, 440.0)), FRAME);
             x += 20.0;
         }
-        let tip = estimator.update(&hand(640.0, 240.0, 440.0)).tip.0;
+        let tip = estimator
+            .update(Some(&hand(640.0, 240.0, 440.0)), FRAME)
+            .tip
+            .0;
         assert!(
             tip > 500.0,
             "the smoother never caught up with the sweep: {tip}"
@@ -352,14 +368,14 @@ mod tests {
     /// back towards where the hand was before it left.
     fn losing_the_hand_resets_the_smoother() {
         let mut estimator = HandEstimator::new();
-        estimator.update(&hand(100.0, 240.0, 440.0));
-        estimator.update(&hand(100.0, 240.0, 440.0));
-        estimator.update(&empty());
-        estimator.update(&empty());
-        estimator.update(&empty());
-        estimator.update(&empty());
-        estimator.update(&hand(600.0, 60.0, 440.0));
-        let fresh = estimator.update(&hand(600.0, 60.0, 440.0));
+        estimator.update(Some(&hand(100.0, 240.0, 440.0)), FRAME);
+        estimator.update(Some(&hand(100.0, 240.0, 440.0)), FRAME);
+        estimator.update(None, FRAME);
+        estimator.update(None, FRAME);
+        estimator.update(None, FRAME);
+        estimator.update(None, FRAME);
+        estimator.update(Some(&hand(600.0, 60.0, 440.0)), FRAME);
+        let fresh = estimator.update(Some(&hand(600.0, 60.0, 440.0)), FRAME);
         let tip_x = fresh.tip.0;
         assert!((tip_x - 600.0).abs() < 1e-6, "tip was {tip_x}");
     }
@@ -372,12 +388,16 @@ mod tests {
             crate::gesture::PROXIMITY_NEAR,
             crate::gesture::PROXIMITY_FAR,
         );
-        estimator.update(&hand(300.0, 240.0, 440.0));
-        let pinched = estimator.update(&hand(300.0, 240.0, 302.0)).volume;
-        let wide = estimator.update(&hand(300.0, 240.0, 420.0)).volume;
+        estimator.update(Some(&hand(300.0, 240.0, 440.0)), FRAME);
+        let pinched = estimator
+            .update(Some(&hand(300.0, 240.0, 302.0)), FRAME)
+            .volume;
+        let wide = estimator
+            .update(Some(&hand(300.0, 240.0, 420.0)), FRAME)
+            .volume;
         assert!(pinched < wide, "spread must raise the volume");
 
-        let state = estimator.update(&hand(300.0, 240.0, 420.0));
+        let state = estimator.update(Some(&hand(300.0, 240.0, 420.0)), FRAME);
         assert!(state.geometry.palm_length > 0.0);
         assert!(state.geometry.extension[1] > 0.0);
         assert!(state.jitter_px >= 0.0);
@@ -402,8 +422,8 @@ mod tests {
         let open = seen(&mut HandEstimator::new(), 100.0);
         let closed = {
             let mut estimator = HandEstimator::new();
-            estimator.update(&hand_with_palm(300.0, 240.0, 305.0, 100.0));
-            estimator.update(&hand_with_palm(300.0, 240.0, 305.0, 100.0))
+            estimator.update(Some(&hand_with_palm(300.0, 240.0, 305.0, 100.0)), FRAME);
+            estimator.update(Some(&hand_with_palm(300.0, 240.0, 305.0, 100.0)), FRAME)
         };
         assert_eq!(open.volume, closed.volume);
         assert!(open.proximity > 0.0);
@@ -428,8 +448,8 @@ mod tests {
             crate::gesture::PROXIMITY_FAR,
         );
         let closed_state = {
-            closed.update(&hand_with_palm(300.0, 240.0, 305.0, 120.0));
-            closed.update(&hand_with_palm(300.0, 240.0, 305.0, 120.0))
+            closed.update(Some(&hand_with_palm(300.0, 240.0, 305.0, 120.0)), FRAME);
+            closed.update(Some(&hand_with_palm(300.0, 240.0, 305.0, 120.0)), FRAME)
         };
         assert!(
             closed_state.volume < open_volume,
@@ -445,32 +465,32 @@ mod tests {
         let mut towards = HandEstimator::new();
         let mut palm = 20.0;
         while palm <= 140.0 {
-            towards.update(&hand_with_palm(300.0, 240.0, 440.0, palm));
+            towards.update(Some(&hand_with_palm(300.0, 240.0, 440.0, palm)), FRAME);
             palm += 20.0;
         }
         let approaching = towards
-            .update(&hand_with_palm(300.0, 240.0, 440.0, 140.0))
+            .update(Some(&hand_with_palm(300.0, 240.0, 440.0, 140.0)), FRAME)
             .approach;
         assert!(approaching > 0.0, "approaching read as {approaching}");
 
         let mut away = HandEstimator::new();
         let mut palm = 140.0;
         while palm >= 20.0 {
-            away.update(&hand_with_palm(300.0, 240.0, 440.0, palm));
+            away.update(Some(&hand_with_palm(300.0, 240.0, 440.0, palm)), FRAME);
             palm -= 20.0;
         }
         let retreating = away
-            .update(&hand_with_palm(300.0, 240.0, 440.0, 20.0))
+            .update(Some(&hand_with_palm(300.0, 240.0, 440.0, 20.0)), FRAME)
             .approach;
         assert!(retreating < 0.0, "retreating read as {retreating}");
 
         let mut still = HandEstimator::new();
         for _ in 0..10 {
-            still.update(&hand_with_palm(300.0, 240.0, 440.0, 80.0));
+            still.update(Some(&hand_with_palm(300.0, 240.0, 440.0, 80.0)), FRAME);
         }
         assert!(
             still
-                .update(&hand_with_palm(300.0, 240.0, 440.0, 80.0))
+                .update(Some(&hand_with_palm(300.0, 240.0, 440.0, 80.0)), FRAME)
                 .approach
                 .abs()
                 < 1e-6,

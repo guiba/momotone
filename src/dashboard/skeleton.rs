@@ -58,6 +58,17 @@ const GROUP_COLORS: [Color; 6] = [
     Color::from_rgb8(199, 125, 255), // pinky
 ];
 
+/// The modulator hand's palette: the same families as the pitch hand, pulled towards
+/// cyan, so a second skeleton on stage never reads as the one playing notes.
+const MODULATOR_COLORS: [Color; 6] = [
+    Color::from_rgb8(122, 142, 162), // palm
+    Color::from_rgb8(126, 196, 214), // thumb
+    Color::from_rgb8(96, 176, 224),  // index
+    Color::from_rgb8(126, 196, 214), // middle
+    Color::from_rgb8(96, 176, 224),  // ring
+    Color::from_rgb8(126, 196, 214), // pinky
+];
+
 const FINGER_TIPS: [usize; 5] = [4, 8, 12, 16, 20];
 /// The outer palm loop, used as a faint hull fill behind the bones.
 const PALM_HULL: [usize; 5] = [0, 5, 9, 13, 17];
@@ -517,6 +528,10 @@ pub struct Skeleton {
     /// gesture does not quantise to a note.
     pub frequency: Option<f32>,
     pub landmarks: Vec<Landmark>,
+    /// The modulator hand's 21 keypoints, drawn in a cooler ink so the two hands
+    /// are instantly distinguishable on stage.
+    pub modulator_landmarks: Vec<Landmark>,
+    pub modulator_box: Option<(f32, f32, f32, f32)>,
     pub frame_size: (usize, usize),
     pub hand_box: Option<(f32, f32, f32, f32)>,
     pub show_box: bool,
@@ -524,6 +539,8 @@ pub struct Skeleton {
     pub detected: bool,
     /// Milliseconds since the tracker last saw a hand.
     pub lost_ms: u64,
+    /// Milliseconds since the tracker last saw the second hand.
+    pub modulator_lost_ms: u64,
     /// Per-semitone brightness of the keyboard, index = note - NOTE_LOW, as
     /// published by the frame loop.
     pub trail: Vec<f32>,
@@ -644,12 +661,45 @@ impl<Message> Program<Message> for Skeleton {
             }
         }
 
+        // The modulator, in a cooler ink and dimmer: it shapes the sound, it does not
+        // select a note, so it should never read as the main hand. It is drawn whether
+        // or not the pitch hand is present - a hand that is only modulating is still a
+        // hand the player is holding up.
+        if self.modulator_landmarks.len() == 21 {
+            if self.show_box {
+                if let Some((x, y, w, h)) = self.modulator_box {
+                    let rect = map.rect(x, y, w, h);
+                    frame.stroke(
+                        &Path::rectangle(
+                            Point::new(rect.x, rect.y),
+                            Size::new(rect.width, rect.height),
+                        ),
+                        Stroke::default()
+                            .with_color(Color::from_rgb8(120, 180, 220))
+                            .with_width(1.5),
+                    );
+                }
+            }
+            draw_hand(
+                &mut frame,
+                &map,
+                &self.modulator_landmarks,
+                HandStyle {
+                    colours: MODULATOR_COLORS,
+                    strength: 0.55,
+                    role: "mod",
+                    show_labels: false,
+                },
+                bounds,
+            );
+        }
+
         if self.landmarks.len() < 21 {
             frame.fill_text(Text {
                 content: if self.detected {
-                    "hand found, landmark stage failed".to_string()
+                    "pitch hand found, landmark stage failed".to_string()
                 } else {
-                    "no hand detected - searching...".to_string()
+                    "no pitch hand - searching...".to_string()
                 },
                 position: frame.center(),
                 max_width: bounds.width,
@@ -658,13 +708,23 @@ impl<Message> Program<Message> for Skeleton {
                 ..Default::default()
             });
             frame.fill_text(Text {
-                content: format!("lost for {} ms", self.lost_ms),
+                content: format!("pitch lost for {} ms", self.lost_ms),
                 position: Point::new(stage.x + 12.0, stage.y + 6.0),
                 max_width: stage.width,
                 color: Color::from_rgb8(90, 100, 110),
                 size: 11.0.into(),
                 ..Default::default()
             });
+            if self.modulator_landmarks.is_empty() {
+                frame.fill_text(Text {
+                    content: format!("modulator lost for {} ms", self.modulator_lost_ms),
+                    position: Point::new(stage.x + 12.0, stage.y + 22.0),
+                    max_width: stage.width,
+                    color: Color::from_rgb8(90, 100, 110),
+                    size: 11.0.into(),
+                    ..Default::default()
+                });
+            }
             geometry.push(frame.into_geometry());
             return geometry;
         }
@@ -685,75 +745,137 @@ impl<Message> Program<Message> for Skeleton {
             }
         }
 
-        // Palm hull: a translucent fill so the bones read as a hand, not a wire.
-        let hull = Path::new(|path| {
-            for (i, joint) in PALM_HULL.iter().enumerate() {
-                let position = map.point(&self.landmarks[*joint]);
-                if i == 0 {
-                    path.move_to(position);
-                } else {
-                    path.line_to(position);
-                }
-            }
-            path.close();
-        });
-        frame.fill(&hull, tint(GROUP_COLORS[0], 0.12));
-
-        // Bones: a wide translucent pass for the glow, then the crisp bone.
-        for (a, b, group) in CONNECTIONS {
-            let line = Path::line(map.point(&self.landmarks[a]), map.point(&self.landmarks[b]));
-            let color = GROUP_COLORS[group];
-            frame.stroke(
-                &line,
-                Stroke::default()
-                    .with_color(tint(color, 0.25))
-                    .with_width(8.0),
-            );
-            frame.stroke(&line, Stroke::default().with_color(color).with_width(2.5));
-        }
-
-        // Joints; fingertips get a halo so the finger chains stand out.
-        for (index, landmark) in self.landmarks.iter().enumerate() {
-            let position = map.point(landmark);
-            let is_tip = FINGER_TIPS.contains(&index);
-            let radius = if is_tip { 5.5 } else { 3.5 };
-            // Landmark 0 is the wrist, 1..4 the thumb, then four per finger.
-            let group = if index == 0 {
-                0
-            } else if index <= 4 {
-                1
-            } else {
-                2 + (index - 5) / 4
-            };
-            let color = if index == 0 {
-                Color::from_rgb8(240, 244, 248)
-            } else {
-                GROUP_COLORS[group]
-            };
-
-            if is_tip {
-                frame.fill(&Path::circle(position, radius + 6.0), tint(color, 0.18));
-            }
-            frame.fill(&Path::circle(position, radius + 2.0), tint(color, 0.35));
-            frame.fill(&Path::circle(position, radius), color);
-        }
-
-        if self.show_labels {
-            for (finger, tip) in FINGER_TIPS.iter().enumerate() {
-                let position = map.point(&self.landmarks[*tip]);
-                frame.fill_text(Text {
-                    content: crate::core::geometry::FINGER_NAMES[finger].to_string(),
-                    position: Point::new(position.x + 8.0, position.y - 8.0),
-                    max_width: bounds.width,
-                    color: GROUP_COLORS[finger + 1],
-                    size: 12.0.into(),
-                    ..Default::default()
-                });
-            }
-        }
+        draw_hand(
+            &mut frame,
+            &map,
+            &self.landmarks,
+            HandStyle {
+                colours: GROUP_COLORS,
+                strength: 1.0,
+                role: "pitch",
+                show_labels: self.show_labels,
+            },
+            bounds,
+        );
 
         geometry.push(frame.into_geometry());
         geometry
+    }
+}
+
+/// How a hand is drawn: its palette, how strongly, and what role label it carries.
+#[derive(Debug, Clone, Copy)]
+struct HandStyle {
+    colours: [Color; 6],
+    /// Scales every alpha, so the modulator can be drawn faintly without inventing a
+    /// second palette.
+    strength: f32,
+    role: &'static str,
+    show_labels: bool,
+}
+
+/// One hand: palm hull, glowing bones, haloed joints, a role tag, and optional
+/// finger labels.
+fn draw_hand(
+    frame: &mut Frame,
+    map: &Mapping,
+    landmarks: &[Landmark],
+    style: HandStyle,
+    bounds: Rectangle,
+) {
+    let HandStyle {
+        colours,
+        strength,
+        role,
+        show_labels,
+    } = style;
+    // Palm hull: a translucent fill so the bones read as a hand, not a wire.
+    let hull = Path::new(|path| {
+        for (i, joint) in PALM_HULL.iter().enumerate() {
+            let position = map.point(&landmarks[*joint]);
+            if i == 0 {
+                path.move_to(position);
+            } else {
+                path.line_to(position);
+            }
+        }
+        path.close();
+    });
+    frame.fill(&hull, tint(colours[0], 0.12 * strength));
+
+    // Bones: a wide translucent pass for the glow, then the crisp bone.
+    for (a, b, group) in CONNECTIONS {
+        let line = Path::line(map.point(&landmarks[a]), map.point(&landmarks[b]));
+        let color = colours[group];
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(tint(color, 0.25 * strength))
+                .with_width(8.0),
+        );
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(color)
+                .with_width(2.5 * strength),
+        );
+    }
+
+    // Joints; fingertips get a halo so the finger chains stand out.
+    for (index, landmark) in landmarks.iter().enumerate() {
+        let position = map.point(landmark);
+        let is_tip = FINGER_TIPS.contains(&index);
+        let radius = if is_tip { 5.5 } else { 3.5 };
+        // Landmark 0 is the wrist, 1..4 the thumb, then four per finger.
+        let group = if index == 0 {
+            0
+        } else if index <= 4 {
+            1
+        } else {
+            2 + (index - 5) / 4
+        };
+        let color = if index == 0 {
+            Color::from_rgb8(240, 244, 248)
+        } else {
+            colours[group]
+        };
+
+        if is_tip {
+            frame.fill(
+                &Path::circle(position, radius + 6.0),
+                tint(color, 0.18 * strength),
+            );
+        }
+        frame.fill(
+            &Path::circle(position, radius + 2.0),
+            tint(color, 0.35 * strength),
+        );
+        frame.fill(&Path::circle(position, radius), color);
+    }
+
+    // Which hand this is. The role is printed on the palm itself, so two skeletons
+    // on stage can never be confused whichever way the player is holding them.
+    frame.fill_text(Text {
+        content: role.to_string(),
+        position: map.point(&landmarks[9]),
+        max_width: bounds.width,
+        color: tint(colours[0], 0.85 * strength),
+        size: 12.0.into(),
+        ..Default::default()
+    });
+
+    if show_labels {
+        for (finger, tip) in FINGER_TIPS.iter().enumerate() {
+            let position = map.point(&landmarks[*tip]);
+            frame.fill_text(Text {
+                content: crate::core::geometry::FINGER_NAMES[finger].to_string(),
+                position: Point::new(position.x + 8.0, position.y - 8.0),
+                max_width: bounds.width,
+                color: colours[finger + 1],
+                size: 12.0.into(),
+                ..Default::default()
+            });
+        }
     }
 }
 

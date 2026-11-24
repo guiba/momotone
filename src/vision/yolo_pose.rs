@@ -18,7 +18,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 
 use crate::core::frame::Frame;
-use crate::core::{HandDetectionResult, Landmark, StageTimings};
+use crate::core::{HandDetection, HandDetectionResult, Landmark, StageTimings};
 use crate::vision::reuse::{square_box, ReuseCache};
 use crate::vision::sampling::{letterbox_map, sample_affine_to_tensor, StageInput, TensorLayout};
 
@@ -339,10 +339,8 @@ impl YoloPoseTracker {
 
     pub fn process_frame(&mut self, frame: &Frame) -> Result<HandDetectionResult> {
         let mut result = HandDetectionResult {
-            hand_landmarks: None,
-            r#box: None,
+            hands: Vec::new(),
             frame_size: (frame.width(), frame.height()),
-            score: 0.0,
             timings: StageTimings::default(),
         };
 
@@ -350,9 +348,11 @@ impl YoloPoseTracker {
         // a new one - here that saves the *whole* model, not just the landmarker.
         if let Some(anchor) = self.cache.anchor() {
             if let Some(landmarks) = self.cache.reuse(anchor) {
-                result.hand_landmarks = Some(landmarks);
-                result.r#box = Some(square_box(anchor));
-                result.score = self.last_score;
+                result.hands.push(HandDetection {
+                    landmarks: Some(landmarks),
+                    r#box: Some(square_box(anchor)),
+                    score: self.last_score,
+                });
                 tracing::debug!(
                     "hand steady, reusing the previous pose ({} frame{} in a row)",
                     self.cache.streak(),
@@ -370,12 +370,14 @@ impl YoloPoseTracker {
 
         match pose {
             Some(pose) => {
-                result.score = pose.score;
-                result.r#box = Some(pose.r#box);
                 let anchor = box_anchor(pose.r#box);
                 self.cache.refresh(anchor, &pose.landmarks);
                 self.last_score = pose.score;
-                result.hand_landmarks = Some(pose.landmarks);
+                result.hands.push(HandDetection {
+                    landmarks: Some(pose.landmarks),
+                    r#box: Some(pose.r#box),
+                    score: pose.score,
+                });
             }
             None => {
                 // No hand: the cache is worthless and must not be reused on the next

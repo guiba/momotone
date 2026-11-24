@@ -12,9 +12,11 @@ assets/
 .zed/
 
 # The fixture clip is a recording of a real hand, so it is generated locally by
-# `make record` and never committed; neither is the trace recorded from it.
+# `make record` and never committed; neither is the trace recorded from it, nor the
+# two-hand clip and its trace.
 fixtures/*.mp4
 fixtures/clip_trace.json
+fixtures/hands_trace.json
 
 # The mock trace *is* committed: it is deterministic and needs no camera or
 # models, so it is what CI can actually check.

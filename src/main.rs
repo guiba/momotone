@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::synthesizer::Synthesizer;
+use crate::core::effects::EffectMask;
 use crate::core::event_bus::EventBus;
 use crate::core::frame::Frame;
 use crate::core::runtime::{control_channel, RuntimeConfig};
@@ -30,7 +31,7 @@ use crate::presentation::annotator::Visualizer;
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS, DEFAULT_COLS};
 use crate::presentation::presenter::DEFAULT_FEED_FPS;
 use crate::vision::camera::WebcamSource;
-use crate::vision::tracker::{HandTracker, DEFAULT_SCORE_THRESHOLD};
+use crate::vision::tracker::{DetectorWindow, HandTracker, DEFAULT_SCORE_THRESHOLD};
 use crate::vision::video::VideoSource;
 
 #[derive(Parser, Debug)]
@@ -56,6 +57,16 @@ struct Args {
     /// returns the hand box and all 21 keypoints in one pass.
     #[arg(long, value_enum, default_value = "mediapipe")]
     model: Model,
+
+    /// How many hands the tracker looks for. `one` is the original behaviour: a
+    /// `min(W,H)` square slid to the palm seen last frame, reporting a single hand.
+    /// `two` is the instrument: the pitch hand still comes from that anchored crop,
+    /// which is the more sensitive window, and a second whole-frame pass finds the
+    /// modulator the crop physically cannot reach. `probe` runs both windows and
+    /// prints the comparison without changing what the instrument does - it is how
+    /// the two-hand decision was measured.
+    #[arg(long, value_enum, default_value = "two")]
+    hands: Hands,
 
     /// ONNX Runtime intra-op threads. 0 leaves the runtime default (one thread per
     /// core); a positive number pins the pool, which is worth trying if the model's
@@ -155,6 +166,12 @@ struct Args {
     #[arg(long, default_value = "blocks")]
     ascii_ramp: String,
 
+    /// Which stages are in the effect chain: `lowpass`, `vibrato`, `delay`, or
+    /// `none`. The parameters they use are continuous, so a stage can join a note
+    /// that is already sounding; the dashboard's EFFECTS card flips them live.
+    #[arg(long, default_value = "lowpass")]
+    effects: String,
+
     /// Write each rendered ASCII frame to this file. Handy for checking the art
     /// headlessly, e.g. with `--mode mock --no-ui --ascii-dump art.txt`.
     #[arg(long)]
@@ -244,6 +261,13 @@ struct Args {
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
+enum Hands {
+    One,
+    Two,
+    Probe,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum Model {
     #[value(name = "mediapipe")]
     MediaPipe,
@@ -273,6 +297,11 @@ fn build_tracker(args: &Args) -> Result<HandTracker> {
             args.score_threshold,
             !args.landmarker_always,
             args.ort_threads,
+            match args.hands {
+                Hands::One => DetectorWindow::Anchored,
+                Hands::Two => DetectorWindow::TwoHands,
+                Hands::Probe => DetectorWindow::Probe,
+            },
         ),
         Model::Yolo => HandTracker::yolo_pose(
             &args.pose_path,
@@ -347,12 +376,26 @@ fn main() -> Result<()> {
         )
     })?;
 
+    let effects = EffectMask::parse(&args.effects).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown effect '{}'; available: {}",
+            args.effects,
+            crate::core::effects::Effect::all()
+                .iter()
+                .map(|effect| effect.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    tracing::info!("effect chain: {}", effects.names());
+
     // 1. Headless single-image mode: verify the detector offline.
     if let Some(path) = &args.image {
         let mut tracker = build_tracker(&args).context("Failed to initialize hand tracker")?;
 
         let mut frame = Frame::read(path)?;
-        let detection = tracker.process_frame(&frame)?;
+        // Single image: no UI to trade roles with, so slot 0 plays pitch.
+        let detection = tracker.process_frame(&frame, 0)?;
         Visualizer::new().draw_skeleton(&mut frame, &detection);
 
         let out = args
@@ -362,10 +405,14 @@ fn main() -> Result<()> {
         frame.write(&out)?;
 
         tracing::info!(
-            "detection: box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",
-            detection.r#box,
-            detection.score,
-            detection.hand_landmarks.as_ref().map_or(0, |l| l.len()),
+            "detection: {} hand(s); pitch box={:?} score={:.3} landmarks={} detector={:.0}us landmarker={:.0}us",
+            detection.hands.len(),
+            detection.pitch().and_then(|h| h.r#box),
+            detection.pitch().map_or(0.0, |h| h.score),
+            detection
+                .pitch()
+                .and_then(|h| h.landmarks.as_ref())
+                .map_or(0, |l| l.len()),
             detection.timings.detector_us,
             detection.timings.landmarker_us,
         );
@@ -485,12 +532,13 @@ fn main() -> Result<()> {
         args.ascii,
         ascii_ramp,
     )));
-    // The loudness model and its band are runtime knobs, so they live in the same
-    // config the dashboard will change later.
+    // The loudness model, its band and the effect chain are runtime knobs, so they
+    // live in the same config the dashboard will change later.
     if let Ok(mut config) = control.lock() {
         config.volume = volume_model;
         config.proximity_near = args.proximity_near;
         config.proximity_far = args.proximity_far;
+        config.effects = effects;
     }
 
     let mut pipeline = Pipeline::new(pipeline::PipelineConfig {

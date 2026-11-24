@@ -5,6 +5,43 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
+- **Two hands.** `--hands one|two|probe` (default `two`) turns the instrument into a
+  pitch hand plus a modulator hand. The pitch hand still comes from the palm-anchored
+  192×192 crop - the more sensitive window - and a second letterboxed whole-frame pass
+  finds the modulator, which the crop physically cannot reach. Both hands run the same
+  landmarker with their own reuse cache, so the second hand is detected exactly like the
+  first. `HandDetectionResult` now carries `hands: Vec<HandDetection>` in role order with
+  `MAX_HANDS = 2`, and `HandEstimator` is instantiated twice. Palm anchors above the score
+  gate are merged by greedy spatial NMS (`non_overlapping`) at the measured
+  `HAND_SEPARATION = 1.0`, and hands keep their slot across frames (`match_to_slots`,
+  `SLOT_MAX_JUMP = 0.35`) so the two hands do not trade identities when the detector's
+  scores flip. The modulator drives the effect chain - its proximity, height and horizontal
+  position - and the distance between the palms drives vibrato depth and echo feedback; with
+  one hand in view that hand drives everything, exactly as before. The gap is normalised by
+  the hands' own sizes (`gap_level(distance, touching)`), so it reads the same at 640×480
+  and 1620×1080. The dashboard gains a HANDS card with a **swap hands** button, and the
+  modulator skeleton is drawn in a cooler, dimmer palette labelled "mod". Measured on the
+  two-hand fixture: inference p50 16.9 ms with two detector passes and two landmarker runs,
+  against 11.8 ms with one hand - still inside the 33 ms frame budget.
+- **A detector-window probe.** `--hands probe` runs the anchored crop and the whole-frame
+  pass over the same frames and prints the comparison - detections, mean score, hands per
+  frame at each NMS separation, and µs per detector pass. `make probe`, `make probe-single`
+  and `make probe-640` run it on the fixtures. It is a measuring mode, not a playing mode.
+  The measurement it produced is what settled the two-hand design (see `SECOND_HAND_PLAN.md`
+  §16).
+- **An effect chain, driven by the hand.** `src/core/effects.rs` declares the stages
+  (`lowpass`, `vibrato`, `delay`) as source -> parameter -> curve, and the frame loop
+  smooths their parameters every frame and puts them on the bus as
+  `BusMessage::Modulation`, which sinks receive through `Sink::set_modulation` (a
+  default no-op, so the MIDI engine is unaffected for now). The synthesizer runs
+  `glide -> vibrato -> oscillator -> one-pole lowpass -> comb delay -> soft clip`; the
+  delay line is allocated once when the stream opens, and the audio callback still takes
+  no lock and allocates nothing. `--effects lowpass,vibrato,delay|none` sets the chain
+  at launch and the dashboard's EFFECTS card toggles it live. When the hand leaves the
+  frame the chain fades to neutral over `--fade-ms` rather than switching off, and a
+  released note rings out through an echo that is already in the ring instead of being
+  cut off. Measured cost: ~7 ns per audio sample, ~0.2 ms of the 33 ms frame budget, and
+  it is not spent in the frame loop at all.
 - **OpenCV is gone.** `opencv` 0.102 was the project's only native dependency and it was
   doing three chores: grabbing pixels, cropping/resampling into the model input, and
   drawing the `--image` overlay. All three are now Rust:
@@ -54,6 +91,31 @@ in parentheses are the branches each phase was developed on.
   attributes struct, the wgpu compositor settings, the adapter and format lists. A run
   now starts with the seven lines that describe *this* run; ONNX Runtime's single CoreML
   capability warning still shows, and `RUST_LOG=info,iced_winit=info` gets the detail back.
+- **The echo no longer crackles.** Two bugs in the delay stage made it sound like noise
+  rather than an echo. `delay_ms` is the fingertip's horizontal position, so it wobbles
+  constantly, and the comb tap was an integer: every time the modulation crossed the
+  2 ms deadband the tap jumped by up to 88 samples, i.e. the feedback loop read an
+  unrelated sample of the ring - an impulse. Across one measured sweep that is a click
+  every 256 samples (worst sample-to-sample step 0.69 against the note's own slope of
+  0.025). The tap is now a float that slews at most one sample per audio sample
+  (`DELAY_SLEW`), read by linear interpolation between the two samples either side of it.
+  Second, a feedback comb has a loop gain of `1/(1 - feedback)` at its resonances, so 0.6
+  feedback made a note 2.5x louder than the envelope asked for and parked it in the soft
+  clipper: ~24 % harmonic distortion. The stage is now pre-scaled by `1 - feedback`, so a
+  held note comes out at the level the hand set and the tail still decays by `feedback`
+  per repeat. Two new regression tests fail on the old behaviour. A fresh attack after the
+  voice went silent empties the ring and snaps the float tap to the current echo time, so
+  the previous note's echo cannot layer onto the attack and the tap cannot chirp through
+  a slew while the hand sat still; the tail on a release is unchanged.
+- **The lowpass now bites.** Its knee was an absolute `200-8000 Hz`, which for the
+  notes this instrument plays (C2-C6, 65-1047 Hz) sits above every fundamental: a
+  pole at 4 kHz attenuates a 440 Hz sine by 1 %, so switching the stage on or off
+  was inaudible except when the hand backed right off. The knee is now measured in
+  harmonics of the sounding note (`CUTOFF_MIN_HARMONICS = 0.5` to `CUTOFF_MAX_HARMONICS
+  = 3.0`, `cutoff_for(frequency, proximity)`), and it is two cascaded poles instead
+  of one - 12 dB per octave rather than 6. At the dark end a note loses ~14 dB and
+  a square loses its harmonics down to the second; the EFFECTS card shows the knee as
+  `2.4x harmonics (627 Hz)` instead of a bare hertz value.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

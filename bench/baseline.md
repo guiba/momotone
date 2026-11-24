@@ -331,6 +331,54 @@ OpenCV vectorises the bilinear tap, our loop does not, so the 224x224 landmarker
 costs ~2.5x more. On a 33 ms frame budget that is noise — the whole capture stage of a
 fixture run is 1.9 ms p50.
 
+## Detector window: anchored crop vs whole frame (PR 2)
+
+`make probe` runs `--detector-window both`, which keeps the anchored crop as the
+behaviour and scores the letterboxed whole frame alongside it. Two windows, one run,
+identical conditions. 200 frames each, release build, quiet machine.
+
+| clip | window | frames with a hand | mean best score | hands/frame | frames with 2+ hands | detector µs/frame |
+| :-- | :-- | --: | --: | --: | --: | --: |
+| `hand_clip.mp4` (640×480, one hand) | crop | 173 | 0.838 | 0.87 | 1 | 8126 |
+| | frame | 162 | 0.785 | 0.81 | **0** | 7902 |
+| `2_hands_640.mp4` (640×480) | crop | 200 | 0.953 | 1.46 | 92 | 10486 |
+| | frame | 200 | 0.957 | **1.90** | **179** | 10181 |
+| `2_hands_clip.mp4` (1620×1080) | crop | 199 | 0.951 | 1.01 | 4 | 8900 |
+| | frame | 198 | 0.949 | **1.84** | **171** | 8436 |
+
+Three things fall out of this:
+
+- **The whole-frame window is not slower.** Both windows sample the same 192×192
+  buffer; only the affine differs. 7.9 ms vs 8.1 ms is within run-to-run noise. A
+  previous reading of "the frame window is 2.5× slower" was contention from a second
+  copy of the app running in another terminal.
+- **Only the frame window sees a second hand.** At native 1620×1080 the anchored crop -
+  a `min(W,H)` = 1080 square - finds two palms in 4 frames out of 200, because the two
+  hands are further apart than the window can span. The letterbox finds them in 171.
+- **The frame window does lose detections on a single distant hand** (173 → 162), and
+  it is not a gate problem: sweeping `--score-threshold` 0.6 → 0.5 → 0.4 moves the
+  frame window 162 → 165 → 169 while the crop goes 173 → 178 → 179 and its false
+  positives grow from 1 frame to 11. Lowering the threshold buys crop noise, not frame
+  recall.
+
+Across 753 detections on the two-hand clips, no palm centre landed in the top 22% of
+the frame where the face and torso are: the letterbox padding does not manufacture
+hands.
+
+### The separation gate
+
+Hands per frame on `2_hands_640.mp4` as the NMS gate widens:
+
+| gate | 0.25 | 0.5 | 1.0 | 2.0 |
+| :-- | --: | --: | --: | --: |
+| crop | 1.46 | 1.46 | 1.46 | 1.18 |
+| frame | 1.90 | 1.90 | 1.90 | 1.34 |
+
+One hand's duplicate anchors merge at any gate up to 1.0; separate hands only start
+merging at 2.0. Measured palm-centre separation in the clip is 1.3-2.6 palm radii.
+`HAND_SEPARATION = 1.0` is the widest gate that still separates the hands while leaving
+margin before they merge.
+
 ## Fixture and trace
 
 `fixtures/hand_clip.mp4` is a recording of a real hand, so it is **not in the repo**
@@ -379,3 +427,46 @@ make mock-trace-check    # CI's gate
 Tests: **181 passing** (7 ignored), `make verify` green, `unsafe` down to the single
 documented `unsafe impl Send for StreamWrapper` (four raw-pointer reads in the tracker's
 tensor sampling went away with OpenCV).
+
+## The effect chain costs nanoseconds, not milliseconds
+
+The chain (one-pole lowpass, LFO vibrato, comb delay) runs inside the cpal callback, so the
+number that matters is cost per audio sample, not per frame. Measured on the same machine,
+`cargo test --release -- --include-ignored bench_chain_cost --nocapture` (1 M samples at
+44.1 kHz):
+
+| Voice | ns/sample | Cost over one 33 ms frame |
+| :-- | :-- | :-- |
+| Sine, no chain | 5.7 | 0.19 ms |
+| Sine, all three stages | 12.8 | 0.42 ms |
+| Square, no chain | 31.6 | 1.04 ms |
+| Square, all three stages | 36.9 | 1.22 ms |
+
+The chain adds ~7 ns per sample, i.e. ~0.2 ms per frame - 0.6 % of the 33 ms budget, and it
+does not touch inference at all (the parameters are computed once per frame on the pipeline
+thread and read once per audio block). The timbre is an order of magnitude more expensive
+than the filtering: a band-limited square is 5x the cost of a sine before any effect is
+switched on.
+
+The delay ring is `DELAY_MAX_MS` (600 ms) long, allocated once in `Voice::idle` when the
+stream opens: ~106 KB at 44.1 kHz, never reallocated by the callback.
+
+
+## Two hands costs five milliseconds
+
+`--hands two` is the default, so these are the numbers the instrument actually runs with.
+Two-hand fixture (`fixtures/2_hands_640.mp4`, 120 frames, release build, MediaPipe):
+
+| Window | inference p50 | p95 | p99 | max |
+| :-- | --: | --: | --: | --: |
+| `--hands one` (anchored crop) | 11.8 ms | 14.8 ms | 15.4 ms | 15.9 ms |
+| `--hands two` (crop + whole frame) | 16.9 ms | 19.2 ms | 20.3 ms | 23.6 ms |
+
+The extra detector pass plus a second landmarker run costs ~5 ms per frame - under a sixth
+of the 33 ms budget. The whole-frame pass is not intrinsically more expensive than the crop
+(both sample into the same 192x192 buffer); the probe measured 9.7 ms vs 8.9 ms per pass on
+the native-resolution clip. Landmark reuse covers the modulator as well, so a still second
+hand costs no landmarker time at all.
+
+Detected hand counts on the two-hand clip, 120 frames: the crop reports a second hand in 1
+frame, the whole-frame pass in 105. That is the measurement PR 3 is built on.
