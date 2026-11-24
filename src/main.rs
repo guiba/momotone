@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -336,8 +337,35 @@ fn init_logging(debug: bool) {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+/// Resolve an asset path relative to the cwd, falling back to the `.app`
+/// bundle's `Resources/assets/` when the binary runs installed. The bundled
+/// DMG ships the models inside the package, where a cwd-relative path never
+/// resolves. An explicit `--<flag> /path/to/file` always wins.
+fn resolve_asset(path: &str) -> String {
+    if Path::new(path).exists() {
+        return path.to_string();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // MacOS/momotone -> Resources/assets/<file>
+        if let Some(macos) = exe.parent() {
+            if let Some(contents) = macos.parent() {
+                let file = Path::new(path).file_name().unwrap_or_default();
+                let candidate = contents.join("Resources").join("assets").join(file);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    path.to_string()
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.detector_path = resolve_asset(&args.detector_path);
+    args.landmarker_path = resolve_asset(&args.landmarker_path);
+    args.anchors_path = resolve_asset(&args.anchors_path);
+    args.pose_path = resolve_asset(&args.pose_path);
     init_logging(args.debug);
 
     tracing::info!("starting momotone in {:?} mode", args.mode);

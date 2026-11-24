@@ -126,6 +126,20 @@ make hands-trace    # record the two-hand golden trace
 make hands-check    # fail if the two-hand run drifts
 ```
 
+## Releases
+
+An unsigned DMG build lives at `make release` (= `scripts/release.sh`): it compiles
+`--release`, assembles `Momotone.app` (models bundled under `Contents/Resources/assets/`)
+and packs it with `hdiutil` into `target/release/Momotone.dmg`.
+
+Publishing a release is a tag push: `git tag vX.Y.Z && git push origin vX.Y.Z` triggers
+`.github/workflows/release.yml`, which runs the same script on a self-hosted macOS runner
+and attaches the DMG to the GitHub release. The runner must be registered against the repo
+with the labels `macOS` and `ARM64`, and the models must exist in `assets/` on that machine.
+
+Unsigned means Gatekeeper blocks the first launch: right-click the app and choose Open,
+or `xattr -d com.apple.quarantine Momotone.app` after mounting.
+
 ## Tests
 
 `make verify` is the local gate and the CI gate: `cargo check`, `cargo test` (220 tests),

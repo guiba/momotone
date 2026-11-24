@@ -1,0 +1,36 @@
+name: Release
+
+# Tag a release — e.g. `git tag v0.2.0 && git push origin v0.2.0` — and this
+# builds an unsigned DMG on your own macOS runner and attaches it to the
+# GitHub release. Unsigned means Gatekeeper blocks first run; signed/notarized
+# releases need a Developer ID certificate and an Apple ID (not set up yet).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Build DMG (unsigned)
+    # Self-hosted: this repo's models live in assets/ (gitignored), so a build
+    # only works on a machine that has them. The runner needs to be registered
+    # against this repo with a label matching macOS + ARM64 (see the README's
+    # releases section). Fork PRs are never eligible — tag pushes are the only
+    # trigger.
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DMG
+        run: scripts/release.sh
+
+      - name: Upload DMG to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/Momotone*.dmg
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true

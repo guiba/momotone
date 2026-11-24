@@ -5,6 +5,13 @@ in parentheses are the branches each phase was developed on.
 
 ## Unreleased
 
+- **Unsigned DMG release.** `make release` (and `.github/workflows/release.yml` on a
+  `v*` tag push, running `scripts/release.sh` on a self-hosted macOS runner) builds an
+  unsigned `Momotone.dmg` with the models bundled inside the `.app`. The binary now falls
+  back to `Resources/assets/` inside the bundle when the default asset paths do not resolve
+  relative to the cwd, so the installed app finds its models. Releases are unsigned and will
+  be blocked by Gatekeeper on first run until a Developer ID is set up.
+
 - **Two hands.** `--hands one|two|probe` (default `two`) turns the instrument into a
   pitch hand plus a modulator hand. The pitch hand still comes from the palm-anchored
   192×192 crop - the more sensitive window - and a second letterboxed whole-frame pass
