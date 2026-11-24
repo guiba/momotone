@@ -38,7 +38,7 @@ CLIP_FRAMES ?= 120
         probe probe-single probe-640 \
         hands-640 hands-trace hands-check \
         mock-trace mock-trace-check \
-        stats clean
+        stats clean release
 
 ## The gate: run this before every commit.
 verify: check test fmt-check clippy
@@ -51,7 +51,7 @@ help:
 	@echo ""
 	@echo "  gate     verify | fmt-check | clippy | clippy-fix | check"
 	@echo "  tests    test | bench"
-	@echo "  builds   build | check"
+	@echo "  builds   build | release (unsigned DMG) | check"
 	@echo "  run      run | run-release | mock | ascii | headless | yolo | image IMG=photo.png"
 	@echo "  fixture  fixture | trace-check | record | trace"
 	@echo "  probe    probe | probe-single | probe-640   (crop vs whole-frame detection counts)"
@@ -211,3 +211,8 @@ stats:
 
 clean:
 	$(CARGO) clean
+
+## --- release ------------------------------------------------------------------
+
+release:
+	sh scripts/release.sh
