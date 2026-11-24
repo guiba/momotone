@@ -29,8 +29,8 @@ use crate::core::trace::Trace;
 use crate::core::types::Performance;
 use crate::core::{box_centre, HandDetectionResult, Sink, MAX_HANDS};
 use crate::dashboard::metrics::{
-    cell_index, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView, SoundView,
-    LOG_CAPACITY,
+    cell_index, note_frequency, note_name, EventLogEntry, FrameMetrics, KeyboardTrail, SceneView,
+    SoundView, LOG_CAPACITY,
 };
 use crate::gesture::{band_position, HandEstimator, HandState, Strategy};
 use crate::presentation::ascii::{Ramp, DEFAULT_ASCII_FPS};
@@ -932,12 +932,22 @@ impl Pipeline {
             // `band_position` is the same inset the keyboard is drawn with, so the
             // hand's height and width mean the same thing here as they do on stage.
             let (x, y) = band_position(driver.tip.0, driver.tip.1, driver.frame_size);
+            // The filter's knee is a multiple of the pitch that is actually sounding,
+            // so the same hand position darkens C2 and C6 equally. Before a note has
+            // ever sounded, `cutoff_for` uses the middle of the keyboard.
+            let sounding = self
+                .metrics
+                .sound
+                .frequency
+                .or_else(|| self.metrics.sound.note.map(note_frequency))
+                .unwrap_or(0.0);
             modulation_from_hands(
                 settings.effects,
                 driver.proximity,
                 1.0 - y, // higher in the frame = faster wobble
                 gap,
                 x,
+                sounding,
             )
         } else {
             Modulation::neutral_with(settings.effects)

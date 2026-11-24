@@ -36,6 +36,12 @@ const RELEASE_SECONDS: f32 = 0.06;
 /// Time constant of the pitch glide. The strategy retargets the voice every frame
 /// (33 ms), so without a ramp a keyboard sweep jumps between notes in one sample.
 const GLIDE_SECONDS: f32 = 0.015;
+/// How fast the echo time may move, in samples of delay per audio sample. The delay
+/// is driven by the fingertip's horizontal position, so a moving hand asks for a new
+/// echo time every frame; stepping the comb tap straight to it makes the stage read an
+/// unrelated sample of the ring, which is an impulse - a click, every time the hand
+/// moves. One sample per sample turns that step into a glide the ear cannot hear.
+const DELAY_SLEW: f32 = 1.0;
 /// Below this the voice is inaudible, and the callback skips the oscillator.
 const SILENT: f32 = 1e-4;
 /// Harmonics kept for the discontinuous waveforms. A step function contains every
@@ -172,8 +178,9 @@ struct Voice {
     waveform: Waveform,
     /// The chain this voice is running, refreshed once per audio block.
     chain: Chain,
-    /// One-pole filter state, and the cutoff its coefficient was derived from.
+    /// Filter states, one per pole, and the cutoff their coefficient came from.
     filter_y: f32,
+    filter_second_pole: f32,
     filter_cutoff: f32,
     filter_k: f32,
     /// LFO position for the vibrato, 0..1.
@@ -181,6 +188,9 @@ struct Voice {
     /// Delay line, sized when the stream opens so the callback never allocates.
     delay: Vec<f32>,
     delay_write: usize,
+    /// The echo time currently in use, in samples, moving towards the chain's
+    /// `delay_ms` by at most `DELAY_SLEW` per sample.
+    delay_taps: f32,
     /// Magnitude of the last sample the delay stage produced. An echo outlives the
     /// note that made it, so "silent" has to mean the ring is empty too, not just
     /// that the envelope has closed.
@@ -198,6 +208,7 @@ impl Voice {
             waveform: Waveform::Sine,
             chain: Chain::idle(),
             filter_y: 0.0,
+            filter_second_pole: 0.0,
             filter_cutoff: NEUTRAL_CUTOFF_HZ,
             filter_k: 1.0,
             lfo_phase: 0.0,
@@ -205,6 +216,7 @@ impl Voice {
             // and never reallocated by the callback.
             delay: vec![0.0; (DELAY_MAX_MS * sample_rate / 1000.0) as usize + 1],
             delay_write: 0,
+            delay_taps: 0.0,
             echo_tail: 0.0,
         }
     }
@@ -221,6 +233,30 @@ impl Voice {
 
     fn release(&mut self) {
         self.target_amplitude = 0.0;
+    }
+
+    /// A fresh attack starts from a clean slate. The ring still holds the previous
+    /// note's tail and the float tap may have been slewed to the echo time the hand
+    /// asked for while the voice sat silent; replaying either would layer a stale
+    /// echo onto the attack, and a slew through the ring is a chirp. Snap the tap
+    /// to the current echo time and empty the ring.
+    fn reset_for_attack(&mut self, sample_rate: f32) {
+        for sample in self.delay.iter_mut() {
+            *sample = 0.0;
+        }
+        self.delay_write = 0;
+        self.echo_tail = 0.0;
+        self.delay_taps =
+            (self.chain.delay_ms * sample_rate / 1000.0).clamp(0.0, (self.delay.len() - 1) as f32);
+    }
+
+    /// Snap the tap to the current echo time without slewing. Only called while the
+    /// envelope is effectively closed (the voice is on its way into silence or into
+    /// attack), where a slew would be a chirp through whatever is in the ring.
+    fn snap_delay_taps(&mut self, sample_rate: f32) {
+        let desired =
+            (self.chain.delay_ms * sample_rate / 1000.0).clamp(0.0, (self.delay.len() - 1) as f32);
+        self.delay_taps = desired;
     }
 
     fn is_silent(&self) -> bool {
@@ -268,20 +304,36 @@ impl Voice {
 
         let value = if self.chain.lowpass {
             let k = self.filter_coefficient(sample_rate);
-            one_pole(&mut self.filter_y, value, k)
+            // Two identical poles: 12 dB per octave rather than the 6 dB a single pole
+            // gives. That is what makes the stage read as a tone control instead of a
+            // faint change in level.
+            one_pole(&mut self.filter_y, value, k);
+            one_pole(&mut self.filter_second_pole, self.filter_y, k)
         } else {
             // Track the signal while the stage is off, so switching it on mid-note
             // starts from the current value rather than a stale one and clicks.
             self.filter_y = value;
+            self.filter_second_pole = value;
             value
         };
 
-        let taps = (self.chain.delay_ms * sample_rate / 1000.0) as usize;
-        let value = if self.chain.delay && taps >= 1 {
+        // The tap is a float that only ever moves a sample at a time. `delay_ms` is
+        // the hand's position, so it wobbles constantly; an integer tap would jump by
+        // whole milliseconds and each jump is a click out of the feedback loop.
+        let desired =
+            (self.chain.delay_ms * sample_rate / 1000.0).clamp(0.0, (self.delay.len() - 1) as f32);
+        self.delay_taps += (desired - self.delay_taps).clamp(-DELAY_SLEW, DELAY_SLEW);
+        let taps = self.delay_taps;
+        // A feedback comb has a loop gain of 1/(1 - feedback) at its resonances, so
+        // 0.6 feedback amplifies the note 2.5x and drives it into the limiter: the
+        // echo then sounds like distortion rather than echo. Pre-scaling by the same
+        // factor makes the loop unity-gain, and the tail still decays by `feedback`
+        // per repeat.
+        let value = if self.chain.delay && taps >= 1.0 {
             comb(
                 &mut self.delay,
                 &mut self.delay_write,
-                value,
+                value * (1.0 - self.chain.feedback),
                 taps,
                 self.chain.feedback,
             )
@@ -300,7 +352,7 @@ impl Voice {
         soft_clip(value)
     }
 
-    /// `k` for the one-pole at the current cutoff. Recomputed only when the cutoff
+    /// `k` for the poles at the current cutoff. Recomputed only when the cutoff
     /// moved, because an `exp` per sample would cost more than the filter.
     fn filter_coefficient(&mut self, sample_rate: f32) -> f32 {
         let cutoff = self.chain.cutoff_hz;
@@ -322,13 +374,19 @@ fn one_pole(state: &mut f32, sample: f32, k: f32) -> f32 {
 /// A comb delay: `y[n] = x[n] + feedback * y[n - taps]`. The ring holds the stage's
 /// *output*, not its input, which is what makes feedback repeat: each tap is the
 /// previous echo, so the tail decays geometrically instead of echoing once.
-/// The ring is written after the tap is read, so `taps = 0` cannot feed the current
+/// The tap is fractional: the value is read by linear interpolation between the two
+/// samples either side of it, which is what lets the echo time glide instead of
+/// snapping to a whole number of samples.
+/// The ring is written after the tap is read, so `taps < 1` cannot feed the current
 /// sample into itself.
-fn comb(buffer: &mut [f32], write: &mut usize, sample: f32, taps: usize, feedback: f32) -> f32 {
+fn comb(buffer: &mut [f32], write: &mut usize, sample: f32, taps: f32, feedback: f32) -> f32 {
     let length = buffer.len();
-    let taps = taps.min(length - 1);
-    let read = (*write + length - taps) % length;
-    let out = sample + feedback * buffer[read];
+    let whole = (taps.floor() as usize).min(length - 1);
+    let fraction = taps - taps.floor();
+    let read = (*write + length - whole) % length;
+    let older = (read + length - 1) % length;
+    let tapped = buffer[read] + (buffer[older] - buffer[read]) * fraction;
+    let out = sample + feedback * tapped;
     buffer[*write] = out;
     *write = (*write + 1) % length;
     out
@@ -437,10 +495,18 @@ impl Sink for Synthesizer {
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // One chain read per block, not per sample: the whole effect chain is
                 // a handful of atomic loads and a copy of a small struct.
+                let was_silent = voice.is_silent();
                 voice.set_chain(target.chain());
                 if target.is_sounding() {
                     let (frequency, amplitude, waveform) = target.read();
                     voice.set_target(frequency, amplitude, waveform);
+                    if was_silent {
+                        voice.reset_for_attack(sample_rate);
+                    } else if voice.amplitude <= SILENT {
+                        // Envelope closed but the echo has not fully drained yet:
+                        // snap, don't slew, so the new attack cannot chirp.
+                        voice.snap_delay_taps(sample_rate);
+                    }
                 } else {
                     voice.release();
                 }
@@ -688,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    /// The one-pole keeps what is below its cutoff and throws away what is above it.
+    /// The filter keeps what is below its knee and throws away what is above it.
     fn a_closed_filter_darkens_a_note_more_than_an_open_one() {
         let rms_at = |cutoff: f32| {
             let mut voice = Voice::idle(44100.0);
@@ -752,7 +818,7 @@ mod tests {
         let mut out = Vec::new();
         for frame in 0..30 {
             let impulse = if frame == 0 { 1.0 } else { 0.0 };
-            out.push(comb(&mut buffer, &mut write, impulse, 10, 0.5));
+            out.push(comb(&mut buffer, &mut write, impulse, 10.0, 0.5));
         }
         assert!((out[0] - 1.0).abs() < 1e-6, "the dry signal always passes");
         assert!(
@@ -780,9 +846,185 @@ mod tests {
         let mut out = Vec::new();
         for frame in 0..30 {
             let impulse = if frame == 0 { 1.0 } else { 0.0 };
-            out.push(comb(&mut buffer, &mut write, impulse, 5, 0.0));
+            out.push(comb(&mut buffer, &mut write, impulse, 5.0, 0.0));
         }
         assert!(out.iter().skip(1).all(|&value| value.abs() < 1e-6));
+    }
+
+    #[test]
+    /// A lowpass is only a tone control if it has something to remove. A square at A3
+    /// carries harmonics out to 5 kHz; with the knee at twice the fundamental most of
+    /// them are gone, and the mean amplitude of the waveform drops by a third. Two
+    /// poles are what make that a real change rather than a rounding error.
+    fn the_filter_actually_darkens_a_harmonic_note() {
+        let mean_abs = |cutoff: f32| {
+            let mut voice = Voice::idle(44100.0);
+            voice.set_chain(Chain {
+                lowpass: true,
+                cutoff_hz: cutoff,
+                ..Chain::idle()
+            });
+            voice.set_target(220.0, 0.8, Waveform::Square);
+            let mut total = 0.0;
+            for _ in 8820..17640 {
+                total += voice.next_sample(44100.0).abs();
+            }
+            total / 8820.0
+        };
+        let open = mean_abs(NEUTRAL_CUTOFF_HZ);
+        let dark = mean_abs(440.0); // the knee at two harmonics of A3
+        assert!(
+            dark < open * 0.8,
+            "a knee at 2 harmonics moved the square from {open} to {dark}"
+        );
+    }
+
+    #[test]
+    /// The knee is measured in harmonics, so the darkest end of the band is a real
+    /// muffle: a note at half its own fundamental loses most of its energy.
+    fn the_dark_end_of_the_band_is_a_muffle() {
+        let level = |cutoff: f32| {
+            let mut voice = Voice::idle(44100.0);
+            voice.set_chain(Chain {
+                lowpass: true,
+                cutoff_hz: cutoff,
+                ..Chain::idle()
+            });
+            voice.set_target(220.0, 0.8, Waveform::Sine);
+            let mut loudest = 0.0f32;
+            for _ in 22050..24090 {
+                loudest = loudest.max(voice.next_sample(44100.0).abs());
+            }
+            loudest
+        };
+        assert!(
+            level(110.0) < 0.25,
+            "a 220 Hz note through a 110 Hz knee should be nearly gone, measured {}",
+            level(110.0)
+        );
+    }
+
+    #[test]
+    /// A tap that is not a whole number of samples sits between two of them, so the
+    /// echo arrives split across the pair instead of snapping to one side.
+    fn a_fractional_tap_is_read_between_two_samples() {
+        let mut buffer = vec![0.0; 2000];
+        let mut write = 0usize;
+        let mut out = Vec::new();
+        for frame in 0..30 {
+            let impulse = if frame == 0 { 1.0 } else { 0.0 };
+            out.push(comb(&mut buffer, &mut write, impulse, 10.5, 1.0));
+        }
+        assert!(
+            (out[10] - 0.5).abs() < 1e-6 && (out[11] - 0.5).abs() < 1e-6,
+            "the 10.5 sample tap landed {:?}",
+            &out[10..12]
+        );
+        assert!(out[1..10].iter().all(|&value| value.abs() < 1e-6));
+    }
+
+    #[test]
+    /// The echo time is the hand's horizontal position, so it is never still. If the
+    /// comb jumped straight to each new tap it would read an unrelated sample of the
+    /// ring - an impulse, one click every time the hand moves. The tap is slewed a
+    /// sample at a time, so the worst sample-to-sample change while the delay sweeps
+    /// stays in the same order as the slope of the note itself.
+    fn a_sweeping_echo_time_glides_instead_of_clicking() {
+        let rate = 44100.0;
+        let mut voice = Voice::idle(rate);
+        voice.set_target(220.0, 0.8, Waveform::Sine);
+        let mut previous = 0.0;
+        let mut worst_step = 0.0f32;
+        for frame in 0..44100 {
+            // 2 ms of new delay every 256 samples: the dispatch cadence the pipeline
+            // actually uses, walked from 50 ms to 400 ms.
+            if frame % 256 == 0 {
+                voice.set_chain(Chain {
+                    delay: true,
+                    delay_ms: 50.0 + (frame as f32 / 256.0) * 2.0,
+                    feedback: 0.6,
+                    ..Chain::idle()
+                });
+            }
+            let sample = voice.next_sample(rate);
+            worst_step = worst_step.max((sample - previous).abs());
+            previous = sample;
+        }
+        let slope = 2.0 * std::f32::consts::PI * 220.0 * 0.8 / rate;
+        assert!(
+            worst_step < slope * 4.0,
+            "the delay clicked: worst step {worst_step}, note slope {slope}"
+        );
+    }
+
+    #[test]
+    /// A feedback comb has a loop gain of 1/(1 - feedback) at its resonances, so 0.6
+    /// feedback would make the note 2.5x louder than the envelope asked for and push it
+    /// into the limiter - a crackly echo instead of a clean one. The stage is scaled by
+    /// the same factor, so a held note comes out at the level the hand set it to.
+    fn feedback_does_not_amplify_the_note_into_the_limiter() {
+        let rate = 44100.0;
+        let loudest = |feedback: f32| {
+            let mut voice = Voice::idle(rate);
+            voice.set_chain(Chain {
+                delay: true,
+                delay_ms: 200.0,
+                feedback,
+                ..Chain::idle()
+            });
+            voice.set_target(220.0, 0.8, Waveform::Sine);
+            (0..44100).fold(0.0f32, |peak, _| peak.max(voice.next_sample(rate).abs()))
+        };
+        let dry = loudest(0.0);
+        let echoed = loudest(0.6);
+        assert!(
+            echoed <= dry + 0.05,
+            "feedback made the note louder: dry {dry}, echoed {echoed}"
+        );
+        assert!(echoed < 0.9, "the limiter was engaged: peak {echoed}");
+    }
+
+    #[test]
+    /// A note that goes silent and then attacks again must not replay the previous
+    /// note's echo or chirp through a slewed tap: the fresh attack gets a clean
+    /// ring at the current echo time.
+    fn a_fresh_attack_after_silence_starts_clean() {
+        let rate = 44100.0;
+        let mut voice = Voice::idle(rate);
+        voice.set_chain(Chain {
+            delay: true,
+            delay_ms: 200.0,
+            feedback: 0.6,
+            ..Chain::idle()
+        });
+        voice.set_target(440.0, 1.0, Waveform::Sine);
+        for _ in 0..4410 {
+            voice.next_sample(rate);
+        }
+        voice.release();
+        for _ in 0..44100 * 15 {
+            voice.next_sample(rate);
+        }
+        assert!(voice.is_silent(), "the voice went silent");
+
+        // A fresh attack while the hand still sits in the same place.
+        voice.reset_for_attack(rate);
+        voice.set_target(440.0, 0.8, Waveform::Sine);
+        assert!(
+            voice.delay.iter().all(|&sample| sample == 0.0),
+            "the ring was not cleared"
+        );
+        assert!(
+            (voice.delay_taps - 0.2 * rate).abs() < 1.0,
+            "the tap should sit at 200 ms, got {}",
+            voice.delay_taps
+        );
+
+        let first = voice.next_sample(rate);
+        assert!(
+            first.abs() < 0.1,
+            "a stale echo leaked into the attack: {first}"
+        );
     }
 
     #[test]

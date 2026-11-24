@@ -15,13 +15,25 @@
 //! are continuous, so a stage can be added to a running performance without the
 //! player hearing a step.
 
-/// Lowest cutoff the filter can reach. Below this the note stops being dark and
-/// starts being gone, which is a different gesture.
-pub const CUTOFF_MIN_HZ: f32 = 200.0;
-/// Brightest the filter opens. Deliberately below Nyquist so the one-pole never
-/// gets close to transparent at both ends of the band.
-pub const CUTOFF_MAX_HZ: f32 = 8000.0;
-/// What "no filter" means. A one-pole at 12 kHz passes everything the instrument
+/// The filter's band, in **harmonics of the note that is sounding** rather than in
+/// absolute hertz. The keyboard spans C2-C6 (65-1047 Hz), so an absolute band is
+/// either above every note - where a lowpass does nothing at all - or below all of
+/// them, muffling everything equally. Measured against the note, "bright" and "dark"
+/// mean the same thing at C2 as they do at C6.
+///
+/// Half a fundamental is as dark as the chain gets: the note sits well above the knee
+/// of the filter and comes out muffled. Three harmonics is about as open as a
+/// lowpass can be and still be a tone control - above that it is a pass-through.
+pub const CUTOFF_MIN_HARMONICS: f32 = 0.5;
+pub const CUTOFF_MAX_HARMONICS: f32 = 3.0;
+
+/// Absolute clamp on the derived cutoff. The floor keeps a degenerate frequency from
+/// closing the filter shut; the ceiling is the neutral value, so the meter reads full
+/// when the stage is open.
+pub const CUTOFF_MIN_HZ: f32 = 30.0;
+pub const CUTOFF_MAX_HZ: f32 = NEUTRAL_CUTOFF_HZ;
+
+/// What "no filter" means. A pole at 12 kHz passes everything the instrument
 /// produces, so handing the voice this value is equivalent to the stage not being
 /// there - without needing a branch in the audio callback to say so.
 pub const NEUTRAL_CUTOFF_HZ: f32 = 12000.0;
@@ -216,6 +228,16 @@ pub fn openness(spread: f32) -> f32 {
     ((spread - SPREAD_CLOSED) / (SPREAD_OPEN - SPREAD_CLOSED)).clamp(0.0, 1.0)
 }
 
+/// Where the filter's knee sits, in hertz, for a proximity level and the pitch that
+/// is currently sounding. With no note playing the middle of the keyboard (C4) is the
+/// reference, so the stage still has somewhere sensible to fade from.
+pub fn cutoff_for(frequency: f32, proximity: f32) -> f32 {
+    let reference = if frequency > 0.0 { frequency } else { 261.6 };
+    let harmonics = CUTOFF_MIN_HARMONICS
+        + (CUTOFF_MAX_HARMONICS - CUTOFF_MIN_HARMONICS) * proximity.clamp(0.0, 1.0);
+    (reference * harmonics).clamp(CUTOFF_MIN_HZ, CUTOFF_MAX_HZ)
+}
+
 /// How far apart two hands are, on the 0..1 band the inter-hand sources read.
 ///
 /// The distance is normalised by the sum of the two palm radii rather than by the
@@ -234,7 +256,7 @@ pub fn gap_level(distance_px: f32, touching_px: f32) -> f32 {
 ///
 /// | effect | source |
 /// | :--- | :--- |
-/// | lowpass cutoff | driver proximity (near = bright) |
+/// | lowpass cutoff | driver proximity (near = bright), measured against `frequency` |
 /// | vibrato rate | driver height in the frame (high = faster) |
 /// | vibrato depth | how far apart the two hands are |
 /// | delay time | driver horizontal position |
@@ -249,6 +271,7 @@ pub fn modulation_from_hands(
     height: f32,
     gap: f32,
     x_position: f32,
+    frequency: f32,
 ) -> Modulation {
     let proximity = proximity.clamp(0.0, 1.0);
     let height = height.clamp(0.0, 1.0);
@@ -258,7 +281,7 @@ pub fn modulation_from_hands(
     Modulation {
         enabled,
         // A hand pushed towards the lens opens the filter; one backing off darkens it.
-        cutoff_hz: CUTOFF_MIN_HZ + (CUTOFF_MAX_HZ - CUTOFF_MIN_HZ) * proximity,
+        cutoff_hz: cutoff_for(frequency, proximity),
         // Higher in the frame = faster wobble.
         vibrato_hz: VIBRATO_RATE_MIN_HZ + (VIBRATO_RATE_MAX_HZ - VIBRATO_RATE_MIN_HZ) * height,
         // Hands spread wide = deeper wobble; hands together = none.
@@ -372,38 +395,61 @@ mod tests {
 
     #[test]
     fn the_band_saturates_at_both_ends() {
-        let far = modulation_from_hands(EffectMask::ALL, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(far.cutoff_hz, CUTOFF_MIN_HZ);
+        let far = modulation_from_hands(EffectMask::ALL, 0.0, 0.0, 0.0, 0.0, 220.0);
+        assert_eq!(far.cutoff_hz, 220.0 * CUTOFF_MIN_HARMONICS);
         assert_eq!(far.vibrato_cents, 0.0);
         assert_eq!(far.delay_ms, 0.0);
 
         // Out-of-range inputs clamp instead of running past the band.
-        let beyond = modulation_from_hands(EffectMask::ALL, 4.0, 2.0, 9.0, 2.0);
-        assert_eq!(beyond.cutoff_hz, CUTOFF_MAX_HZ);
+        let beyond = modulation_from_hands(EffectMask::ALL, 4.0, 2.0, 9.0, 2.0, 220.0);
+        assert_eq!(beyond.cutoff_hz, 220.0 * CUTOFF_MAX_HARMONICS);
         assert_eq!(beyond.vibrato_hz, VIBRATO_RATE_MAX_HZ);
         assert_eq!(beyond.vibrato_cents, VIBRATO_MAX_CENTS);
         assert_eq!(beyond.delay_ms, DELAY_MAX_MS);
 
-        let behind = modulation_from_hands(EffectMask::ALL, -1.0, -1.0, -1.0, -1.0);
+        let behind = modulation_from_hands(EffectMask::ALL, -1.0, -1.0, -1.0, -1.0, 220.0);
         assert_eq!(
-            behind.cutoff_hz, CUTOFF_MIN_HZ,
+            behind.cutoff_hz, far.cutoff_hz,
             "a hand below the band sits at the bottom of it"
         );
         assert_eq!(behind.vibrato_hz, VIBRATO_RATE_MIN_HZ);
     }
 
     #[test]
-    fn each_source_moves_exactly_one_parameter() {
-        let baseline = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
+    /// The knee is a multiple of the pitch, so the same hand position darkens an A3
+    /// and a C6 by the same amount. An absolute band would be transparent for one and
+    /// muffling for the other.
+    fn the_knee_is_measured_in_harmonics_of_the_note() {
+        let a3 = cutoff_for(220.0, 0.5);
+        let two_octaves_up = cutoff_for(880.0, 0.5);
+        assert!(
+            (two_octaves_up - a3 * 4.0).abs() < 1e-3,
+            "the cutoff should scale with the pitch: {a3} vs {two_octaves_up}"
+        );
+        // A reference of a tenth of a hertz still leaves the filter usable.
+        assert!(
+            cutoff_for(0.0, 0.5) > CUTOFF_MIN_HZ,
+            "silence has a fallback reference"
+        );
+        assert_eq!(
+            cutoff_for(20.0, 0.0),
+            CUTOFF_MIN_HZ,
+            "the knee never closes shut"
+        );
+    }
 
-        let closer = modulation_from_hands(EffectMask::ALL, 0.9, 0.5, 0.7, 0.5);
+    #[test]
+    fn each_source_moves_exactly_one_parameter() {
+        let baseline = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5, 220.0);
+
+        let closer = modulation_from_hands(EffectMask::ALL, 0.9, 0.5, 0.7, 0.5, 220.0);
         assert!(closer.cutoff_hz > baseline.cutoff_hz);
         assert_eq!(
             closer.delay_ms, baseline.delay_ms,
             "proximity must not move delay time"
         );
 
-        let wider = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.9);
+        let wider = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.9, 220.0);
         assert!(wider.delay_ms > baseline.delay_ms);
         assert_eq!(wider.cutoff_hz, baseline.cutoff_hz);
     }
@@ -443,13 +489,14 @@ mod tests {
     fn blending_slides_to_neutral_rather_than_snapping() {
         // One second of frames at the default 450 ms time constant: alpha is
         // frame_interval / fade, so 30 frames is about two time constants.
-        let mut current = modulation_from_hands(EffectMask::ALL, 1.0, 1.0, 1.0, 1.0);
+        let mut current = modulation_from_hands(EffectMask::ALL, 1.0, 1.0, 1.0, 1.0, 220.0);
         let target = Modulation::neutral_with(EffectMask::ALL);
         for _ in 0..30 {
             current = blend(current, target, 0.073);
         }
         assert!(
-            (current.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs() < 600.0,
+            (current.cutoff_hz - NEUTRAL_CUTOFF_HZ).abs()
+                < (220.0 * CUTOFF_MAX_HARMONICS - NEUTRAL_CUTOFF_HZ).abs() * 0.15,
             "after two time constants the filter should be most of the way open, got {}",
             current.cutoff_hz
         );
@@ -461,7 +508,7 @@ mod tests {
     #[test]
     fn an_enabled_stage_is_adopted_at_once_while_its_level_fades() {
         let current = Modulation::neutral();
-        let target = modulation_from_hands(EffectMask::from_bits(2), 0.5, 0.5, 0.5, 0.5);
+        let target = modulation_from_hands(EffectMask::from_bits(2), 0.5, 0.5, 0.5, 0.5, 220.0);
         let blended = blend(current, target, 0.1);
         assert!(
             blended.enabled.is_on(Effect::Vibrato),
@@ -475,14 +522,14 @@ mod tests {
 
     #[test]
     fn noise_does_not_ping_the_bus() {
-        let a = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
-        let b = modulation_from_hands(EffectMask::ALL, 0.5002, 0.5002, 0.7001, 0.5001);
+        let a = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5, 220.0);
+        let b = modulation_from_hands(EffectMask::ALL, 0.5002, 0.5002, 0.7001, 0.5001, 220.0);
         assert!(
             !is_different(&a, &b),
             "sub-threshold jitter is not a change"
         );
 
-        let moved = modulation_from_hands(EffectMask::ALL, 0.6, 0.5, 0.7, 0.5);
+        let moved = modulation_from_hands(EffectMask::ALL, 0.6, 0.5, 0.7, 0.5, 220.0);
         assert!(is_different(&a, &moved), "a real move is a change");
     }
 
@@ -491,13 +538,14 @@ mod tests {
     /// a wobble that moves the echo by less than a rounding error, or the vibrato by
     /// less than a cent, is not a change worth sending.
     fn the_deadbands_ignore_jitter_smaller_than_a_cent_or_a_millisecond() {
-        let steady = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5);
+        let steady = modulation_from_hands(EffectMask::ALL, 0.5, 0.5, 0.7, 0.5, 220.0);
         let wobbling = modulation_from_hands(
             EffectMask::ALL,
             0.5 + 0.0002,
             0.5 + 0.0002,
             0.7 + 0.001,
             0.5 + 0.002,
+            220.0,
         );
         assert!(
             !is_different(&steady, &wobbling),

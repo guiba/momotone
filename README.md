@@ -76,7 +76,7 @@ louder. `Ctrl+C` stops.
 | `--volume proximity\|pinch\|blend` | what decides loudness (default: proximity) |
 | `--scale`, `--root`, `--octaves` | keyboard layout, e.g. `--scale minor pentatonic --root A` |
 | `--waveform sine\|triangle\|square\|saw` | synthesiser timbre |
-| `--effects lowpass,vibrato,delay` | which stages are in the sound chain (default: `lowpass`; `none` for a bare note) |
+| `--effects lowpass,vibrato,delay` | which stages are in the sound chain (default: `lowpass`; `none` for a bare note). The filter's knee sits at 0.5x-6x the harmonics of the note being played, driven by the modulator hand's proximity |
 | `--model mediapipe\|yolo` | which ONNX backend |
 | `--hands one\|two\|probe` | how many hands the tracker looks for. `two` is the default: the anchored crop tracks the hand playing notes and a whole-frame pass finds the second one. `one` is the single-hand instrument; `probe` is the measurement mode below |
 | `--camera 1`, `--camera-width 1280` | pick the webcam and capture size |

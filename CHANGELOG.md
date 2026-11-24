@@ -91,6 +91,31 @@ in parentheses are the branches each phase was developed on.
   attributes struct, the wgpu compositor settings, the adapter and format lists. A run
   now starts with the seven lines that describe *this* run; ONNX Runtime's single CoreML
   capability warning still shows, and `RUST_LOG=info,iced_winit=info` gets the detail back.
+- **The echo no longer crackles.** Two bugs in the delay stage made it sound like noise
+  rather than an echo. `delay_ms` is the fingertip's horizontal position, so it wobbles
+  constantly, and the comb tap was an integer: every time the modulation crossed the
+  2 ms deadband the tap jumped by up to 88 samples, i.e. the feedback loop read an
+  unrelated sample of the ring - an impulse. Across one measured sweep that is a click
+  every 256 samples (worst sample-to-sample step 0.69 against the note's own slope of
+  0.025). The tap is now a float that slews at most one sample per audio sample
+  (`DELAY_SLEW`), read by linear interpolation between the two samples either side of it.
+  Second, a feedback comb has a loop gain of `1/(1 - feedback)` at its resonances, so 0.6
+  feedback made a note 2.5x louder than the envelope asked for and parked it in the soft
+  clipper: ~24 % harmonic distortion. The stage is now pre-scaled by `1 - feedback`, so a
+  held note comes out at the level the hand set and the tail still decays by `feedback`
+  per repeat. Two new regression tests fail on the old behaviour. A fresh attack after the
+  voice went silent empties the ring and snaps the float tap to the current echo time, so
+  the previous note's echo cannot layer onto the attack and the tap cannot chirp through
+  a slew while the hand sat still; the tail on a release is unchanged.
+- **The lowpass now bites.** Its knee was an absolute `200-8000 Hz`, which for the
+  notes this instrument plays (C2-C6, 65-1047 Hz) sits above every fundamental: a
+  pole at 4 kHz attenuates a 440 Hz sine by 1 %, so switching the stage on or off
+  was inaudible except when the hand backed right off. The knee is now measured in
+  harmonics of the sounding note (`CUTOFF_MIN_HARMONICS = 0.5` to `CUTOFF_MAX_HARMONICS
+  = 3.0`, `cutoff_for(frequency, proximity)`), and it is two cascaded poles instead
+  of one - 12 dB per octave rather than 6. At the dark end a note loses ~14 dB and
+  a square loses its harmonics down to the second; the EFFECTS card shows the knee as
+  `2.4x harmonics (627 Hz)` instead of a bare hertz value.
 
 ## 0.1.0 — 2026-11-15 · standalone crate
 

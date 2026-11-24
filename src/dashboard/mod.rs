@@ -28,13 +28,15 @@ use iced::widget::{
 use iced::{alignment, Background, Border, Color, Element, Length, Shadow, Size, Theme};
 use iced::{time, Subscription};
 
-use crate::core::effects::{Effect, CUTOFF_MAX_HZ, CUTOFF_MIN_HZ, DELAY_MAX_MS, VIBRATO_MAX_CENTS};
+use crate::core::effects::{
+    Effect, CUTOFF_MAX_HARMONICS, CUTOFF_MIN_HARMONICS, DELAY_MAX_MS, VIBRATO_MAX_CENTS,
+};
 use crate::core::geometry::FINGER_NAMES;
 use crate::core::instrument::{InstrumentConfig, VolumeModel, Waveform};
 use crate::core::runtime::UiCommand;
 use crate::core::telemetry::Latency;
 use crate::dashboard::gauges::{Meter, Sparkline};
-use crate::dashboard::metrics::{note_name, FrameMetrics};
+use crate::dashboard::metrics::{note_frequency, note_name, FrameMetrics};
 use crate::dashboard::skeleton::Skeleton;
 use crate::presentation::ascii::Ramp;
 
@@ -440,6 +442,15 @@ fn small_button<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
 fn effects_card(metrics: &FrameMetrics) -> Element<'_, Message> {
     let modulation = metrics.sound.modulation;
     let bar = |value: f32, low: f32, high: f32| (value - low) / (high - low);
+    // The knee is a multiple of the pitch that is sounding, so the meter is more
+    // useful in harmonics than in hertz: 2x means "everything above the second
+    // harmonic is gone", whichever note is playing.
+    let reference = metrics
+        .sound
+        .frequency
+        .or_else(|| metrics.sound.note.map(note_frequency))
+        .unwrap_or(261.6);
+    let harmonics = modulation.cutoff_hz / reference;
     let buttons = Effect::all()
         .into_iter()
         .map(|effect| {
@@ -456,7 +467,7 @@ fn effects_card(metrics: &FrameMetrics) -> Element<'_, Message> {
         column![
             Row::with_children(buttons).spacing(6),
             canvas(Meter {
-                value: bar(modulation.cutoff_hz, CUTOFF_MIN_HZ, CUTOFF_MAX_HZ),
+                value: bar(harmonics, CUTOFF_MIN_HARMONICS, CUTOFF_MAX_HARMONICS),
                 color: PROXIMITY,
             })
             .width(Length::Fill)
@@ -464,7 +475,8 @@ fn effects_card(metrics: &FrameMetrics) -> Element<'_, Message> {
             kv(
                 "tone",
                 format!(
-                    "{:.0} Hz {}",
+                    "{:.1}x harmonics ({:.0} Hz) {}",
+                    harmonics,
                     modulation.cutoff_hz,
                     if modulation.enabled.is_on(Effect::Lowpass) {
                         ""
