@@ -24,7 +24,7 @@ This document provides structural and architectural context to guide AI assistan
 - Everything Rust-side is pure Rust; there is no native library to link against. `build.rs` links clang's compiler-rt on Apple targets only: fat LTO drops `___isPlatformVersionAtLeast` from `std`, which ONNX Runtime's CoreML object references (rustc issue #164915). Do not remove it if `cargo build --release` fails to link on macOS.
 - `target/` is gitignored and is the only large artifact.
 - Quick verification loop: `cargo check` (≈4 s warm) rather than a full build.
-- The gate before any commit is `make verify` (`check` + `test` + `fmt --check` + `clippy --all-targets -D warnings`), mirrored on GitHub Actions by `.github/workflows/ci.yml` (push to `master` and every PR), which also runs a `--mode mock` smoke test that needs no camera and no models. `make help` lists the local targets.
+- The gate before any commit is `make verify` (`check` + `test` + `fmt --check` + `clippy --all-targets -D warnings`), mirrored on GitHub Actions by `.github/workflows/ci.yml` (push to `main` and every PR), which also runs a `--mode mock` smoke test that needs no camera and no models. `make help` lists the local targets.
 
 ## Core Architecture & Data Flow
 One frame per iteration of `Pipeline::run`, on a dedicated thread:
@@ -189,8 +189,8 @@ The usual open-source Rust workflow. Deviating is fine with a reason in the comm
 
 ### Branches
 - One topic per branch, named `feat/…`, `fix/…`, `perf/…`, `chore/…`, `ci/…` (the `phaseN-…` branches are the historical phase names from the rearchitecture).
-- Branch off `master`, keep the branch short-lived, rebase onto `master` before opening the PR.
-- `master` is always green: it passes `make verify` and CI at every merge.
+- Branch off `main`, keep the branch short-lived, rebase onto `main` before opening the PR.
+- `main` is always green: it passes `make verify` and CI at every merge.
 
 ### Commits
 - **Conventional commits**: `feat:`, `fix:`, `perf:`, `docs:`, `test:`, `chore:`, `ci:` — with an optional scope, e.g. `fix(vision): …`.
@@ -201,7 +201,7 @@ The usual open-source Rust workflow. Deviating is fine with a reason in the comm
 ### Pull requests
 - Small and focused: the diff should be readable in one sitting.
 - The description says what changed, why, and **how it was verified** (which command you ran).
-- CI must pass before merging; squash-merge keeps `master` one commit per feature.
+- CI must pass before merging; squash-merge keeps `main` one commit per feature.
 
 ### Tests
 - Every new pure function gets a unit test in the same file under `#[cfg(test)]` — the dashboard aside, this codebase is tested where it is testable.
