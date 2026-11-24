@@ -3,7 +3,7 @@
 Notes by development phase. Dates are the merge dates in the history; the branch names
 in parentheses are the branches each phase was developed on.
 
-## Unreleased
+## v0.2.0 — 2026-11-25
 
 - **Unsigned DMG release.** `make release` (and `.github/workflows/release.yml` on a
   `v*` tag push, running `scripts/release.sh` on a self-hosted macOS runner) builds an
