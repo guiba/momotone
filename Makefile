@@ -1,7 +1,7 @@
 # Makefile — the local gate for momotone
 #
 # GitHub Actions (.github/workflows/ci.yml) runs the same checks on every push to
-# master; this is the pre-commit version. Run
+# main; this is the pre-commit version. Run
 #
 #     make verify        # fmt check + clippy (errors) + cargo check + tests
 #
